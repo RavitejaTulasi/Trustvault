@@ -14,16 +14,17 @@ Security controls:
 import json
 import re
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import or_
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Query as SQLAlchemyQuery
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.database import get_db
-from backend.app.models.audit import AuditEvent
+from backend.app.models.audit import AuditEvent, AuditOutcome
 from backend.app.models.user import User
 from backend.app.schemas.audit import (
     AuditEventListResponse,
@@ -96,6 +97,51 @@ def _disable_caching(response: Response) -> None:
     response.headers["Pragma"] = "no-cache"
 
 
+def _get_client_ip(request: Request) -> str | None:
+    """Extract the best-effort client IP, honoring a forwarding proxy header."""
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+def _record_admin_audit_read(
+    db: Session,
+    *,
+    action: str,
+    actor_id: str,
+    request: Request,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """
+    Append the administrator-read audit event and fail closed on persistence errors.
+
+    The response data is computed by the caller before this call, but the caller
+    only returns it if the audit event commits. An administrative read that cannot
+    be durably recorded is refused with 503 instead of being served unaudited.
+    """
+    try:
+        AuditService.log_event(
+            db,
+            action=action,
+            outcome=AuditOutcome.SUCCESS,
+            actor_id=actor_id,
+            resource_type="audit",
+            ip_address=_get_client_ip(request) or "127.0.0.1",
+            user_agent=request.headers.get("User-Agent"),
+            request_id=getattr(request.state, "request_id", None),
+            details=details,
+        )
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Audit trail unavailable",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        ) from None
+
+
 def _paginate(
     query: SQLAlchemyQuery[AuditEvent],
     page: int,
@@ -127,6 +173,7 @@ def _paginate(
     ),
 )
 def list_audit_events(
+    request: Request,
     response: Response,
     current_user: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
@@ -163,7 +210,11 @@ def list_audit_events(
     if timestamp_to is not None:
         query = query.filter(AuditEvent.timestamp <= timestamp_to)
 
-    return _paginate(query, page, page_size)
+    result = _paginate(query, page, page_size)
+    _record_admin_audit_read(
+        db, action="audit.read", actor_id=current_user.id, request=request
+    )
+    return result
 
 
 @router.get(
@@ -177,6 +228,7 @@ def list_audit_events(
     ),
 )
 def verify_audit_chain(
+    request: Request,
     response: Response,
     current_user: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
@@ -201,6 +253,13 @@ def verify_audit_chain(
         batch_size=settings.AUDIT_VERIFY_BATCH_SIZE,
         timeout_seconds=settings.AUDIT_VERIFY_TIMEOUT_SECONDS,
     )
+    _record_admin_audit_read(
+        db,
+        action="audit.verify",
+        actor_id=current_user.id,
+        request=request,
+        details={"verification_status": result.status},
+    )
     return AuditVerificationResponse(
         status=result.status,
         is_valid=result.status == "VALID",
@@ -220,6 +279,7 @@ def verify_audit_chain(
     ),
 )
 def list_document_activity(
+    request: Request,
     response: Response,
     current_user: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(get_db)],
@@ -261,4 +321,8 @@ def list_document_activity(
     if timestamp_to is not None:
         query = query.filter(AuditEvent.timestamp <= timestamp_to)
 
-    return _paginate(query, page, page_size)
+    result = _paginate(query, page, page_size)
+    _record_admin_audit_read(
+        db, action="audit.activity_read", actor_id=current_user.id, request=request
+    )
+    return result

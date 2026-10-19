@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
@@ -102,6 +103,17 @@ async def test_audit_endpoints_deny_non_admin_roles(
     for path in AUDIT_ENDPOINTS:
         response = await async_client.get(path)
         assert response.status_code == 403, path
+
+    assert (
+        db_session.query(AuditEvent)
+        .filter(
+            AuditEvent.action.in_(
+                ("audit.read", "audit.verify", "audit.activity_read")
+            )
+        )
+        .count()
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -415,9 +427,21 @@ async def test_audit_verification_detects_tampering_without_repairing_it(
     assert "[redacted]" in data["failure_reason"]
     assert re.search(r"\b[0-9a-f]{64}\b", data["failure_reason"]) is None
 
-    assert db_session.query(AuditEvent).count() == total
+    assert db_session.query(AuditEvent).count() == total + 1
     db_session.refresh(event)
     assert event.action == "test.verify.tampered"
+
+    read_event = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "audit.verify")
+        .order_by(AuditEvent.sequence_number.desc())
+        .first()
+    )
+    assert read_event is not None
+    assert read_event.actor_id == admin.id
+    assert read_event.outcome == AuditOutcome.SUCCESS
+    assert read_event.resource_type == "audit"
+    assert json.loads(read_event.details) == {"verification_status": "INVALID"}
 
 
 @pytest.mark.asyncio
@@ -703,6 +727,16 @@ async def test_audit_verification_reports_incomplete_without_full_success(
     assert "incomplete" in data["failure_reason"].lower()
     assert re.search(r"\b[0-9a-f]{64}\b", data["failure_reason"]) is None
 
+    db_session.expire_all()
+    read_event = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "audit.verify")
+        .order_by(AuditEvent.sequence_number.desc())
+        .first()
+    )
+    assert read_event is not None
+    assert json.loads(read_event.details) == {"verification_status": "INCOMPLETE"}
+
 
 @pytest.mark.asyncio
 async def test_audit_verification_is_rate_limited(
@@ -730,6 +764,14 @@ async def test_audit_verification_is_rate_limited(
         params={"max_records": "999999", "batch_size": "1"},
     )
     assert repeated.status_code == 429
+
+    db_session.expire_all()
+    recorded = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "audit.verify")
+        .count()
+    )
+    assert recorded == limit
 
 
 @pytest.mark.asyncio
@@ -764,3 +806,130 @@ async def test_audit_access_does_not_expand_document_visibility(
     assert (
         await async_client.get(f"/api/v1/documents/{document.id}")
     ).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_admin_audit_reads_are_audited_once(
+    async_client: AsyncClient, db_session: Session
+):
+    """Each successful admin read records exactly one matching audit event."""
+    admin = await _login_admin(
+        async_client, db_session, email="admin_audit_reads@example.com"
+    )
+
+    expected_actions = {
+        "/api/v1/admin/audit": "audit.read",
+        "/api/v1/admin/audit/verify": "audit.verify",
+        "/api/v1/admin/documents/activity": "audit.activity_read",
+    }
+    for path, action in expected_actions.items():
+        response = await async_client.get(path)
+        assert response.status_code == 200, response.text
+
+    db_session.expire_all()
+    for action in expected_actions.values():
+        events = (
+            db_session.query(AuditEvent)
+            .filter(AuditEvent.action == action)
+            .all()
+        )
+        assert len(events) == 1, action
+        assert events[0].actor_id == admin.id
+        assert events[0].outcome == AuditOutcome.SUCCESS
+        assert events[0].resource_type == "audit"
+        assert events[0].resource_id is None
+
+    verify_event = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "audit.verify")
+        .one()
+    )
+    assert json.loads(verify_event.details) == {"verification_status": "VALID"}
+
+
+@pytest.mark.asyncio
+async def test_admin_read_event_details_expose_only_allowlisted_fields(
+    async_client: AsyncClient, db_session: Session
+):
+    """The recorded verification status is allowlisted and returned to admins."""
+    await _login_admin(
+        async_client, db_session, email="admin_audit_details@example.com"
+    )
+    verify = await async_client.get("/api/v1/admin/audit/verify")
+    assert verify.status_code == 200, verify.text
+
+    response = await async_client.get(
+        "/api/v1/admin/audit", params={"action": "audit.verify"}
+    )
+    assert response.status_code == 200, response.text
+    events = response.json()["events"]
+    assert len(events) == 1
+    assert events[0]["details"] == {"verification_status": "VALID"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", AUDIT_ENDPOINTS)
+async def test_admin_audit_reads_fail_closed_when_audit_write_fails(
+    async_client: AsyncClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+):
+    """A successful read is refused if its audit event cannot be persisted."""
+    await _login_admin(
+        async_client,
+        db_session,
+        email=f"admin_fail_closed_{path.rsplit('/', 1)[-1]}@example.com",
+    )
+
+    def exploding_log_event(*args, **kwargs):
+        raise SQLAlchemyError("audit store unavailable")
+
+    monkeypatch.setattr(AuditService, "log_event", exploding_log_event)
+
+    response = await async_client.get(path)
+    assert response.status_code == 503
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["detail"] == "Audit trail unavailable"
+
+
+@pytest.mark.asyncio
+async def test_failed_audit_write_rolls_back_partial_event_and_session_recovers(
+    async_client: AsyncClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+):
+    """A flushed-but-uncommitted read event is rolled back and the session stays usable."""
+    await _login_admin(
+        async_client, db_session, email="admin_partial_audit_write@example.com"
+    )
+
+    original_log_event = AuditService.log_event
+
+    def log_then_fail(*args, **kwargs):
+        original_log_event(*args, **kwargs)
+        raise SQLAlchemyError("simulated audit commit failure")
+
+    monkeypatch.setattr(AuditService, "log_event", log_then_fail)
+    response = await async_client.get("/api/v1/admin/audit")
+    assert response.status_code == 503
+
+    monkeypatch.setattr(AuditService, "log_event", original_log_event)
+    db_session.expire_all()
+    assert (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "audit.read")
+        .count()
+        == 0
+    )
+
+    recovered = AuditService.log_event(
+        db_session,
+        action="audit.read",
+        outcome=AuditOutcome.SUCCESS,
+        actor_id=None,
+        resource_type="audit",
+    )
+    assert recovered.sequence_number == 1
+    is_valid, failure_reason, verified = AuditService.verify_chain_integrity(db_session)
+    assert is_valid is True, failure_reason
+    assert verified == 1
+    db_session.rollback()

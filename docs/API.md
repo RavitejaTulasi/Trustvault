@@ -93,7 +93,7 @@ This document details the complete API contract for TrustVault, including authen
     "updated_at": "2026-10-19T10:00:00.000000Z"
   }
   ```
-- **Audit Event**: `document.upload`
+- **Audit Event**: `document.upload` (Outcome: `SUCCESS`, or `DENIED` with an allowlisted `details.reason` of `insufficient_role`, `missing_filename`, `invalid_upload`, or `size_limit_exceeded` when an upload attempt is rejected)
 
 ### `GET /api/v1/documents`
 - **Authentication**: Required
@@ -278,8 +278,9 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
   }
   ```
 - **Response Safety**: Only the fields shown above are exposed. Internal hash-chain fields (`previous_hash`, `record_hash`) and user credential fields are never returned. Verification diagnostics redact full hash values before returning a failure reason. Stored JSON `details` is parsed into an object; malformed or non-object details are returned as `null`.
-- **Detail Redaction**: `details` uses a default-deny key allowlist for `changed_fields`, `document_id`, `email`, `from_role`, `permission`, `reason`, `recipient_id`, `role`, `sessions_revoked`, `target_user_id`, and `to_role`. Every other key is returned as `[redacted]`, including document title, filename, size, category, MIME type, storage path/key, password, and token values. Redaction applies only to API serialization; stored audit records remain unchanged.
+- **Detail Redaction**: `details` uses a default-deny key allowlist for `changed_fields`, `document_id`, `email`, `from_role`, `permission`, `reason`, `recipient_id`, `role`, `sessions_revoked`, `target_user_id`, `to_role`, and `verification_status`. Every other key is returned as `[redacted]`, including document title, filename, size, category, MIME type, storage path/key, password, and token values. Redaction applies only to API serialization; stored audit records remain unchanged.
 - **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache` on all three audit/activity endpoints.
+- **Read Auditing**: Each successful read of these endpoints is itself recorded as an audit event (`audit.read`, `audit.verify`, or `audit.activity_read`, with `resource_type` `audit`). The event commits before the response is sent; if it cannot be persisted, the endpoint returns `503` with detail `Audit trail unavailable` instead of serving an unaudited response. Requests denied by role (`403`) or verification rate limiting (`429`) do not create read events.
 - **Filtering Safety**: All filters use parameterized SQLAlchemy expressions. String filters are trimmed and exact-matched; document activity uses escaped literal matching where text search is required.
 
 ### `GET /api/v1/admin/audit/verify`
@@ -330,4 +331,4 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
   - `timestamp_from` / `timestamp_to`: optional inclusive ISO-8601 bounds, normalized to UTC.
 - **Response `200 OK`**: Same paginated envelope and safe event shape as `GET /api/v1/admin/audit`, limited to document activity.
 - **Boundary**: This endpoint does not return document metadata values or bytes and does not grant any document access. Document title, filename, size, category, and MIME type values in `details` are redacted through the same default-deny allowlist as the audit endpoint. The administrator remains subject to the normal owner-or-active-grant rules on document endpoints.
-- **Audit Coverage Note**: Reading audit or activity data through these endpoints is not itself currently written to the audit log. The endpoints are read-only and administrator-only, but this administrative-read coverage gap is intentional for the current milestone and documented in `docs/ARCHITECTURE.md`.
+- **Audit Coverage Note**: Reading audit or activity data through these endpoints is itself recorded as `audit.read`, `audit.verify`, and `audit.activity_read` events with `resource_type` `audit`, and the response is withheld with `503` if that event cannot be persisted. Known remaining read gaps (document listing/search, successful permission listing, administrative user-listing) are documented in `docs/ARCHITECTURE.md`.

@@ -178,3 +178,38 @@ When collaborating with AI on TrustVault, the following engineering prompts and 
   - `python -m ruff check . --statistics`: 45 findings, unchanged from baseline (38 `B008`, 3 `I001`, 2 `F401`, 1 `BLE001`, 1 `F841`).
   - `git diff --check`: no whitespace errors; only Git's expected CRLF conversion warnings.
 - **Git Status**: Day 6.1 changes remain uncommitted and unpushed. Day 6 remains staged; no commit hash is recorded because no commit was created.
+
+---
+
+### Entry 9 (Day 6.2 — 2026-10-19): Audit Coverage Completion for Administrative Reads and Upload Denials
+- **Category**: Audit Coverage / Security Observability
+- **Prompt Summary** (abridged from the actual Day 6.2 prompt):
+  "Audit the implementation for security-relevant actions that are not actually covered by audit events. Build a coverage matrix from real code, then implement only the minimum safe changes needed to close the genuine gaps. Do not fabricate coverage claims, do not change the hash format or historical records, do not add external anchoring or frontend work, and leave all changes uncommitted and unpushed pending review."
+- **Baseline Inspected Before Changes**:
+  - HEAD and `origin/main` were both `ab3a702` (Day 6 `a56d7ac` and Day 6.1 `ab3a702` already pushed). Working tree was clean.
+  - Baseline: 91 tests passing; `ruff check . --statistics` reported 45 findings (38 `B008`, 3 `I001`, 2 `F401`, 1 `BLE001`, 1 `F841`).
+  - Every `AuditService.log_event` call site was enumerated across `auth.py`, `documents.py`, `users.py`, and `audit.py` and mapped against the review matrix's action list.
+- **Coverage Matrix Result**:
+  - Covered: authentication (`user.register`, `user.login`, `user.login_failed`, `user.login_rate_limited`, `user.logout`, `user.update`), admin user management (`user.role_change`, `user.deactivate`, `user.reactivate`, `user.sessions_revoked`), document lifecycle success paths (`document.upload`, `document.read`, `document.download`, `document.edit`, `document.delete`), authorization denials on read/download/edit/delete, and sharing (`permission.grant`, `permission.revoke`, `permission.list_denied`).
+  - Genuine gaps closed: the three administrator audit/activity reads appended no events, and rejected uploads (role denial, missing filename, invalid extension/magic bytes, empty/oversized files) appended no events.
+  - Remaining documented gaps (unchanged, accepted for this milestone): document list/search reads, successful `GET /documents/{id}/permissions` reads, administrative user-list/profile reads, and request-validation failures that occur before an audit call.
+- **What the AI Produced**:
+  - Added `_record_admin_audit_read()` in `backend/app/api/audit.py`: appends the read event, commits, and fails closed with `503 Audit trail unavailable` (plus no-store headers) on `SQLAlchemyError`, so an administrative read is never served without a persisted audit record.
+  - Instrumented the three endpoints: `audit.read` for `GET /admin/audit`, `audit.verify` for `GET /admin/audit/verify` (details record the allowlisted `verification_status`), and `audit.activity_read` for `GET /admin/documents/activity`. All use `resource_type` `audit`, the admin's actor ID, client IP, user agent, and request ID.
+  - Instrumented rejected uploads in `backend/app/api/documents.py` as `document.upload` with `DENIED` and an allowlisted `details.reason`: `insufficient_role`, `missing_filename`, `invalid_upload`, or `size_limit_exceeded`.
+  - Added `verification_status` to the `SAFE_DETAIL_KEYS` allowlist in `backend/app/schemas/audit.py`; nothing else in the allowlist changed.
+  - Added seven tests and extended six existing ones: administrative reads audited exactly once with correct actor/outcome/resource type; `verification_status` visible through the API allowlist; all three endpoints fail closed per-path when audit persistence fails; a flushed-but-uncommitted read event is rolled back after a simulated persistence failure and the session remains usable; viewer upload denial audited without a false success; invalid and empty uploads now assert exactly one `DENIED` event each with no `SUCCESS` upload event; tamper, incomplete, rate-limit, and non-admin tests now assert event counts and outcomes, including that `429` responses append nothing and the tamper test still proves the chain is never repaired.
+  - Updated `docs/API.md`, `docs/ARCHITECTURE.md`, and `THREATS.md` (TV-12, TV-13, TV-19) and this entry. `THREATS.md` TV-12 notes the read-event tradeoff honestly, and TV-19's residual risk now states that read auditing increases audit-log volume during investigations.
+- **Issues Discovered and Corrections Made**:
+  - Day 6 deliberately avoided appending audit events from audit GET endpoints because it could inflate the chain during investigations. Day 6.2 reverses that decision only for read auditing, with an explicit fail-closed policy, explicit documentation of the log-volume tradeoff, and tests proving rate-limited and denied requests append nothing.
+  - The `audit.verify` read event is appended only after a verification pass completes, so it can never inflate that pass's `records_verified`; the valid-chain test still expects `records_verified == total` with no change.
+  - The tamper test previously asserted an exact audit-row count. It now expects `+1` (the single `audit.verify` read event), still refreshes the tampered row, and keeps the no-repair invariant, rather than deleting the count assertion.
+  - Touching `status.HTTP_413_REQUEST_ENTITY_TOO_LARGE` in the new upload-denial path emitted a Starlette deprecation warning; used `HTTP_413_CONTENT_TOO_LARGE` (same code) instead.
+  - The fail-closed `HTTPException` cannot inherit the endpoint's injected `Response` headers, so the `503` carries its own `Cache-Control: no-store` and `Pragma: no-cache` headers, consistent with the Day 6.1 rate-limit fix.
+  - The fail-closed tests trigger a real session `rollback()` in the request path, which surfaced `SAWarning: transaction already deassociated from connection` at fixture teardown. Root cause: the test fixture joins its session to a pre-existing connection transaction using the effective `rollback_only` mode, so a legitimate application rollback ends that shared transaction and deactivates the fixture's `Transaction` handle; teardown then rolled back the deactivated handle. This is a test-fixture artifact, not a production transaction-management defect, because production `get_db` uses a fresh session per request. Fixed in `backend/tests/conftest.py` by making the join mode explicit and rolling back only when the fixture transaction is still active. An initial attempt to use `create_savepoint` made isolation worse: with pysqlite's legacy transactional mode and the StaticPool test engine, no explicit `BEGIN` precedes `SAVEPOINT`, so releasing the outermost savepoint commits and data leaked across tests; that change was reverted.
+- **What was Changed and How Verified**:
+  - `python -m pytest backend/tests/ -q`: 98 passed (91 prior + 7 new).
+  - `python -m pytest backend/tests/ -q -W error`: 98 passed with no warnings.
+  - `python -m ruff check . --statistics`: 45 findings, unchanged from baseline with no new rules or categories.
+  - `git diff --check`: no whitespace errors; only Git's expected CRLF conversion warnings.
+- **Git Status**: Day 6.2 changes remain uncommitted and unpushed pending review. No commit hash is recorded because no commit has been created; approval-gated commit commands are provided in the review summary.

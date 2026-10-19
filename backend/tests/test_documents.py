@@ -4,6 +4,8 @@ Verifies authentication, RBAC, owner authorization, magic byte validation,
 size limits, cross-user isolation, audit events, and deliberate 404 responses.
 """
 
+import json
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.orm import Session
@@ -201,6 +203,31 @@ async def test_invalid_file_type_and_magic_bytes_rejected(async_client: AsyncCli
     )
     assert resp_magic.status_code == 400
 
+    db_session.expire_all()
+    denied_events = (
+        db_session.query(AuditEvent)
+        .filter(
+            AuditEvent.action == "document.upload",
+            AuditEvent.outcome == AuditOutcome.DENIED,
+        )
+        .order_by(AuditEvent.sequence_number.asc())
+        .all()
+    )
+    assert len(denied_events) == 2
+    assert [json.loads(event.details)["reason"] for event in denied_events] == [
+        "invalid_upload",
+        "invalid_upload",
+    ]
+    assert (
+        db_session.query(AuditEvent)
+        .filter(
+            AuditEvent.action == "document.upload",
+            AuditEvent.outcome == AuditOutcome.SUCCESS,
+        )
+        .count()
+        == 0
+    )
+
 
 @pytest.mark.asyncio
 async def test_empty_upload_rejected(async_client: AsyncClient, db_session: Session):
@@ -219,6 +246,52 @@ async def test_empty_upload_rejected(async_client: AsyncClient, db_session: Sess
         data={"title": "Empty Doc"},
     )
     assert resp.status_code == 400
+
+    db_session.expire_all()
+    denied_event = (
+        db_session.query(AuditEvent)
+        .filter(
+            AuditEvent.action == "document.upload",
+            AuditEvent.outcome == AuditOutcome.DENIED,
+        )
+        .one()
+    )
+    assert json.loads(denied_event.details) == {"reason": "invalid_upload"}
+
+
+@pytest.mark.asyncio
+async def test_viewer_upload_denial_is_audited(async_client: AsyncClient, db_session: Session):
+    """A viewer upload attempt is denied and recorded without a false success event."""
+    viewer = make_user(
+        db_session,
+        email="viewer_up_denied@example.com",
+        password=VALID_PASSWORD,
+        role=UserRole.VIEWER,
+    )
+    db_session.commit()
+
+    await async_client.post(
+        "/api/v1/auth/login",
+        json={"email": "viewer_up_denied@example.com", "password": VALID_PASSWORD},
+    )
+
+    resp = await async_client.post(
+        "/api/v1/documents",
+        files={"file": ("denied.pdf", b"%PDF-1.4 viewer upload attempt", "application/pdf")},
+        data={"title": "Denied Upload"},
+    )
+    assert resp.status_code == 403
+
+    db_session.expire_all()
+    upload_events = (
+        db_session.query(AuditEvent)
+        .filter(AuditEvent.action == "document.upload")
+        .all()
+    )
+    assert len(upload_events) == 1
+    assert upload_events[0].outcome == AuditOutcome.DENIED
+    assert upload_events[0].actor_id == viewer.id
+    assert json.loads(upload_events[0].details) == {"reason": "insufficient_role"}
 
 
 @pytest.mark.asyncio

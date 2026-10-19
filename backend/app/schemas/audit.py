@@ -22,6 +22,7 @@ SAFE_DETAIL_KEYS = frozenset(
         "sessions_revoked",
         "target_user_id",
         "to_role",
+        "verification_status",
     }
 )
 

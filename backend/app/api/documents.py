@@ -208,12 +208,36 @@ def upload_document(
 
     # Enforce least privilege: Uploaders must be owners or admins
     if current_user.role not in {UserRole.OWNER, UserRole.ADMIN}:
+        AuditService.log_event(
+            db,
+            action="document.upload",
+            outcome=AuditOutcome.DENIED,
+            actor_id=current_user.id,
+            resource_type="document",
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={"reason": "insufficient_role"},
+        )
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Document owner or administrator privileges required to upload documents",
         )
 
     if not file.filename:
+        AuditService.log_event(
+            db,
+            action="document.upload",
+            outcome=AuditOutcome.DENIED,
+            actor_id=current_user.id,
+            resource_type="document",
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={"reason": "missing_filename"},
+        )
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No filename provided",
@@ -222,7 +246,24 @@ def upload_document(
     # Save and validate file via StorageService
     try:
         storage_key, file_size = StorageService.save_file(file.file, file.filename)
-    except HTTPException:
+    except HTTPException as exc:
+        reason = (
+            "size_limit_exceeded"
+            if exc.status_code == status.HTTP_413_CONTENT_TOO_LARGE
+            else "invalid_upload"
+        )
+        AuditService.log_event(
+            db,
+            action="document.upload",
+            outcome=AuditOutcome.DENIED,
+            actor_id=current_user.id,
+            resource_type="document",
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={"reason": reason},
+        )
+        db.commit()
         raise
     except Exception as e:
         logger.error(f"File upload storage error: {e}")

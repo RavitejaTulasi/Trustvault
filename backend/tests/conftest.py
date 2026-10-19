@@ -57,12 +57,16 @@ def db_session():
     """Provides a fresh transactional database session for each test."""
     connection = test_engine.connect()
     transaction = connection.begin()
-    session = TestingSessionLocal(bind=connection)
+    session = TestingSessionLocal(bind=connection, join_transaction_mode="rollback_only")
 
     yield session
 
     session.close()
-    transaction.rollback()
+    # An application-level rollback (for example the audit fail-closed 503 path)
+    # ends the shared transaction under rollback_only join mode; rolling back an
+    # already-deactivated transaction is invalid and would raise a warning.
+    if transaction.is_active:
+        transaction.rollback()
     connection.close()
 
 
