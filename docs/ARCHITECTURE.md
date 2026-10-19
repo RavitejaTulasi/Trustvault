@@ -12,7 +12,7 @@ TrustVault is engineered around five mandatory security pillars:
 2. **Server-Side Trust Boundary**: Frontend checks exist solely for user interface ergonomics. The backend is the sole authority; client-supplied role parameters or user IDs are rejected.
 3. **Storage Decoupling**: Stored files are kept strictly outside the web server root. Physical file paths are generated via 256-bit unguessable random keys and are never exposed to clients.
 4. **Immediate Revocation**: No cached authorization tokens or long-lived download URLs are used. When an access grant is revoked, the very next download or read attempt is blocked.
-5. **Tamper-Evident Auditability**: Every sensitive action (authentication, document read, download, upload, edit, deletion, grant change, administrative query, and access denial) produces a cryptographically hash-chained audit record.
+5. **Tamper-Evident Auditability**: Every instrumented authentication, state-changing, document access, and access-denial action produces a cryptographically hash-chained audit record. The exact recorded actions and the remaining gaps are listed in Section 5; administrative reads of the audit API are not currently themselves audit-logged.
 
 ---
 
@@ -34,7 +34,9 @@ TrustVault enforces three distinct roles, with fine-grained document-level permi
 | **System Health (`GET /health`)** | Yes | Yes | Yes | Yes | Yes (Public probe) |
 | **User Authentication (`POST /auth/login`, `logout`)** | Yes | Yes | Yes | Yes | Yes (Public endpoint) |
 | **Manage Users (`GET/PATCH /admin/users`, revoke sessions)** | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
-| **System-wide Audit Trail (`GET /admin/audit`)** | **Planned** (not implemented) | N/A (planned) | N/A (planned) | N/A (planned) | N/A (planned) |
+| **System-wide Audit Trail (`GET /admin/audit`)** | **Yes** (read-only) | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
+| **Verify Audit Hash Chain (`GET /admin/audit/verify`)** | **Yes** (read-only) | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
+| **Document Activity History (`GET /admin/documents/activity`)** | **Yes** (read-only) | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
 | **Upload New Document (`POST /documents`)** | **Yes** (creates an admin-owned document) | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
 | **List Documents (`GET /documents`)** | Own/granted only | Own docs only | Granted docs only | Granted docs only | No (401 Unauthorized) |
 | **Read Document Metadata (`GET /documents/{id}`)** | Own/granted only | **Yes** | **Yes** | **Yes** | No (401/404 Deliberate) |
@@ -107,5 +109,41 @@ Where:
 3. Canonicalizes timestamps into UTC `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
 4. Recomputes the SHA-256 hash and asserts exact equality against `event.record_hash`.
 
+Administrators can invoke this verification through the read-only `GET /api/v1/admin/audit/verify` endpoint. The endpoint reports validity, the number of records verified before any failure, and a failure reason with full hash values redacted. It never rewrites a record, appends an event, or returns the stored hash-chain fields.
+
 ### Limitation & Production Anchoring
 Hash chaining reliably detects unauthorized modification, insertion, or deletion of individual records. However, an attacker with full database superuser privileges could theoretically rewrite the entire chain from an arbitrary record forward. For high-assurance production environments, TrustVault supports streaming audit hashes to immutable external storage (e.g., AWS S3 Object Lock in Compliance Mode or RFC 3161 timestamping authorities).
+
+---
+
+## 5. Administrative Audit API and Coverage
+
+### API Surface
+All three endpoints require the authenticated `admin` role and are registered under `/api/v1`:
+
+- `GET /admin/audit`: filtered, paginated audit-event inspection across all actors and resources.
+- `GET /admin/audit/verify`: full hash-chain verification.
+- `GET /admin/documents/activity`: filtered, paginated document and document-grant activity.
+
+The audit and activity response schemas expose only `id`, `sequence_number`, `timestamp`, `actor_id`, `action`, `resource_type`, `resource_id`, `outcome`, `request_id`, `ip_address`, `user_agent`, and sanitized `details`. `previous_hash` and `record_hash` are deliberately excluded, as are any credential fields. `details` uses a default-deny allowlist that preserves correlation and account-management keys (`document_id`, `recipient_id`, `target_user_id`, `permission`, `reason`, `changed_fields`, `role`, `from_role`, `to_role`, `email`, and `sessions_revoked`) and returns `[redacted]` for every other key, including document title, filename, size, category, MIME type, storage path/key, password, and token values. Raw audit rows are unchanged. Verification failure diagnostics redact full hash values. All three endpoints also return `Cache-Control: no-store` and `Pragma: no-cache`. String filters are trimmed, length-bounded, and exact-matched through bound SQLAlchemy expressions. `document_id` activity filtering matches direct document events by `resource_id` and grant events by the recorded `details.document_id`; LIKE metacharacters in the supplied ID are escaped.
+
+These endpoints are read-only. They do not return document metadata values or bytes and do not create an alternative path to document access. An administrator querying audit data remains subject to the same owner-or-active-grant policy on document routes.
+
+### Recorded Audit Actions
+The current build records the following events:
+
+- Authentication and self-service: `user.register`, `user.login`, `user.login_failed`, `user.login_rate_limited`, `user.logout`, `user.update`.
+- Administrative user management: `user.role_change`, `user.deactivate`, `user.reactivate`, `user.sessions_revoked`.
+- Documents: `document.upload`, `document.read`, `document.download`, `document.edit`, `document.delete`, including success and authorization-denial outcomes where implemented.
+- Sharing: `permission.grant`, `permission.revoke`, and `permission.list_denied`.
+
+### Known Coverage Gaps
+The following operations are not currently recorded as audit events:
+
+- Document list/search/read-metadata enumeration through `GET /documents`.
+- Successful `GET /documents/{id}/permissions` reads (denied attempts are recorded as `permission.list_denied`).
+- Administrative user-list/profile reads.
+- Administrative audit and activity API reads.
+- Some request-validation and upload-validation failures that occur before an audit call.
+
+These gaps mean the architecture does not claim that every read or every administrative query is audited. State-changing administrative actions and the document access paths listed above are audited; expanding read coverage would require a separate, explicit event-volume and privacy decision.

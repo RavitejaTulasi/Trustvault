@@ -109,3 +109,36 @@ When collaborating with AI on TrustVault, the following engineering prompts and 
 - **What was Changed and How Verified**:
   Verified with `pytest backend/tests/ -v`: 69/69 tests passing (59 prior + 10 new). `ruff check .` still reports the same 45 pre-existing findings (38 `B008`, 3 `I001`, 2 `F401`, 1 `BLE001`, 1 `F841`) with no new findings or rule categories.
 - **Git Status**: Committed and pushed as [`650acd63d930966d2d2254d3e0dfaeb8a104d9c8`](https://github.com/RavitejaTulasi/Trustvault/commit/650acd63d930966d2d2254d3e0dfaeb8a104d9c8) — "feat(security): add secure document search and effective permissions".
+
+---
+
+### Entry 7 (Day 6 — 2026-10-19): Administrator Audit Inspection, Document Activity, and Hash-Chain Verification APIs
+- **Category**: Administrative Audit Visibility / API Security / Integrity Verification
+- **Prompt Summary** (abridged from the actual Day 6 prompt):
+  "Implement the Day 6 administrator audit-event and document activity-history APIs. Expose a filtered, paginated audit query, a read-only hash-chain verification endpoint, and a document-focused activity endpoint. Restrict all three endpoints to administrators, keep responses free of hash-chain internals and sensitive credentials, validate filters and date ranges, add security and tamper-detection tests, and update the API, architecture, threat-model, and prompt-history documentation. Leave the work uncommitted for review."
+- **Final Review Prompt Summary** (abridged):
+  "Independently review the uncommitted Day 6 changes for security, correctness, test adequacy, and documentation accuracy. Inspect every change, run the full test suite with warnings as errors, and verify authorization, response shaping, hash verification, caching, and audit coverage claims against the actual repository. If a defect is found, make only a narrow, tested correction. Do not commit or push, and do not start Day 7."
+- **What the AI Produced**:
+  - Added `backend/app/schemas/audit.py` with `AuditEventResponse`, `AuditEventListResponse`, and `AuditVerificationResponse`.
+  - Added `backend/app/api/audit.py` with:
+    - `GET /api/v1/admin/audit` for exact actor/action/resource/outcome/time filters and newest-first pagination.
+    - `GET /api/v1/admin/audit/verify` as a read-only wrapper around `AuditService.verify_chain_integrity()`.
+    - `GET /api/v1/admin/documents/activity` restricted to `document` and `document_grant` events with document, actor, action, outcome, and time filters.
+  - Added `Cache-Control: no-store` and `Pragma: no-cache` to all three read-only responses.
+  - Wired the router into `backend/app/api/router.py` and exported the schemas from `backend/app/schemas/__init__.py`.
+  - Added `backend/tests/test_audit_api.py` with 16 tests covering 401/403 access control, safe response shaping and cache prevention, pagination and ordering, combined and invalid filters, SQL-injection/wildcard handling, document/grant activity correlation, malformed details, default-deny detail redaction, valid and tampered chain verification, altered record hashes, broken previous-hash links, sequence gaps, and separation from document-content authorization.
+  - No model or migration change was required because the existing `audit_events` fields and indexes support every new query.
+  - Updated `docs/API.md`, `docs/ARCHITECTURE.md`, and `THREATS.md` with the implemented endpoints, actual audit coverage, known gaps, and TV-19.
+- **Issues Discovered and Corrections Made**:
+  - Grant audit events use the grant row ID as `resource_id`, not the document ID. A document activity filter based only on `resource_id` would omit grant/revoke history; added an OR condition matching the recorded `details.document_id`.
+  - `details` is stored as JSON text on the ORM model. The response schema now parses it into an object and returns `null` for malformed or non-object values so a bad row cannot break the endpoint.
+  - A raw LIKE pattern for activity correlation would treat `%` and `_` in a supplied document ID as wildcards; escaped all LIKE metacharacters before matching.
+  - The first test run emitted Starlette deprecation warnings for `HTTP_422_UNPROCESSABLE_ENTITY`; used a literal `422` status in the new endpoints to avoid the warning without depending on a newly added Starlette constant.
+  - `AuditService.verify_chain_integrity()` embeds the stored and computed 64-character hashes in tamper failure messages. Returning that diagnostic verbatim would contradict the endpoint's no-hash-exposure boundary; added full-hash redaction while preserving sequence numbers and failure type.
+  - The final independent review found that parsed audit `details` could expose historical document titles, filenames, categories, sizes, and MIME types from upload/delete events through the admin audit and activity endpoints, contradicting the documented no-metadata boundary. Added a default-deny `details` allowlist to `AuditEventResponse`; safe correlation/account-management keys are preserved and every other key, including storage paths/keys, passwords, and tokens, is returned as `[redacted]`. Raw audit rows are unchanged. Added a regression test covering safe, unsafe, nested, and secret-like keys.
+  - The same review found that direct service tests did not explicitly cover an altered record hash, a broken previous-hash link, or a sequence gap, although the verifier implements each check and empty-chain/altered-event cases already existed. Added three focused service tests; all now pass.
+  - Audit API reads were deliberately not made to append audit events: doing so would create side effects on GET requests, inflate the chain during investigations, and make verification counts unstable. The resulting administrative-read coverage gap is documented instead of claiming complete read auditing.
+  - Used `Annotated` FastAPI dependencies in the new endpoints to avoid adding new `B008` lint findings.
+- **What was Changed and How Verified**:
+  Verified with `pytest backend/tests/ -q`: 85/85 tests passing (69 prior + 16 Day 6 tests: 12 initial + 4 final-review tests). `pytest backend/tests/ -q -W error` also passed 85/85. `ruff check .` still reports the same 45 pre-existing findings (38 `B008`, 3 `I001`, 2 `F401`, 1 `BLE001`, 1 `F841`) with no new findings or rule categories. `git diff --check` reported no whitespace errors, only Git's CRLF conversion warnings.
+- **Git Status**: Day 6 changes remain uncommitted and unpushed pending review. No commit hash is recorded because no commit has been created.

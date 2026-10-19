@@ -2,6 +2,11 @@
 Pydantic Schemas Package for TrustVault
 """
 
+from backend.app.schemas.audit import (
+    AuditEventListResponse,
+    AuditEventResponse,
+    AuditVerificationResponse,
+)
 from backend.app.schemas.auth import (
     AdminUserUpdateRequest,
     UserListResponse,
@@ -25,6 +30,9 @@ from backend.app.schemas.health import HealthResponse
 
 __all__ = [
     "AdminUserUpdateRequest",
+    "AuditEventListResponse",
+    "AuditEventResponse",
+    "AuditVerificationResponse",
     "DocumentListItem",
     "DocumentListResponse",
     "DocumentResponse",

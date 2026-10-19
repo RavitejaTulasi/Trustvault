@@ -238,8 +238,76 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 - **Response `200 OK`**: `{"user_id": "...", "sessions_revoked": N}`
 - **Audit Event**: `user.sessions_revoked`
 
-### `GET /api/v1/admin/audit` — Planned (not implemented)
-- **Status**: Planned for a later milestone. System-wide audit records continue to be written to the tamper-evident audit store; a read-only admin query API is not registered in the current build.
+### `GET /api/v1/admin/audit`
+- **Authentication**: Required
+- **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
+- **Action**: Returns a filtered, paginated view of the tamper-evident audit log, sorted by `sequence_number` descending.
+- **Query Parameters**:
+  - `page`: integer, minimum 1 (default: 1).
+  - `page_size`: integer, 1-100 (default: 25).
+  - `actor_id`: optional exact actor user ID (1-36 characters).
+  - `action`: optional exact action name (1-100 characters), for example `document.read`.
+  - `resource_type`: optional exact resource type (1-50 characters), for example `document` or `document_grant`.
+  - `resource_id`: optional exact resource ID (1-100 characters).
+  - `outcome`: optional exact outcome, one of `SUCCESS`, `DENIED`, or `FAILURE`.
+  - `timestamp_from`: optional ISO-8601 inclusive lower bound. Naive datetimes are interpreted as UTC; timezone offsets are normalized to UTC.
+  - `timestamp_to`: optional ISO-8601 inclusive upper bound. Naive datetimes are interpreted as UTC; timezone offsets are normalized to UTC.
+- **Validation**: Invalid pagination, blank/oversized filters, invalid outcomes, malformed datetimes, or `timestamp_from > timestamp_to` return `422 Unprocessable Entity`.
+- **Response `200 OK`**:
+  ```json
+  {
+    "events": [
+      {
+        "id": "ae_5c9d...",
+        "sequence_number": 42,
+        "timestamp": "2026-10-19T10:00:00.000000Z",
+        "actor_id": "u_984f1b...",
+        "action": "document.read",
+        "resource_type": "document",
+        "resource_id": "doc_a1b2c3...",
+        "outcome": "SUCCESS",
+        "request_id": "5f42...",
+        "ip_address": "127.0.0.1",
+        "user_agent": "Mozilla/5.0...",
+        "details": {"changed_fields": ["title"]}
+      }
+    ],
+    "total": 1,
+    "page": 1,
+    "page_size": 25
+  }
+  ```
+- **Response Safety**: Only the fields shown above are exposed. Internal hash-chain fields (`previous_hash`, `record_hash`) and user credential fields are never returned. Verification diagnostics redact full hash values before returning a failure reason. Stored JSON `details` is parsed into an object; malformed or non-object details are returned as `null`.
+- **Detail Redaction**: `details` uses a default-deny key allowlist for `changed_fields`, `document_id`, `email`, `from_role`, `permission`, `reason`, `recipient_id`, `role`, `sessions_revoked`, `target_user_id`, and `to_role`. Every other key is returned as `[redacted]`, including document title, filename, size, category, MIME type, storage path/key, password, and token values. Redaction applies only to API serialization; stored audit records remain unchanged.
+- **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache` on all three audit/activity endpoints.
+- **Filtering Safety**: All filters use parameterized SQLAlchemy expressions. String filters are trimmed and exact-matched; document activity uses escaped literal matching where text search is required.
 
-### `GET /api/v1/admin/documents/activity` — Planned (not implemented)
-- **Status**: Planned for a later milestone. Document lifecycle events remain available in the audit store without exposing file contents; no HTTP activity endpoint is registered in the current build.
+### `GET /api/v1/admin/audit/verify`
+- **Authentication**: Required
+- **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
+- **Action**: Performs a complete read-only validation of audit sequence continuity, previous-hash links, and recomputed SHA-256 record hashes. It does not modify, repair, or append audit records.
+- **Response `200 OK`**:
+  ```json
+  {
+    "is_valid": true,
+    "records_verified": 42,
+    "failure_reason": null
+  }
+  ```
+- **Failure Response**: The endpoint still returns `200 OK`, with `is_valid: false`, the number of records verified before the failure, and a `failure_reason` identifying the sequence gap, broken link, or tampered record. Full 64-character hash values in the underlying diagnostic are redacted as `[redacted]`; sequence numbers and failure type remain available.
+
+### `GET /api/v1/admin/documents/activity`
+- **Authentication**: Required
+- **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
+- **Action**: Returns a filtered, paginated activity history restricted to `document` and `document_grant` audit resources, sorted by `sequence_number` descending.
+- **Query Parameters**:
+  - `page`: integer, minimum 1 (default: 1).
+  - `page_size`: integer, 1-100 (default: 25).
+  - `document_id`: optional document ID (1-100 characters). Matches document events whose `resource_id` is the document ID, and grant events whose recorded `details.document_id` is the document ID.
+  - `actor_id`: optional exact actor user ID (1-36 characters).
+  - `action`: optional exact action name (1-100 characters), for example `document.download` or `permission.revoke`.
+  - `outcome`: optional exact outcome, one of `SUCCESS`, `DENIED`, or `FAILURE`.
+  - `timestamp_from` / `timestamp_to`: optional inclusive ISO-8601 bounds, normalized to UTC.
+- **Response `200 OK`**: Same paginated envelope and safe event shape as `GET /api/v1/admin/audit`, limited to document activity.
+- **Boundary**: This endpoint does not return document metadata values or bytes and does not grant any document access. Document title, filename, size, category, and MIME type values in `details` are redacted through the same default-deny allowlist as the audit endpoint. The administrator remains subject to the normal owner-or-active-grant rules on document endpoints.
+- **Audit Coverage Note**: Reading audit or activity data through these endpoints is not itself currently written to the audit log. The endpoints are read-only and administrator-only, but this administrative-read coverage gap is intentional for the current milestone and documented in `docs/ARCHITECTURE.md`.

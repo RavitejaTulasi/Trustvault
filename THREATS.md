@@ -14,7 +14,7 @@ Status Classifications:
 | Threat ID | Threat Category | OWASP / Security Vector | Status | Primary Defense Layer |
 |---|---|---|---|---|
 | **TV-01** | Broken Object-Level Authorization (BOLA / IDOR) | OWASP API1:2023 | **Mitigated** | Centralized `AuthorizationService` evaluated on fresh DB state |
-| **TV-02** | Broken Function-Level Authorization | OWASP API5:2023 | **Mitigated** | Server-side role enforcement (`require_role`), client roles ignored |
+| **TV-02** | Broken Function-Level Authorization | OWASP API5:2023 | **Mitigated** | Server-side role enforcement (`require_admin`), client roles ignored |
 | **TV-03** | Privilege Escalation (Vertical/Horizontal) | CWE-269 / CWE-250 | **Mitigated** | Role immutable via user endpoints, strict separation of privileges |
 | **TV-04** | Insecure Direct File Access (Direct Download URL) | OWASP API1 / CWE-639 | **Mitigated** | Platform-mediated streaming; random 256-bit unguessable storage keys |
 | **TV-05** | Revocation Races & Stale Authorization | CWE-672 / CWE-362 | **Mitigated** | Zero caching of authorization decisions; immediate query on request |
@@ -31,6 +31,7 @@ Status Classifications:
 | **TV-16** | Secret Leakage through Git & Version Control | CWE-798 | **Mitigated** | `.gitignore` filters `.env`, `private_storage/`, `*.db`; `.env.example` template |
 | **TV-17** | Insecure Caching of Sensitive Metadata & Bytes | CWE-525 / CWE-524 | **Mitigated** | `Cache-Control: no-store, no-cache`, security headers middleware |
 | **TV-18** | Backup and Disaster Recovery Compromise | CWE-311 | **Accepted Risk** | Host-level encrypted volume snapshots; external storage backup policy |
+| **TV-19** | Audit API Data Exposure and Verification Abuse | OWASP API1/API5 / CWE-200 | **Mitigated** | Admin-only RBAC, allowlisted read-only responses, bounded pagination |
 
 ---
 
@@ -45,10 +46,10 @@ Status Classifications:
 - **Status**: **Mitigated**
 
 ### TV-02: Broken Function-Level Authorization
-- **Attack Scenario**: A regular viewer or document owner attempts to invoke administrative user-management endpoints such as `GET /admin/users` or `PATCH /admin/users/{user_id}`. Read-only admin audit endpoints are planned but not registered in the current build.
-- **Impact**: Unauthorized user administration or privilege changes.
-- **Mitigation**: Route-level dependency `require_admin` verifies the authenticated session's server-stored user role. Client-supplied role claims in cookies or bodies are never parsed or trusted.
-- **Test Evidence**: `test_admin_list_users_requires_admin`, `test_admin_list_users_requires_admin_owner`, `test_unauthenticated_admin_endpoints_return_401`.
+- **Attack Scenario**: A regular viewer or document owner attempts to invoke administrative user-management endpoints such as `GET /admin/users` or `PATCH /admin/users/{user_id}`, or the audit endpoints `GET /admin/audit`, `GET /admin/audit/verify`, and `GET /admin/documents/activity`.
+- **Impact**: Unauthorized user administration, privilege changes, or audit-data disclosure.
+- **Mitigation**: Route-level dependency `require_admin` verifies the authenticated session's server-stored user role on every administrative endpoint. Client-supplied role claims in cookies or bodies are never parsed or trusted.
+- **Test Evidence**: `test_admin_list_users_requires_admin`, `test_admin_list_users_requires_admin_owner`, `test_unauthenticated_admin_endpoints_return_401`, `test_audit_endpoints_require_authentication`, `test_audit_endpoints_deny_non_admin_roles`.
 - **Residual Risk**: Low. Server-side session validation only.
 - **Status**: **Mitigated**
 
@@ -127,16 +128,16 @@ Status Classifications:
 ### TV-12: Audit Log Tampering or Omission
 - **Attack Scenario**: Malicious actor or compromised account attempts to modify or delete audit log entries to conceal unauthorized actions.
 - **Impact**: Loss of non-repudiation, forensics invalidation, compliance failure.
-- **Mitigation**: Cryptographic hash-chaining using SHA-256 (`record_hash = SHA256(seq + timestamp + actor + action + outcome + details + previous_hash)`). `AuditService.verify_chain_integrity()` verifies continuity from genesis to latest record. Modifying or deleting any single record invalidates the entire subsequent chain.
+- **Mitigation**: Cryptographic hash-chaining using SHA-256 (`record_hash = SHA256(seq + timestamp + actor + action + outcome + details + previous_hash)`). `AuditService.verify_chain_integrity()` verifies continuity from genesis to latest record. Modifying or deleting any single record invalidates the entire subsequent chain. Administrators can invoke the same read-only verification through `GET /admin/audit/verify`; the endpoint reports validity, records verified, and a failure reason with full hash values redacted, without repairing or altering records.
 - **Honest Limitation**: Hash chaining alone does not prevent an attacker with root database access from rewriting the entire database chain from an arbitrary sequence number forward. External anchoring (streaming to immutable WORM storage like AWS S3 Object Lock) is documented for production hardening.
-- **Test Evidence**: `test_audit_service_initialization_and_verification`, `test_audit_service_detects_tampering`.
+- **Test Evidence**: `test_audit_service_initialization_and_verification`, `test_audit_service_detects_tampering`, `test_audit_verification_returns_valid_chain_metadata`, `test_audit_verification_detects_tampering_without_repairing_it`, `test_verification_detects_altered_record_hash`, `test_verification_detects_broken_previous_hash_link`, `test_verification_detects_sequence_gap`.
 - **Status**: **Partially Mitigated** (Cryptographic chaining active; external anchoring recommended for production).
 
 ### TV-13: Administrator Misuse (Overprivileged Administrator)
 - **Attack Scenario**: Rogue administrator uses admin role to browse and download confidential proprietary documents belonging to other users.
 - **Impact**: Insider threat data breach.
-- **Mitigation**: Administrators are NOT automatically granted metadata, content read, or download permissions. Listing, metadata retrieval, downloads, edits, deletion, and grant management all follow the same owner-or-active-grant policy for administrators as for every other user. Administrative capabilities are restricted to user account management and platform health; document actions are available only under the same ownership/grant rules as other users. Audit records remain in the tamper-evident store and verifiable through `AuditService`, while read-only admin audit HTTP endpoints are planned but not implemented. Every administrative action is recorded in the tamper-evident audit log with the admin's actor ID.
-- **Test Evidence**: `test_admin_cannot_access_document_contents`, `test_admin_cannot_list_unshared_document_metadata`, `test_admin_list_includes_owned_and_explicitly_granted_documents`, `test_admin_search_scope_includes_only_owned_and_granted`, `test_audit_chain_integrity`.
+- **Mitigation**: Administrators are NOT automatically granted metadata, content read, or download permissions. Listing, metadata retrieval, downloads, edits, deletion, and grant management all follow the same owner-or-active-grant policy for administrators as for every other user. Administrative capabilities are restricted to user account management, audit investigation, and platform health; document actions are available only under the same ownership/grant rules as other users. The audit and activity endpoints are read-only, admin-only, expose no document bytes, hash-chain internals, or document metadata values (audit `details` values are default-deny redacted), and cannot expand document access. State-changing administrative actions are recorded in the tamper-evident audit log with the admin's actor ID. Administrative user-list/profile reads and audit API reads are not currently audit-logged; this coverage gap is documented in `docs/ARCHITECTURE.md` Section 5.
+- **Test Evidence**: `test_admin_cannot_access_document_contents`, `test_admin_cannot_list_unshared_document_metadata`, `test_admin_list_includes_owned_and_explicitly_granted_documents`, `test_admin_search_scope_includes_only_owned_and_granted`, `test_audit_chain_integrity`, `test_audit_endpoints_deny_non_admin_roles`, `test_audit_access_does_not_expand_document_visibility`, `test_audit_response_redacts_document_metadata_and_secret_values`.
 - **Residual Risk**: Database superusers with direct OS/DB shell access can inspect physical storage; addressed by host encryption and access controls.
 - **Status**: **Mitigated**
 
@@ -167,8 +168,8 @@ Status Classifications:
 ### TV-17: Insecure Caching of Sensitive Metadata and Bytes
 - **Attack Scenario**: Shared proxy, browser cache, or CDN caches confidential document downloads or metadata, allowing subsequent users on the shared machine to view documents.
 - **Impact**: Accidental data disclosure.
-- **Mitigation**: Protected endpoints set `Cache-Control: no-store, no-cache, must-revalidate, private` and `Pragma: no-cache`.
-- **Test Evidence**: Response header assertions in test suite.
+- **Mitigation**: Protected document downloads set `Cache-Control: no-store, no-cache, must-revalidate, private` and `Pragma: no-cache`. Administrative audit and document-activity endpoints set `Cache-Control: no-store` and `Pragma: no-cache`.
+- **Test Evidence**: `test_admin_lists_audit_events_with_safe_fields_and_pagination`, `test_document_activity_correlates_document_and_grant_events`, and `test_audit_verification_returns_valid_chain_metadata` assert the audit/activity no-cache headers. Document download headers are verified by code inspection; no dedicated download-header test currently exists.
 - **Residual Risk**: Negligible.
 - **Status**: **Mitigated**
 
@@ -178,3 +179,11 @@ Status Classifications:
 - **Mitigation**: Managed PostgreSQL with transparent data encryption (TDE) at rest, encrypted EBS/volume storage, and strict IAM backup access policies.
 - **Residual Risk**: Operational responsibility of hosting provider and cloud deployment administrator.
 - **Status**: **Accepted Risk** (Infrastructure operational boundary).
+
+### TV-19: Audit API Data Exposure and Verification Abuse
+- **Attack Scenario**: A non-administrator attempts to enumerate audit events through the admin audit endpoints, or an administrator uses the read-only API to extract sensitive operational metadata or repeatedly triggers full-chain verification to consume server resources.
+- **Impact**: Internal security-event disclosure (actor IDs, IP addresses, user agents, resource identifiers, request IDs) or resource exhaustion during chain verification on a large audit log.
+- **Mitigation**: All three audit endpoints require `require_admin`, which revalidates the server-side session and stored role. Responses use an explicit field allowlist that excludes `previous_hash`, `record_hash`, credentials, document bytes, and storage keys, and `details` uses a default-deny key allowlist that returns `[redacted]` for document metadata, storage, credential, token, and unknown values. Responses disable caching. Verification diagnostics also redact full hash values. Pagination is capped at 100 events per request, string filters are length-bounded and parameterized, and activity text matching escapes LIKE metacharacters. Verification is read-only and cannot modify or repair the chain.
+- **Test Evidence**: `test_audit_endpoints_require_authentication`, `test_audit_endpoints_deny_non_admin_roles`, `test_admin_lists_audit_events_with_safe_fields_and_pagination`, `test_audit_access_does_not_expand_document_visibility`, `test_audit_response_redacts_document_metadata_and_secret_values`, `test_verification_detects_altered_record_hash`, `test_verification_detects_broken_previous_hash_link`, `test_verification_detects_sequence_gap`.
+- **Residual Risk**: Full-chain verification traverses every audit record and can become expensive as the log grows; the endpoint is administrator-only and does not mutate state. Audit API reads are not themselves audit-logged, so an administrator's investigation activity is not currently recorded. Deployment-level admin rate limiting and background verification are future hardening options.
+- **Status**: **Mitigated**
