@@ -21,6 +21,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Query as SQLAlchemyQuery
 from sqlalchemy.orm import Session
 
+from backend.app.config import settings
 from backend.app.database import get_db
 from backend.app.models.audit import AuditEvent
 from backend.app.models.user import User
@@ -30,6 +31,7 @@ from backend.app.schemas.audit import (
     AuditVerificationResponse,
 )
 from backend.app.security.auth import require_admin
+from backend.app.security.rate_limiter import audit_verification_rate_limiter
 from backend.app.services.audit_service import AuditService
 
 router = APIRouter(prefix="/admin", tags=["Admin – Audit Trail"])
@@ -169,8 +171,9 @@ def list_audit_events(
     response_model=AuditVerificationResponse,
     summary="Verify the audit hash chain",
     description=(
-        "Admin only. Performs a complete read-only validation of sequence continuity, "
-        "previous-hash links, and recomputed record hashes."
+        "Admin only. Performs a bounded read-only validation of sequence continuity, "
+        "previous-hash links, and recomputed record hashes. Returns VALID, INVALID, "
+        "or INCOMPLETE; INCOMPLETE never reports full-chain success."
     ),
 )
 def verify_audit_chain(
@@ -179,11 +182,30 @@ def verify_audit_chain(
     db: Annotated[Session, Depends(get_db)],
 ) -> AuditVerificationResponse:
     _disable_caching(response)
-    is_valid, failure_reason, records_verified = AuditService.verify_chain_integrity(db)
+
+    allowed, retry_after = audit_verification_rate_limiter.allow(current_user.id)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Audit verification rate limit exceeded; retry later",
+            headers={
+                "Retry-After": str(retry_after),
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+            },
+        )
+
+    result = AuditService.verify_chain_integrity_bounded(
+        db,
+        max_records=settings.AUDIT_VERIFY_MAX_RECORDS,
+        batch_size=settings.AUDIT_VERIFY_BATCH_SIZE,
+        timeout_seconds=settings.AUDIT_VERIFY_TIMEOUT_SECONDS,
+    )
     return AuditVerificationResponse(
-        is_valid=is_valid,
-        records_verified=records_verified,
-        failure_reason=_sanitize_failure_reason(failure_reason),
+        status=result.status,
+        is_valid=result.status == "VALID",
+        records_verified=result.records_verified,
+        failure_reason=_sanitize_failure_reason(result.failure_reason),
     )
 
 

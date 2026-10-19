@@ -17,15 +17,30 @@ AWS S3 Object Lock, or publishing periodic root hashes to an external timestampi
 
 import hashlib
 import json
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from backend.app.config import settings
 from backend.app.models.audit import AuditEvent
 
 GENESIS_HASH = "0" * 64
+
+VerificationStatus = Literal["VALID", "INVALID", "INCOMPLETE"]
+
+
+@dataclass(frozen=True)
+class AuditVerificationResult:
+    """Outcome of a bounded audit-chain verification pass."""
+
+    status: VerificationStatus
+    records_verified: int
+    failure_reason: str | None = None
 
 
 class AuditService:
@@ -139,52 +154,197 @@ class AuditService:
         return event
 
     @classmethod
+    def _load_verification_batch(
+        cls,
+        db: Session,
+        after_sequence: int,
+        high_water_mark: int,
+        batch_size: int,
+    ) -> list[Mapping[str, Any]]:
+        """
+        Fetch one ordered batch of audit columns using an indexed keyset range.
+
+        Column selection avoids populating the ORM identity map, and the high-water
+        mark bounds the traversal to records committed at the start of verification.
+        """
+        stmt = (
+            select(
+                AuditEvent.sequence_number,
+                AuditEvent.timestamp,
+                AuditEvent.actor_id,
+                AuditEvent.action,
+                AuditEvent.resource_type,
+                AuditEvent.resource_id,
+                AuditEvent.outcome,
+                AuditEvent.request_id,
+                AuditEvent.details,
+                AuditEvent.previous_hash,
+                AuditEvent.record_hash,
+            )
+            .where(
+                AuditEvent.sequence_number > after_sequence,
+                AuditEvent.sequence_number <= high_water_mark,
+            )
+            .order_by(AuditEvent.sequence_number.asc())
+            .limit(batch_size)
+        )
+        return list(db.execute(stmt).mappings().all())
+
+    @classmethod
+    def verify_chain_integrity_bounded(
+        cls,
+        db: Session,
+        *,
+        max_records: int,
+        batch_size: int,
+        timeout_seconds: float,
+        clock: Callable[[], float] | None = None,
+    ) -> AuditVerificationResult:
+        """
+        Verify the chain in bounded batches within a record and time budget.
+
+        A high-water mark captured at the start defines the verification boundary.
+        The result is VALID only after every record at or below that mark has been
+        examined. If the chain exceeds the record limit or the deadline expires,
+        the result is INCOMPLETE and never reports full-chain success.
+        """
+        clock = clock or time.monotonic
+        deadline = clock() + timeout_seconds
+
+        low_sequence, high_water_mark = db.execute(
+            select(
+                func.min(AuditEvent.sequence_number),
+                func.max(AuditEvent.sequence_number),
+            )
+        ).one()
+        if high_water_mark is None:
+            return AuditVerificationResult("VALID", 0)
+        if low_sequence is None or low_sequence < 1:
+            return AuditVerificationResult(
+                "INVALID",
+                0,
+                (
+                    "Sequence gap detected at index 1: expected 1, found "
+                    f"{low_sequence if low_sequence is not None else 'no valid sequence'}"
+                ),
+            )
+        if high_water_mark > max_records:
+            return AuditVerificationResult(
+                "INCOMPLETE",
+                0,
+                (
+                    "Verification incomplete: audit chain contains "
+                    f"{high_water_mark} records, exceeding the configured limit of "
+                    f"{max_records}"
+                ),
+            )
+
+        expected_sequence = 1
+        expected_prev_hash = GENESIS_HASH
+        last_sequence = 0
+
+        while True:
+            if clock() >= deadline:
+                return AuditVerificationResult(
+                    "INCOMPLETE",
+                    expected_sequence - 1,
+                    (
+                        "Verification incomplete: the configured time limit was "
+                        f"exceeded after verifying {expected_sequence - 1} of "
+                        f"{high_water_mark} records"
+                    ),
+                )
+
+            rows = cls._load_verification_batch(
+                db,
+                after_sequence=last_sequence,
+                high_water_mark=high_water_mark,
+                batch_size=batch_size,
+            )
+            if not rows:
+                break
+
+            for row in rows:
+                sequence_number = row["sequence_number"]
+                if sequence_number != expected_sequence:
+                    return AuditVerificationResult(
+                        "INVALID",
+                        expected_sequence - 1,
+                        (
+                            f"Sequence gap detected at index {expected_sequence}: "
+                            f"expected {expected_sequence}, found {sequence_number}"
+                        ),
+                    )
+
+                previous_hash = row["previous_hash"]
+                if previous_hash != expected_prev_hash:
+                    return AuditVerificationResult(
+                        "INVALID",
+                        expected_sequence - 1,
+                        (
+                            f"Hash link broken at sequence {sequence_number}: "
+                            f"previous_hash '{previous_hash}' does not match "
+                            f"expected '{expected_prev_hash}'"
+                        ),
+                    )
+
+                computed_hash = cls.calculate_hash(
+                    sequence_number=sequence_number,
+                    timestamp=row["timestamp"],
+                    actor_id=row["actor_id"],
+                    action=row["action"],
+                    resource_type=row["resource_type"],
+                    resource_id=row["resource_id"],
+                    outcome=row["outcome"],
+                    request_id=row["request_id"],
+                    details_str=row["details"],
+                    previous_hash=previous_hash,
+                )
+
+                if row["record_hash"] != computed_hash:
+                    return AuditVerificationResult(
+                        "INVALID",
+                        expected_sequence - 1,
+                        (
+                            f"Record tampering detected at sequence {sequence_number}: "
+                            f"stored hash '{row['record_hash']}' does not match "
+                            f"computed '{computed_hash}'"
+                        ),
+                    )
+
+                expected_prev_hash = row["record_hash"]
+                last_sequence = sequence_number
+                expected_sequence += 1
+
+            if last_sequence >= high_water_mark:
+                return AuditVerificationResult("VALID", last_sequence)
+
+        if expected_sequence <= high_water_mark:
+            return AuditVerificationResult(
+                "INVALID",
+                expected_sequence - 1,
+                (
+                    f"Sequence gap detected at index {expected_sequence}: "
+                    f"expected {expected_sequence}, found end of chain at sequence "
+                    f"{last_sequence}"
+                ),
+            )
+
+        return AuditVerificationResult("VALID", expected_sequence - 1)
+
+    @classmethod
     def verify_chain_integrity(cls, db: Session) -> tuple[bool, str | None, int]:
         """
         Verifies the cryptographic integrity of the entire audit log chain.
         Returns: (is_valid, failure_reason_if_any, total_records_verified)
+
+        Uses the configured resource limits. An incomplete pass returns
+        is_valid=False with an explanatory failure reason.
         """
-        stmt = select(AuditEvent).order_by(AuditEvent.sequence_number.asc())
-        events = list(db.execute(stmt).scalars().all())
-
-        if not events:
-            return True, None, 0
-
-        expected_prev_hash = GENESIS_HASH
-        for idx, event in enumerate(events, start=1):
-            # Check sequence continuity
-            if event.sequence_number != idx:
-                return False, f"Sequence gap detected at index {idx}: expected {idx}, found {event.sequence_number}", idx - 1
-
-            # Check previous hash link
-            if event.previous_hash != expected_prev_hash:
-                return (
-                    False,
-                    f"Hash link broken at sequence {event.sequence_number}: previous_hash '{event.previous_hash}' does not match expected '{expected_prev_hash}'",
-                    idx - 1,
-                )
-
-            # Recompute record hash
-            computed_hash = cls.calculate_hash(
-                sequence_number=event.sequence_number,
-                timestamp=event.timestamp,
-                actor_id=event.actor_id,
-                action=event.action,
-                resource_type=event.resource_type,
-                resource_id=event.resource_id,
-                outcome=event.outcome,
-                request_id=event.request_id,
-                details_str=event.details,
-                previous_hash=event.previous_hash,
-            )
-
-            if event.record_hash != computed_hash:
-                return (
-                    False,
-                    f"Record tampering detected at sequence {event.sequence_number}: stored hash '{event.record_hash}' does not match computed '{computed_hash}'",
-                    idx - 1,
-                )
-
-            expected_prev_hash = event.record_hash
-
-        return True, None, len(events)
+        result = cls.verify_chain_integrity_bounded(
+            db,
+            max_records=settings.AUDIT_VERIFY_MAX_RECORDS,
+            batch_size=settings.AUDIT_VERIFY_BATCH_SIZE,
+            timeout_seconds=settings.AUDIT_VERIFY_TIMEOUT_SECONDS,
+        )
+        return result.status == "VALID", result.failure_reason, result.records_verified

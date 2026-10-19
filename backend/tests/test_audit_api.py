@@ -14,9 +14,11 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.orm import Session
 
+from backend.app.config import settings
 from backend.app.models.audit import AuditEvent, AuditOutcome
 from backend.app.models.document import Document
 from backend.app.models.user import User, UserRole
+from backend.app.security.rate_limiter import audit_verification_rate_limiter
 from backend.app.services.audit_service import AuditService
 from backend.tests.test_auth import VALID_PASSWORD, make_user
 
@@ -569,6 +571,165 @@ def test_verification_detects_sequence_gap(db_session: Session):
     assert is_valid is False
     assert count == 1
     assert "Sequence gap detected" in reason
+
+
+def test_verification_detects_out_of_range_low_sequence(db_session: Session):
+    event = _add_event(
+        db_session,
+        action="test.verify.out_of_range",
+        actor_id=None,
+        resource_type="test_resource",
+    )
+    event.sequence_number = 0
+    db_session.commit()
+
+    result = AuditService.verify_chain_integrity_bounded(
+        db_session,
+        max_records=10,
+        batch_size=2,
+        timeout_seconds=5,
+    )
+
+    assert result.status == "INVALID"
+    assert result.records_verified == 0
+    assert result.failure_reason is not None
+    assert "Sequence gap detected" in result.failure_reason
+
+
+def test_verification_accepts_empty_chain(db_session: Session):
+    result = AuditService.verify_chain_integrity_bounded(
+        db_session,
+        max_records=10,
+        batch_size=2,
+        timeout_seconds=5,
+    )
+
+    assert result.status == "VALID"
+    assert result.records_verified == 0
+    assert result.failure_reason is None
+
+
+def test_verification_processes_large_chain_in_bounded_batches(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+):
+    for index in range(7):
+        _add_event(
+            db_session,
+            action=f"test.verify.batch.{index}",
+            actor_id=None,
+            resource_type="test_resource",
+        )
+
+    batch_sizes: list[int] = []
+    original_loader = AuditService._load_verification_batch
+
+    def spy_loader(
+        cls, db, after_sequence, high_water_mark, batch_size
+    ):
+        rows = original_loader(db, after_sequence, high_water_mark, batch_size)
+        batch_sizes.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(
+        AuditService,
+        "_load_verification_batch",
+        classmethod(spy_loader),
+    )
+
+    result = AuditService.verify_chain_integrity_bounded(
+        db_session,
+        max_records=100,
+        batch_size=3,
+        timeout_seconds=5,
+    )
+
+    assert result.status == "VALID"
+    assert result.records_verified == 7
+    assert batch_sizes == [3, 3, 1]
+
+
+def test_verification_timeout_returns_incomplete_not_valid(db_session: Session):
+    for index in range(3):
+        _add_event(
+            db_session,
+            action=f"test.verify.timeout.{index}",
+            actor_id=None,
+            resource_type="test_resource",
+        )
+
+    ticks = iter([0.0, 0.0, 100.0])
+
+    def fake_clock() -> float:
+        return next(ticks, 100.0)
+
+    result = AuditService.verify_chain_integrity_bounded(
+        db_session,
+        max_records=10,
+        batch_size=1,
+        timeout_seconds=5,
+        clock=fake_clock,
+    )
+
+    assert result.status == "INCOMPLETE"
+    assert result.records_verified == 1
+    assert result.failure_reason is not None
+    assert "incomplete" in result.failure_reason.lower()
+    assert "time limit" in result.failure_reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_audit_verification_reports_incomplete_without_full_success(
+    async_client: AsyncClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+):
+    admin = await _login_admin(
+        async_client, db_session, email="admin_verify_limit@example.com"
+    )
+    for index in range(3):
+        _add_event(
+            db_session,
+            action=f"test.verify.limit.{index}",
+            actor_id=admin.id,
+            resource_type="test_resource",
+        )
+    total = db_session.query(AuditEvent).count()
+    monkeypatch.setattr(settings, "AUDIT_VERIFY_MAX_RECORDS", max(total - 1, 1))
+
+    response = await async_client.get("/api/v1/admin/audit/verify")
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["status"] == "INCOMPLETE"
+    assert data["is_valid"] is False
+    assert data["records_verified"] == 0
+    assert "incomplete" in data["failure_reason"].lower()
+    assert re.search(r"\b[0-9a-f]{64}\b", data["failure_reason"]) is None
+
+
+@pytest.mark.asyncio
+async def test_audit_verification_is_rate_limited(
+    async_client: AsyncClient, db_session: Session
+):
+    await _login_admin(
+        async_client, db_session, email="admin_verify_rate_limit@example.com"
+    )
+    limit = audit_verification_rate_limiter.max_requests
+
+    for _ in range(limit):
+        allowed = await async_client.get("/api/v1/admin/audit/verify")
+        assert allowed.status_code == 200, allowed.text
+
+    blocked = await async_client.get("/api/v1/admin/audit/verify")
+    assert blocked.status_code == 429
+    assert blocked.headers["retry-after"].isdigit()
+    assert int(blocked.headers["retry-after"]) >= 1
+    assert blocked.headers["cache-control"] == "no-store"
+    assert blocked.headers["pragma"] == "no-cache"
+    assert "rate limit" in blocked.json()["detail"].lower()
+
+    repeated = await async_client.get(
+        "/api/v1/admin/audit/verify",
+        params={"max_records": "999999", "batch_size": "1"},
+    )
+    assert repeated.status_code == 429
 
 
 @pytest.mark.asyncio

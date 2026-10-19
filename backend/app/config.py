@@ -57,6 +57,34 @@ class Settings(BaseSettings):
     LOGIN_RATE_LIMIT_MAX_ATTEMPTS: int = 5
     LOGIN_RATE_LIMIT_WINDOW_SECONDS: int = 300
 
+    # Audit Chain Verification Resource Controls
+    AUDIT_VERIFY_MAX_RECORDS: int = Field(
+        default=100_000,
+        ge=1,
+        description="Maximum audit-chain length accepted for a complete verification pass",
+    )
+    AUDIT_VERIFY_BATCH_SIZE: int = Field(
+        default=1_000,
+        ge=1,
+        le=10_000,
+        description="Audit rows fetched per verification batch",
+    )
+    AUDIT_VERIFY_TIMEOUT_SECONDS: int = Field(
+        default=30,
+        ge=1,
+        description="Wall-clock budget for a complete audit-chain verification pass",
+    )
+    AUDIT_VERIFY_RATE_LIMIT_MAX_REQUESTS: int = Field(
+        default=5,
+        ge=1,
+        description="Verification requests allowed per administrator per window",
+    )
+    AUDIT_VERIFY_RATE_LIMIT_WINDOW_SECONDS: int = Field(
+        default=60,
+        ge=1,
+        description="Sliding window for verification request rate limiting",
+    )
+
     # CORS
     CORS_ORIGINS: str | list[str] = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000"
 

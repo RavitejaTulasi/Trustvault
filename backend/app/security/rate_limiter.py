@@ -97,5 +97,58 @@ class LoginRateLimiter:
             self._attempts.clear()
 
 
+class SlidingWindowRateLimiter:
+    """
+    Generic process-local sliding-window limiter for expensive authenticated requests.
+
+    Keying is caller-supplied so limits can be scoped to a stable identity (for example,
+    an administrator user ID) rather than a spoofable client-supplied value. Like the
+    login limiter, state is held in process memory and is not shared across workers or
+    application instances.
+    """
+
+    def __init__(
+        self,
+        max_requests: int,
+        window_seconds: int,
+        time_func: Callable[[], float] = time.monotonic,
+    ):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.time_func = time_func
+        self._lock = threading.Lock()
+        self._requests: dict[str, list[float]] = {}
+
+    def allow(self, key: str) -> tuple[bool, int]:
+        """
+        Atomically admits one request for the key if capacity remains.
+        Returns: (is_allowed, retry_after_seconds)
+        """
+        now = self.time_func()
+        window_start = now - self.window_seconds
+
+        with self._lock:
+            timestamps = [t for t in self._requests.get(key, []) if t > window_start]
+            if len(timestamps) >= self.max_requests:
+                self._requests[key] = timestamps
+                retry_after = int(timestamps[0] + self.window_seconds - now) + 1
+                return False, max(retry_after, 1)
+
+            timestamps.append(now)
+            self._requests[key] = timestamps
+            return True, 0
+
+    def reset(self) -> None:
+        """Resets all rate limit state (used for test isolation)."""
+        with self._lock:
+            self._requests.clear()
+
+
 # Global singleton instance for app-wide login rate limiting
 login_rate_limiter = LoginRateLimiter()
+
+# Process-local limiter for expensive administrative audit verification requests
+audit_verification_rate_limiter = SlidingWindowRateLimiter(
+    max_requests=settings.AUDIT_VERIFY_RATE_LIMIT_MAX_REQUESTS,
+    window_seconds=settings.AUDIT_VERIFY_RATE_LIMIT_WINDOW_SECONDS,
+)

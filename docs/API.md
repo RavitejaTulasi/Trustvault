@@ -285,16 +285,36 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 ### `GET /api/v1/admin/audit/verify`
 - **Authentication**: Required
 - **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
-- **Action**: Performs a complete read-only validation of audit sequence continuity, previous-hash links, and recomputed SHA-256 record hashes. It does not modify, repair, or append audit records.
+- **Action**: Performs a bounded, read-only validation of audit sequence continuity, previous-hash links, and recomputed SHA-256 record hashes. It does not modify, repair, append, or truncate audit records.
+- **Consistency Boundary**: The endpoint first reads the current maximum `sequence_number` as a high-water mark, then verifies records in ascending keyset batches with `sequence_number <= high_water_mark`. Records committed after the high-water mark are outside that verification pass. VALID is returned only when every sequence from 1 through the high-water mark was examined without an integrity failure.
+- **Resource Limits** (configurable through environment variables):
+
+  | Setting | Default | Purpose |
+  |---|---|---|
+  | `AUDIT_VERIFY_MAX_RECORDS` | `100000` | Maximum chain length accepted for a complete pass. A larger chain returns `INCOMPLETE` without examining records. |
+  | `AUDIT_VERIFY_BATCH_SIZE` | `1000` | Rows fetched per indexed batch. Prevents loading the entire chain into memory. |
+  | `AUDIT_VERIFY_TIMEOUT_SECONDS` | `30` | Wall-clock budget for the pass. Expiry returns `INCOMPLETE` with the verified count. |
+  | `AUDIT_VERIFY_RATE_LIMIT_MAX_REQUESTS` | `5` | Verification requests allowed per administrator per sliding window. |
+  | `AUDIT_VERIFY_RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding-window duration for verification rate limiting. |
+
 - **Response `200 OK`**:
   ```json
   {
+    "status": "VALID",
     "is_valid": true,
     "records_verified": 42,
     "failure_reason": null
   }
   ```
-- **Failure Response**: The endpoint still returns `200 OK`, with `is_valid: false`, the number of records verified before the failure, and a `failure_reason` identifying the sequence gap, broken link, or tampered record. Full 64-character hash values in the underlying diagnostic are redacted as `[redacted]`; sequence numbers and failure type remain available.
+- **Status Semantics**:
+  - `VALID`: every record from sequence 1 through the high-water mark was examined and passed. `is_valid` is `true`.
+  - `INVALID`: an altered record, altered record hash, broken previous-hash link, or sequence gap was detected. `is_valid` is `false`, and `records_verified` is the number of records successfully verified before the failure.
+  - `INCOMPLETE`: complete verification could not be performed because the chain exceeded the configured record limit or the time budget expired. `is_valid` is `false`, `records_verified` reports only records actually verified, and `failure_reason` explicitly states that verification was incomplete. An `INCOMPLETE` response never represents full-chain success.
+- **Failure Response**: Integrity failures and incomplete passes both return `200 OK` with the status fields above. Full 64-character hash values in the underlying diagnostic are redacted as `[redacted]`; sequence numbers and failure type remain available.
+- **Rate Limit Response**: Exceeding the per-administrator verification limit returns `429 Too Many Requests` with a `Retry-After` header in seconds and a generic error detail. Rate-limit responses also set `Cache-Control: no-store` and `Pragma: no-cache`. Query parameters cannot bypass the limit because the endpoint accepts none and every admitted or rejected request is evaluated against the same administrator identity.
+- **Limiter Scope**: The limiter is in-memory and process-local. It is not shared across multiple workers or application instances, so the effective limit can be multiplied by the number of processes. Distributed enforcement requires an external shared limiter such as Redis.
+- **Concurrency Limitation**: The high-water mark excludes later writes and prevents an endless verification chase, but the batch reads are not a single repeatable-read snapshot. A tampering write that lands between batch reads may not be reflected consistently in one pass; re-run verification after writes are quiesced for a stronger point-in-time check.
+- **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
 
 ### `GET /api/v1/admin/documents/activity`
 - **Authentication**: Required

@@ -103,16 +103,25 @@ Where:
 - $PreviousHash_i = RecordHash_{i-1}$ for $i > 1$
 
 ### Verification Mechanism
-`AuditService.verify_chain_integrity(db)` performs a complete traversal from index 1 to $N$:
+`AuditService.verify_chain_integrity_bounded(db, ...)` verifies the chain from index 1 through a high-water mark captured at the start of the pass. Records are fetched in ascending keyset batches (bounded by `AUDIT_VERIFY_BATCH_SIZE`) using selected columns rather than materializing ORM entities or the full chain. For every record it:
 1. Validates strictly ascending sequence numbers without gaps.
 2. Validates that `event.previous_hash == previous_event.record_hash`.
 3. Canonicalizes timestamps into UTC `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
 4. Recomputes the SHA-256 hash and asserts exact equality against `event.record_hash`.
 
-Administrators can invoke this verification through the read-only `GET /api/v1/admin/audit/verify` endpoint. The endpoint reports validity, the number of records verified before any failure, and a failure reason with full hash values redacted. It never rewrites a record, appends an event, or returns the stored hash-chain fields.
+The pass is bounded by `AUDIT_VERIFY_MAX_RECORDS` and `AUDIT_VERIFY_TIMEOUT_SECONDS`. The result distinguishes three outcomes:
+
+- `VALID`: all records through the high-water mark were examined and passed.
+- `INVALID`: an integrity failure was detected; the reported count stops before the failing record.
+- `INCOMPLETE`: the record limit or time budget prevented complete verification. `is_valid` is `false`, and the result explicitly states that the pass was incomplete. A partial pass is never reported as full-chain success.
+
+Administrators can invoke this verification through the read-only `GET /api/v1/admin/audit/verify` endpoint. The endpoint reports the status, the number of records verified, and a failure reason with full hash values redacted. It never rewrites a record, appends an event, truncates the chain, or returns stored hash-chain fields. Verification requests are limited per administrator by a process-local sliding-window limiter (`AUDIT_VERIFY_RATE_LIMIT_MAX_REQUESTS` per `AUDIT_VERIFY_RATE_LIMIT_WINDOW_SECONDS`, default 5 per 60 seconds); excess requests receive `429 Too Many Requests` with `Retry-After`.
+
+### Verification Consistency and Limits
+The high-water mark prevents verification from chasing audit writes that are appended during the pass: only records at or below the maximum sequence observed at the start are examined. This is not a single repeatable-read database snapshot. A record modified between batch reads can cause a mixed read, and a modification made after a record was already examined is not re-checked until the next run. For a stronger point-in-time result, run verification during a quiet window or against a database snapshot/read replica. The rate limiter is process-local and is not shared across workers or instances; deployment-level or Redis-backed enforcement is required to bound aggregate concurrency. If the chain exceeds the configured record limit or the time budget expires, the endpoint returns an explicit `INCOMPLETE` result rather than a partial success.
 
 ### Limitation & Production Anchoring
-Hash chaining reliably detects unauthorized modification, insertion, or deletion of individual records. However, an attacker with full database superuser privileges could theoretically rewrite the entire chain from an arbitrary record forward. For high-assurance production environments, TrustVault supports streaming audit hashes to immutable external storage (e.g., AWS S3 Object Lock in Compliance Mode or RFC 3161 timestamping authorities).
+Hash chaining reliably detects unauthorized modification, insertion, or deletion of individual records within the observed chain. However, an attacker with full database superuser privileges could theoretically rewrite the entire chain from an arbitrary record forward. Truncating the current tail before a verification pass is also undetectable from database-internal state alone: the high-water mark is derived from the remaining rows, and the chain contains no self-authenticating record count. For high-assurance production environments, TrustVault supports streaming audit hashes to immutable external storage (e.g., AWS S3 Object Lock in Compliance Mode or RFC 3161 timestamping authorities) and recommends periodic external root-hash publication.
 
 ---
 
@@ -122,7 +131,7 @@ Hash chaining reliably detects unauthorized modification, insertion, or deletion
 All three endpoints require the authenticated `admin` role and are registered under `/api/v1`:
 
 - `GET /admin/audit`: filtered, paginated audit-event inspection across all actors and resources.
-- `GET /admin/audit/verify`: full hash-chain verification.
+- `GET /admin/audit/verify`: bounded hash-chain verification with explicit `VALID`, `INVALID`, or `INCOMPLETE` outcomes and per-administrator rate limiting.
 - `GET /admin/documents/activity`: filtered, paginated document and document-grant activity.
 
 The audit and activity response schemas expose only `id`, `sequence_number`, `timestamp`, `actor_id`, `action`, `resource_type`, `resource_id`, `outcome`, `request_id`, `ip_address`, `user_agent`, and sanitized `details`. `previous_hash` and `record_hash` are deliberately excluded, as are any credential fields. `details` uses a default-deny allowlist that preserves correlation and account-management keys (`document_id`, `recipient_id`, `target_user_id`, `permission`, `reason`, `changed_fields`, `role`, `from_role`, `to_role`, `email`, and `sessions_revoked`) and returns `[redacted]` for every other key, including document title, filename, size, category, MIME type, storage path/key, password, and token values. Raw audit rows are unchanged. Verification failure diagnostics redact full hash values. All three endpoints also return `Cache-Control: no-store` and `Pragma: no-cache`. String filters are trimmed, length-bounded, and exact-matched through bound SQLAlchemy expressions. `document_id` activity filtering matches direct document events by `resource_id` and grant events by the recorded `details.document_id`; LIKE metacharacters in the supplied ID are escaped.

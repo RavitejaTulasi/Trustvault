@@ -142,3 +142,39 @@ When collaborating with AI on TrustVault, the following engineering prompts and 
 - **What was Changed and How Verified**:
   Verified with `pytest backend/tests/ -q`: 85/85 tests passing (69 prior + 16 Day 6 tests: 12 initial + 4 final-review tests). `pytest backend/tests/ -q -W error` also passed 85/85. `ruff check .` still reports the same 45 pre-existing findings (38 `B008`, 3 `I001`, 2 `F401`, 1 `BLE001`, 1 `F841`) with no new findings or rule categories. `git diff --check` reported no whitespace errors, only Git's CRLF conversion warnings.
 - **Git Status**: Day 6 changes remain uncommitted and unpushed pending review. No commit hash is recorded because no commit has been created.
+
+---
+
+### Entry 8 (Day 6.1 — 2026-10-19): Bounded Audit-Chain Verification and Abuse Resistance
+- **Category**: Resource Exhaustion Protection / Audit Integrity Verification
+- **Prompt Summary** (abridged from the actual Day 6.1 prompt):
+  "Harden `GET /api/v1/admin/audit/verify` against CPU, memory, database, and request exhaustion while preserving complete and trustworthy integrity verification. Use bounded batching, configurable limits, administrator-scoped rate limiting, explicit incomplete results, and regression tests. Do not change the hash format or historical audit data, and leave all changes uncommitted."
+- **Baseline Inspected Before Changes**:
+  - HEAD and `origin/main` were both `b8f1992`; the Day 6 changes were still staged and uncommitted.
+  - `AuditService.verify_chain_integrity()` executed `list(db.execute(select(AuditEvent).order_by(...)).scalars().all())`, materializing the entire audit chain as ORM objects before hashing any record.
+  - The verification endpoint had no record limit, timeout, or request rate limiting, and was protected only by the administrator role check.
+  - The existing rate limiter was an in-memory, process-local login limiter keyed by IP and email. No shared/distributed limiter existed.
+  - Baseline test result: 85 passed.
+- **What the AI Produced**:
+  - Added `AuditService.verify_chain_integrity_bounded()`, which captures the current maximum `sequence_number` as a high-water mark and verifies records in ascending keyset batches. Batches select only the columns required for hashing, so the ORM identity map and full chain are not materialized.
+  - Added `AuditVerificationResult` with three outcomes: `VALID`, `INVALID`, and `INCOMPLETE`. `VALID` is returned only after every sequence from 1 through the high-water mark is examined.
+  - Added configurable limits: `AUDIT_VERIFY_MAX_RECORDS` (default 100000), `AUDIT_VERIFY_BATCH_SIZE` (default 1000), `AUDIT_VERIFY_TIMEOUT_SECONDS` (default 30), `AUDIT_VERIFY_RATE_LIMIT_MAX_REQUESTS` (default 5), and `AUDIT_VERIFY_RATE_LIMIT_WINDOW_SECONDS` (default 60).
+  - Added `SlidingWindowRateLimiter`, keyed by administrator user ID, and applied it to the verification endpoint. Rate-limited requests receive `429 Too Many Requests` with `Retry-After` and no-cache headers.
+  - Extended `AuditVerificationResponse` with an explicit `status` field while retaining `is_valid`, `records_verified`, and `failure_reason` for compatibility.
+  - Kept the existing `verify_chain_integrity()` tuple API as a bounded wrapper so existing service callers and tests retain their contract.
+  - Added six tests: empty chain, bounded multi-batch traversal, out-of-range low sequence detection, timeout-driven incomplete verification, chain-exceeds-record-limit incomplete verification, and per-administrator verification rate limiting.
+  - Updated `.env.example`, `docs/API.md`, `docs/ARCHITECTURE.md`, and `THREATS.md`.
+- **Issues Discovered and Corrections Made**:
+  - Loading a full batch and checking the deadline only at the top of the loop could report `INCOMPLETE` after the final batch had already verified the high-water mark. Added an immediate `VALID` return when the last verified sequence reaches the high-water mark.
+  - Setting cache headers on the injected `Response` before raising `HTTPException` would not reliably preserve them on the 429 response. Added `Cache-Control: no-store` and `Pragma: no-cache` directly to the rate-limit exception headers.
+  - The existing API contract had only `is_valid`, which cannot distinguish tampering from a resource-limited pass. Added `status` rather than overloading `is_valid`; both `INVALID` and `INCOMPLETE` return `is_valid: false`, but only `INVALID` represents an integrity failure.
+  - The initial keyset query started after sequence 0, so a tampered row with a non-positive `sequence_number` would never be fetched and could escape detection even though the previous verifier caught it as a sequence gap. Captured `MIN(sequence_number)` alongside the high-water mark and reject any minimum below 1 before batching; added a regression test.
+  - The verifier cannot detect deletion of the current tail record when that deletion occurs before the high-water mark is captured, because no external anchor commits to the chain length. This pre-existing hash-chain limitation remains documented as a residual risk rather than being hidden.
+  - The new limiter is intentionally process-local. Documentation states that multiple workers or instances multiply the effective limit and that distributed enforcement requires a shared limiter such as Redis.
+  - Batch reads use a high-water mark rather than a database-wide repeatable-read snapshot. Concurrent tampering between batch reads may require a re-run during a quiet window; this limitation is documented instead of claiming a fully consistent snapshot.
+- **What was Changed and How Verified**:
+  - `python -m pytest backend/tests/ -q`: 91 passed (85 prior + 6 new).
+  - `python -m pytest backend/tests/ -q -W error`: 91 passed.
+  - `python -m ruff check . --statistics`: 45 findings, unchanged from baseline (38 `B008`, 3 `I001`, 2 `F401`, 1 `BLE001`, 1 `F841`).
+  - `git diff --check`: no whitespace errors; only Git's expected CRLF conversion warnings.
+- **Git Status**: Day 6.1 changes remain uncommitted and unpushed. Day 6 remains staged; no commit hash is recorded because no commit was created.

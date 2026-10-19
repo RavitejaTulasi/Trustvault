@@ -18,7 +18,10 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
 from backend.app.database import Base, get_db
 from backend.app.main import app
-from backend.app.security.rate_limiter import login_rate_limiter
+from backend.app.security.rate_limiter import (
+    audit_verification_rate_limiter,
+    login_rate_limiter,
+)
 
 # In-memory test engine isolated to test suite
 TEST_SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -41,10 +44,12 @@ def setup_test_db():
 
 @pytest.fixture(autouse=True)
 def reset_rate_limiter_fixture():
-    """Resets the login rate limiter state before and after each test."""
+    """Resets rate limiter state before and after each test."""
     login_rate_limiter.reset()
+    audit_verification_rate_limiter.reset()
     yield
     login_rate_limiter.reset()
+    audit_verification_rate_limiter.reset()
 
 
 @pytest.fixture

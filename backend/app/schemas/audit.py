@@ -4,7 +4,7 @@ Pydantic Schemas for Administrative Audit Trail Queries
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, field_validator
 
@@ -85,8 +85,9 @@ class AuditEventListResponse(BaseModel):
 
 
 class AuditVerificationResponse(BaseModel):
-    """Result of a complete audit hash-chain verification pass."""
+    """Result of a bounded audit hash-chain verification pass."""
 
+    status: Literal["VALID", "INVALID", "INCOMPLETE"]
     is_valid: bool
     records_verified: int
     failure_reason: str | None = None
