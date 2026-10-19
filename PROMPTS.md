@@ -29,7 +29,7 @@ When collaborating with AI on TrustVault, the following engineering prompts and 
   When the integration test `test_audit_service_initialization_and_verification` executed, `verify_chain_integrity()` loaded the committed `AuditEvent` back from the database. The database engine (SQLite during local testing, and standard SQL DateTime columns without custom type decorators) returns timestamps as timezone-naive datetime objects. Calling `.isoformat()` on the retrieved object yielded `2026-10-19T07:47:53.123456` (lacking the `+00:00` suffix). This produced an unexpected hash mismatch, erroneously triggering a false-positive `Record tampering detected at sequence 1` assertion failure.
 - **What was Changed and How Verified**:
   Created a dedicated, deterministic canonical formatter `AuditService.format_timestamp(dt: datetime) -> str`. It inspects `dt.tzinfo`: if naive, it assigns UTC; if aware, it converts to UTC, and formats explicitly with `%Y-%m-%dT%H:%M:%S.%fZ`. Both `log_event()` and `verify_chain_integrity()` now pass `datetime` objects to `calculate_hash()`, ensuring byte-for-byte serialization identity regardless of database driver quirks. Verified by running `pytest -v`, where both `test_audit_service_initialization_and_verification` and `test_audit_service_detects_tampering` passed successfully.
-- **Git Commit**: Commit `day-1-foundation` (Initial repository foundation commit).
+- **Git Commit**: Commit `631a034` ("feat(core): initialize Day 1 foundation, health check, schema models, and tamper-evident audit service").
 
 ---
 
