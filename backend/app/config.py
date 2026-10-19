@@ -89,9 +89,15 @@ class Settings(BaseSettings):
     # Audit Checkpoint Anchoring
     # "local_file" is a development adapter only. It is not independent of the
     # application host and must never be treated as production-grade anchoring.
-    AUDIT_ANCHOR_MODE: Literal["disabled", "local_file"] = Field(
+    # "s3" selects the external object-storage adapter and requires an
+    # independently controlled bucket; no bucket or credentials ship with this
+    # repository, so an unconfigured deployment fails closed.
+    AUDIT_ANCHOR_MODE: Literal["disabled", "local_file", "s3"] = Field(
         default="disabled",
-        description="Checkpoint anchoring adapter: 'disabled' or development-only 'local_file'",
+        description=(
+            "Checkpoint anchoring adapter: 'disabled', development-only "
+            "'local_file', or external 's3'"
+        ),
     )
     AUDIT_ANCHOR_DIR: str = Field(
         default="./audit_checkpoints",
@@ -99,7 +105,59 @@ class Settings(BaseSettings):
     )
     AUDIT_ANCHOR_HMAC_KEY: str = Field(
         default="",
-        description="HMAC key (>= 32 characters) used to integrity-protect local checkpoints",
+        description=(
+            "HMAC key (>= 32 characters) used to integrity-protect checkpoints; "
+            "required for 'local_file' and 's3' modes"
+        ),
+    )
+    AUDIT_ANCHOR_S3_BUCKET: str = Field(
+        default="",
+        description="Bucket for the external S3 checkpoint adapter (required for mode 's3')",
+    )
+    AUDIT_ANCHOR_S3_PREFIX: str = Field(
+        default="trustvault-audit-checkpoints",
+        description="Object key prefix for checkpoints in the external bucket",
+    )
+    AUDIT_ANCHOR_S3_REGION: str = Field(
+        default="",
+        description="AWS region for the external checkpoint bucket (required for mode 's3')",
+    )
+    AUDIT_ANCHOR_S3_ENDPOINT_URL: str = Field(
+        default="",
+        description=(
+            "Optional custom endpoint for S3-compatible services; must be https "
+            "in production"
+        ),
+    )
+    AUDIT_ANCHOR_S3_KMS_KEY_ID: str = Field(
+        default="",
+        description="Optional KMS key ID for server-side encryption of checkpoint objects",
+    )
+    AUDIT_ANCHOR_S3_OBJECT_LOCK_MODE: Literal["", "GOVERNANCE", "COMPLIANCE"] = Field(
+        default="",
+        description=(
+            "Optional S3 Object Lock mode; the bucket must have Object Lock enabled"
+        ),
+    )
+    AUDIT_ANCHOR_S3_OBJECT_LOCK_DAYS: int = Field(
+        default=30,
+        ge=1,
+        description="Retention period applied when S3 Object Lock mode is configured",
+    )
+    AUDIT_ANCHOR_S3_CONNECT_TIMEOUT_SECONDS: int = Field(
+        default=5,
+        ge=1,
+        description="Connect timeout for external checkpoint store requests",
+    )
+    AUDIT_ANCHOR_S3_READ_TIMEOUT_SECONDS: int = Field(
+        default=10,
+        ge=1,
+        description="Read timeout for external checkpoint store requests",
+    )
+    AUDIT_ANCHOR_S3_MAX_ATTEMPTS: int = Field(
+        default=3,
+        ge=1,
+        description="Maximum attempts for retryable external checkpoint store requests",
     )
     AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS: int = Field(
         default=5,
@@ -132,6 +190,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_anchor_settings(self) -> "Settings":
+        if self.AUDIT_ANCHOR_MODE == "disabled":
+            return self
+
+        if len(self.AUDIT_ANCHOR_HMAC_KEY) < 32:
+            raise ValueError(
+                "AUDIT_ANCHOR_HMAC_KEY must be at least 32 characters when "
+                "AUDIT_ANCHOR_MODE is 'local_file' or 's3'."
+            )
+
         if self.AUDIT_ANCHOR_MODE == "local_file":
             if self.ENVIRONMENT == "production":
                 raise ValueError(
@@ -139,11 +206,26 @@ class Settings(BaseSettings):
                     "independent production anchoring. Disable it or configure a "
                     "supported external checkpoint adapter."
                 )
-            if len(self.AUDIT_ANCHOR_HMAC_KEY) < 32:
-                raise ValueError(
-                    "AUDIT_ANCHOR_HMAC_KEY must be at least 32 characters when "
-                    "AUDIT_ANCHOR_MODE=local_file."
-                )
+            return self
+
+        # AUDIT_ANCHOR_MODE == "s3": required provider configuration is explicit
+        if not self.AUDIT_ANCHOR_S3_BUCKET.strip():
+            raise ValueError(
+                "AUDIT_ANCHOR_S3_BUCKET is required when AUDIT_ANCHOR_MODE=s3."
+            )
+        if not self.AUDIT_ANCHOR_S3_REGION.strip():
+            raise ValueError(
+                "AUDIT_ANCHOR_S3_REGION is required when AUDIT_ANCHOR_MODE=s3."
+            )
+        if (
+            self.ENVIRONMENT == "production"
+            and self.AUDIT_ANCHOR_S3_ENDPOINT_URL
+            and not self.AUDIT_ANCHOR_S3_ENDPOINT_URL.startswith("https://")
+        ):
+            raise ValueError(
+                "AUDIT_ANCHOR_S3_ENDPOINT_URL must use https in production; "
+                "plaintext endpoints are not permitted for checkpoint anchoring."
+            )
         return self
 
     @property

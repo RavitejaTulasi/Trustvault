@@ -28,6 +28,7 @@ from backend.app.services.checkpoint_store import (
     CheckpointIntegrityError,
     CheckpointRollbackError,
     CheckpointStore,
+    CheckpointStoreAccessDeniedError,
     CheckpointStoreUnavailableError,
 )
 
@@ -108,6 +109,8 @@ class CheckpointService:
 
         try:
             existing = store.read_latest()
+        except CheckpointStoreAccessDeniedError:
+            raise CheckpointCreationError("anchor_access_denied") from None
         except CheckpointStoreUnavailableError:
             raise CheckpointCreationError("anchor_unavailable") from None
         except CheckpointIntegrityError:
@@ -151,6 +154,8 @@ class CheckpointService:
             raise CheckpointCreationError("anchor_conflict") from None
         except CheckpointIntegrityError:
             raise CheckpointCreationError("anchor_integrity_failure") from None
+        except CheckpointStoreAccessDeniedError:
+            raise CheckpointCreationError("anchor_access_denied") from None
         except CheckpointStoreUnavailableError:
             raise CheckpointCreationError("anchor_unavailable") from None
 
@@ -191,6 +196,14 @@ class CheckpointService:
 
         try:
             checkpoint = store.read_latest()
+        except CheckpointStoreAccessDeniedError:
+            return CheckpointVerificationResult(
+                "INCOMPLETE",
+                chain.records_verified,
+                None,
+                None,
+                "Checkpoint store access was denied",
+            )
         except CheckpointStoreUnavailableError:
             return CheckpointVerificationResult(
                 "INCOMPLETE",

@@ -116,6 +116,8 @@ pytest backend/tests/ -v
 
 All tests execute against an isolated in-memory database and evaluate live endpoints via HTTPX.
 
+The default suite is fully offline. Real AWS S3 checkpoint integration tests are opt-in, skipped unless explicitly enabled, and require an independently approved test bucket; see [`docs/AWS_INTEGRATION_TESTING.md`](docs/AWS_INTEGRATION_TESTING.md). They have not been run against live AWS in this build.
+
 ---
 
 ## Demo Credentials (Seeded on Day 2)

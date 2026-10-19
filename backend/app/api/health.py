@@ -42,9 +42,13 @@ def get_health(response: Response) -> HealthResponse:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     anchor_mode = settings.AUDIT_ANCHOR_MODE
-    anchor_status = (
-        "not_configured" if anchor_mode == "disabled" else "local_development_only"
-    )
+    # This reports configuration only; it does not probe the provider. A
+    # configured external adapter is not proof that anchoring is live.
+    anchor_status = {
+        "disabled": "not_configured",
+        "local_file": "local_development_only",
+        "s3": "external_provider_configured",
+    }.get(anchor_mode, "not_configured")
 
     return HealthResponse(
         status="healthy" if is_healthy else "unhealthy",
@@ -63,7 +67,7 @@ def get_health(response: Response) -> HealthResponse:
             "audit_anchor": {
                 "status": anchor_status,
                 "mode": anchor_mode,
-                "independent": False,
+                "independent": anchor_mode == "s3",
             },
         },
     )

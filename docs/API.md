@@ -18,7 +18,7 @@ This document details the complete API contract for TrustVault, including authen
 - `413 Payload Too Large`: Upload exceeds maximum allowed file size (10MB).
 - `422 Unprocessable Entity`: Malformed query parameter, invalid filter value, or invalid date range.
 - `429 Too Many Requests`: Rate limit exceeded (e.g. login brute-force throttle).
-- `503 Service Unavailable`: Database or storage health failure.
+- `503 Service Unavailable`: Database or storage health failure, or the configured checkpoint provider is unreachable or denies access.
 
 ### Security Headers on Every Response
 - `X-Content-Type-Options: nosniff`
@@ -318,6 +318,13 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 - **Concurrency Limitation**: The high-water mark excludes later writes and prevents an endless verification chase, but the batch reads are not a single repeatable-read snapshot. A tampering write that lands between batch reads may not be reflected consistently in one pass; re-run verification after writes are quiesced for a stronger point-in-time check.
 - **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
 
+### Checkpoint Anchoring Configuration
+Checkpoint endpoints use the adapter selected by `AUDIT_ANCHOR_MODE`:
+
+- `disabled` (default): no anchoring; creation returns `503` and verification returns `INCOMPLETE`.
+- `local_file`: development-only local directory (`AUDIT_ANCHOR_DIR`); rejected at startup in `ENVIRONMENT=production`.
+- `s3`: external Amazon S3 or S3-compatible bucket (`AUDIT_ANCHOR_S3_*`), using the AWS default credential chain. Checkpoint documents use the same HMAC-protected format and conditional writes as the local adapter. The adapter ships in code but no provider configuration or credentials exist in this repository.
+
 ### `POST /api/v1/admin/audit/checkpoints`
 - **Authentication**: Required
 - **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
@@ -334,9 +341,9 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
     "anchor_mode": "local_file"
   }
   ```
-  `status` is `CREATED` or `ALREADY_PRESENT`. Response fields never include record hashes, HMAC tags, signing keys, or filesystem paths.
+  `status` is `CREATED` or `ALREADY_PRESENT`. `anchor_mode` is the configured adapter (`local_file` or `s3`). Response fields never include record hashes, HMAC tags, signing keys, filesystem paths, bucket names, object prefixes, endpoints, or provider error details.
 - **Refusal `409 Conflict`**: Returned when the chain fails verification (altered record, broken link, gap), when the bounded pass was incomplete, when the stored checkpoint is ahead of the chain, or when the anchor store rejects a rollback or conflicting write. The detail is a generic message; the stored `audit.checkpoint_created` failure event records an allowlisted `reason` such as `chain_invalid`, `chain_incomplete`, `anchor_ahead_of_chain`, `anchor_chain_mismatch`, `anchor_rollback_detected`, or `anchor_conflict`.
-- **Unavailable `503 Service Unavailable`**: Returned with a generic detail when no anchor adapter is configured (`AUDIT_ANCHOR_MODE=disabled`) or the configured adapter is not reachable. The failure is recorded as `audit.checkpoint_created` with outcome `FAILURE` and `reason: anchor_unavailable` where the audit trail is available. Other refusal reasons (`anchor_integrity_failure`, `anchor_format_unsupported`, `anchor_stream_mismatch`, `anchor_ahead_of_chain`, `anchor_chain_mismatch`, `anchor_rollback_detected`, `anchor_conflict`) return `409 Conflict`.
+- **Unavailable `503 Service Unavailable`**: Returned with a generic detail when no anchor adapter is configured (`AUDIT_ANCHOR_MODE=disabled`), the configured adapter is not reachable, or the provider denies access. The failure is recorded as `audit.checkpoint_created` with outcome `FAILURE` and `reason: anchor_unavailable` or `anchor_access_denied` where the audit trail is available. Provider error payloads, credentials, bucket names, prefixes, and endpoints are never returned. Other refusal reasons (`anchor_integrity_failure`, `anchor_format_unsupported`, `anchor_stream_mismatch`, `anchor_ahead_of_chain`, `anchor_chain_mismatch`, `anchor_rollback_detected`, `anchor_conflict`) return `409 Conflict`.
 - **Rate Limit Response**: Checkpoint creation shares a separate per-administrator limiter from hash-chain verification. Exceeding `AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS` per `AUDIT_CHECKPOINT_RATE_LIMIT_WINDOW_SECONDS` returns `429` with `Retry-After`.
 - **Audit Event**: `audit.checkpoint_created` (SUCCESS with allowlisted `details.already_present` and `details.checkpoint_sequence`; FAILURE with allowlisted `details.reason`). The chain verification and anchor comparison inspect only records committed before the event is appended.
 - **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
@@ -356,7 +363,7 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
     "format_version": 1
   }
   ```
-  When no anchor adapter is configured (`AUDIT_ANCHOR_MODE=disabled`), the endpoint returns `200 OK` with `available: false` and `null` checkpoint fields instead of failing. If the adapter is configured but no checkpoint has been written yet, it returns `200 OK` with `available: false`.
+  When no anchor adapter is configured (`AUDIT_ANCHOR_MODE=disabled`), the endpoint returns `200 OK` with `available: false` and `null` checkpoint fields instead of failing. If the adapter is configured but no checkpoint has been written yet, it returns `200 OK` with `available: false`. Provider configuration (bucket, prefix, endpoint) is never returned.
 - **Unavailable `503 Service Unavailable` / Conflict `409 Conflict`**: `503` is returned when a configured adapter cannot be reached; `409` is returned when the stored checkpoint fails its integrity check. The details are generic.
 - **Audit Event**: `audit.checkpoint_read` (with `resource_type` `audit`). If the event cannot be persisted, the endpoint returns `503` with detail `Audit trail unavailable` instead of serving an unaudited response.
 - **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
@@ -366,9 +373,9 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 - **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
 - **Action**: Runs the same bounded chain verification as `GET /api/v1/admin/audit/verify`, then compares the verified chain against the latest stored checkpoint. The chain is verified first, so integrity failures take precedence over anchor state.
 - **Status Semantics**:
-  - `VALID`: the bounded chain verification passed and the record hash at the checkpointed sequence equals the checkpoint's stored hash. The chain may legitimately extend beyond the checkpoint; `chain_head_sequence` reports the verified head. `is_valid` is `true`.
+  - `VALID`: the bounded chain verification passed and the record hash at the checkpointed sequence equals the checkpoint's stored hash. The chain may legitimately extend beyond the checkpoint; `chain_head_sequence` reports the verified head. `is_valid` is `true`. `VALID` describes the chain and the latest checkpoint object the provider returned; it does not prove that the provider retained newer checkpoints or resisted deletion/rollback. Those guarantees depend on provider versioning, Object Lock, and permissions (see `docs/ARCHITECTURE.md`).
   - `INVALID`: the chain failed verification, the checkpointed sequence no longer exists (tail truncation), the chain's hash at that sequence no longer matches the checkpoint (history rewrite), or the stored checkpoint fails its HMAC integrity check. `is_valid` is `false`.
-  - `INCOMPLETE`: the chain passed verification but no anchor is configured or available, no checkpoint has been stored yet, or the bounded pass hit the record limit or time budget. `is_valid` is `false` and `failure_reason` states why a complete comparison could not be made. `INCOMPLETE` is never reported as `VALID`.
+  - `INCOMPLETE`: the chain passed verification but no anchor is configured or available, provider access was denied, no checkpoint has been stored yet, or the bounded pass hit the record limit or time budget. `is_valid` is `false` and `failure_reason` states why a complete comparison could not be made. `INCOMPLETE` is never reported as `VALID`.
 - **Response `200 OK`**:
   ```json
   {

@@ -50,7 +50,9 @@ from backend.app.services.checkpoint_store import (
     CheckpointStore,
     CheckpointStoreUnavailableError,
     LocalFileCheckpointStore,
+    S3CheckpointStore,
     UnavailableCheckpointStore,
+    create_s3_client,
 )
 
 router = APIRouter(prefix="/admin", tags=["Admin – Audit Trail"])
@@ -64,6 +66,9 @@ _CHECKPOINT_FAILURE_DETAILS = {
         "Checkpoint creation refused: audit chain verification was incomplete"
     ),
     "anchor_unavailable": "Checkpoint anchoring is not configured or unavailable",
+    "anchor_access_denied": (
+        "Checkpoint creation refused: checkpoint store access was denied"
+    ),
     "anchor_integrity_failure": (
         "Checkpoint creation refused: stored checkpoint failed its integrity check"
     ),
@@ -150,7 +155,8 @@ def get_checkpoint_store() -> CheckpointStore:
 
     Disabled or invalid configuration resolves to a fail-closed store so that
     administrative operations surface unavailability instead of claiming that an
-    external anchor exists.
+    external anchor exists. Provider credentials are never read here; the S3
+    client uses the AWS default credential chain.
     """
     if settings.AUDIT_ANCHOR_MODE == "local_file":
         try:
@@ -159,6 +165,32 @@ def get_checkpoint_store() -> CheckpointStore:
                 settings.AUDIT_ANCHOR_HMAC_KEY.encode("utf-8"),
             )
         except (OSError, ValueError):
+            logger.error("Audit checkpoint store initialization failed")
+    elif settings.AUDIT_ANCHOR_MODE == "s3":
+        try:
+            client = create_s3_client(
+                region=settings.AUDIT_ANCHOR_S3_REGION,
+                endpoint_url=settings.AUDIT_ANCHOR_S3_ENDPOINT_URL or None,
+                connect_timeout_seconds=settings.AUDIT_ANCHOR_S3_CONNECT_TIMEOUT_SECONDS,
+                read_timeout_seconds=settings.AUDIT_ANCHOR_S3_READ_TIMEOUT_SECONDS,
+                max_attempts=settings.AUDIT_ANCHOR_S3_MAX_ATTEMPTS,
+            )
+            if client is None:
+                logger.error(
+                    "Audit checkpoint S3 adapter is unavailable because boto3 "
+                    "is not installed"
+                )
+                return UnavailableCheckpointStore()
+            return S3CheckpointStore(
+                settings.AUDIT_ANCHOR_S3_BUCKET,
+                hmac_key=settings.AUDIT_ANCHOR_HMAC_KEY.encode("utf-8"),
+                client=client,
+                prefix=settings.AUDIT_ANCHOR_S3_PREFIX,
+                object_lock_mode=settings.AUDIT_ANCHOR_S3_OBJECT_LOCK_MODE or None,
+                object_lock_retain_days=settings.AUDIT_ANCHOR_S3_OBJECT_LOCK_DAYS,
+                kms_key_id=settings.AUDIT_ANCHOR_S3_KMS_KEY_ID or None,
+            )
+        except Exception:  # noqa: BLE001 - fail closed on client/config errors
             logger.error("Audit checkpoint store initialization failed")
     return UnavailableCheckpointStore()
 
@@ -410,7 +442,9 @@ def create_audit_checkpoint(
             db, actor_id=current_user.id, request=request, reason=exc.reason
         )
         status_code = (
-            503 if exc.reason == "anchor_unavailable" else 409
+            503
+            if exc.reason in {"anchor_unavailable", "anchor_access_denied"}
+            else 409
         )
         raise HTTPException(
             status_code=status_code,
@@ -458,9 +492,9 @@ def get_audit_checkpoint(
     store: Annotated[CheckpointStore, Depends(get_checkpoint_store)],
 ) -> CheckpointInfoResponse:
     _disable_caching(response)
-    available = settings.AUDIT_ANCHOR_MODE != "disabled"
+    configured = settings.AUDIT_ANCHOR_MODE != "disabled"
     checkpoint = None
-    if available:
+    if configured:
         try:
             checkpoint = store.read_latest()
         except CheckpointStoreUnavailableError:
@@ -481,7 +515,7 @@ def get_audit_checkpoint(
     )
     return CheckpointInfoResponse(
         anchor_mode=settings.AUDIT_ANCHOR_MODE,
-        available=available,
+        available=checkpoint is not None,
         stream_id=checkpoint.stream_id if checkpoint is not None else None,
         sequence_number=(
             checkpoint.sequence_number if checkpoint is not None else None

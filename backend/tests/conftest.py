@@ -24,6 +24,15 @@ from backend.app.security.rate_limiter import (
     login_rate_limiter,
 )
 
+
+def pytest_configure(config):
+    """Register opt-in markers so unknown-mark warnings never fail strict runs."""
+    config.addinivalue_line(
+        "markers",
+        "aws_integration: opt-in tests that use real AWS S3 and an explicitly approved bucket",
+    )
+
+
 # In-memory test engine isolated to test suite
 TEST_SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
 
