@@ -108,4 +108,4 @@ When collaborating with AI on TrustVault, the following engineering prompts and 
   - No model or migration change was required because `title`, `original_filename`, `category`, `owner_id`, and `created_at` already exist.
 - **What was Changed and How Verified**:
   Verified with `pytest backend/tests/ -v`: 69/69 tests passing (59 prior + 10 new). `ruff check .` still reports the same 45 pre-existing findings (38 `B008`, 3 `I001`, 2 `F401`, 1 `BLE001`, 1 `F841`) with no new findings or rule categories.
-- **Git Status**: Uncommitted changes pending user review; commit hash to be added after an approved commit exists.
+- **Git Status**: Committed and pushed as [`650acd63d930966d2d2254d3e0dfaeb8a104d9c8`](https://github.com/RavitejaTulasi/Trustvault/commit/650acd63d930966d2d2254d3e0dfaeb8a104d9c8) — "feat(security): add secure document search and effective permissions".
