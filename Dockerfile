@@ -1,0 +1,45 @@
+# ==============================================================================
+# TrustVault - Production Backend Dockerfile
+# ==============================================================================
+
+FROM python:3.12-slim-bookworm AS base
+
+# Prevent Python from writing .pyc files and enable unbuffered output
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# Install system runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY backend/requirements.txt /app/backend/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /app/backend/requirements.txt
+
+# Copy application code and Alembic migrations
+COPY backend /app/backend
+COPY alembic.ini /app/alembic.ini
+COPY .env.example /app/.env.example
+
+# Create directory for private persistent document storage
+RUN mkdir -p /app/private_storage && chmod 700 /app/private_storage
+
+# Create a non-privileged user to run the application (Defense in depth)
+RUN adduser --disabled-password --gecos "" trustvault && \
+    chown -R trustvault:trustvault /app
+USER trustvault
+
+EXPOSE 8000
+
+# Health check probe
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

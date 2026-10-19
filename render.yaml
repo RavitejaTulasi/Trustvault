@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: trustvault-backend
+    runtime: python
+    buildCommand: pip install -r backend/requirements.txt && alembic upgrade head
+    startCommand: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: trustvault-postgres
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: STORAGE_DIR
+        value: /var/data/private_storage
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: CORS_ORIGINS
+        value: https://trustvault.onrender.com
+    disk:
+      name: private-storage
+      mountPath: /var/data/private_storage
+      sizeGB: 10
+
+databases:
+  - name: trustvault-postgres
+    databaseName: trustvault_db
+    user: trustvault_user
+    plan: starter
