@@ -15,6 +15,11 @@ from backend.app.schemas.document import (
     DocumentResponse,
     DocumentUpdateRequest,
 )
+from backend.app.schemas.grant import (
+    GrantCreateRequest,
+    GrantListResponse,
+    GrantResponse,
+)
 from backend.app.schemas.health import HealthResponse
 
 __all__ = [
@@ -22,6 +27,9 @@ __all__ = [
     "DocumentListResponse",
     "DocumentResponse",
     "DocumentUpdateRequest",
+    "GrantCreateRequest",
+    "GrantListResponse",
+    "GrantResponse",
     "HealthResponse",
     "UserListResponse",
     "UserLoginRequest",

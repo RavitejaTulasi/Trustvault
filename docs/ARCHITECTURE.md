@@ -23,7 +23,7 @@ TrustVault enforces three distinct roles, with fine-grained document-level permi
 ### Role Definitions
 
 - **Administrator**: Responsible for platform governance, user lifecycle management, and security audit investigations.
-  * *Critical Rule*: Administrators are **NOT** superusers with automatic bypass to read or download confidential document contents. Content inspection is restricted unless explicitly granted document ownership or access by an owner.
+  * *Critical Rule*: Administrators are **NOT** superusers with automatic bypass to document metadata or contents. Administrators see only documents they own or are explicitly granted by an owner, and they cannot read or download other users' documents without such a grant.
 - **Document Owner**: Users who upload documents. Document owners have exclusive control over their documents (read, download, edit, delete, grant permissions, revoke permissions, and view document-specific audit history).
 - **Viewer**: Read-only or read/edit participants who have been explicitly granted access to specific documents. Viewers cannot upload documents, delete documents, or grant permissions to others.
 
@@ -33,19 +33,20 @@ TrustVault enforces three distinct roles, with fine-grained document-level permi
 |---|---|---|---|---|---|
 | **System Health (`GET /health`)** | Yes | Yes | Yes | Yes | Yes (Public probe) |
 | **User Authentication (`POST /auth/login`, `logout`)** | Yes | Yes | Yes | Yes | Yes (Public endpoint) |
-| **Manage Users (`POST /admin/users`, toggle active)** | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
-| **System-wide Audit Trail (`GET /admin/audit`)** | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
-| **Upload New Document (`POST /documents`)** | No* | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
-| **Read Document Metadata (`GET /documents/{id}`)** | No* | **Yes** | **Yes** | **Yes** | No (403/404 Deliberate) |
-| **Download Document Bytes (`GET /documents/{id}/download`)** | No* | **Yes** | **Yes** | **Yes** | No (403/404 Deliberate) |
-| **Edit Document / Upload Version (`PATCH /documents/{id}`)** | No* | **Yes** | **Yes** | No (403 Forbidden) | No (403/404 Deliberate) |
-| **Delete Document (`DELETE /documents/{id}`)** | No* | **Yes** (Owner only) | No (403 Forbidden) | No (403 Forbidden) | No (403/404 Deliberate) |
-| **Grant Access to Named User (`POST /documents/{id}/permissions`)**| No* | **Yes** (Owner only) | No (403 Forbidden) | No (403 Forbidden) | No (403/404 Deliberate) |
-| **Revoke Access (`DELETE /documents/{id}/permissions/{user_id}`)** | No* | **Yes** (Owner only) | No (403 Forbidden) | No (403 Forbidden) | No (403/404 Deliberate) |
-| **View Document Permissions (`GET /documents/{id}/permissions`)** | No* | **Yes** (Owner only) | No (403 Forbidden) | No (403 Forbidden) | No (403/404 Deliberate) |
-| **Search Documents (`GET /documents/search`)** | Metadata only | Own docs only | Granted docs only | Granted docs only | No (401 Unauthorized) |
+| **Manage Users (`GET/PATCH /admin/users`, revoke sessions)** | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
+| **System-wide Audit Trail (`GET /admin/audit`)** | **Planned** (not implemented) | N/A (planned) | N/A (planned) | N/A (planned) | N/A (planned) |
+| **Upload New Document (`POST /documents`)** | **Yes** (creates an admin-owned document) | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
+| **List Documents (`GET /documents`)** | Own/granted only | Own docs only | Granted docs only | Granted docs only | No (401 Unauthorized) |
+| **Read Document Metadata (`GET /documents/{id}`)** | Own/granted only | **Yes** | **Yes** | **Yes** | No (401/404 Deliberate) |
+| **Download Document Bytes (`GET /documents/{id}/download`)** | Own/granted only | **Yes** | **Yes** | **Yes** | No (401/404 Deliberate) |
+| **Edit Document Metadata (`PATCH /documents/{id}`)** | Own/granted only | **Yes** | **Yes** | No (404 Deliberate) | No (401/404 Deliberate) |
+| **Delete Document (`DELETE /documents/{id}`)** | Own only | **Yes** (Owner only) | No (404 Deliberate) | No (404 Deliberate) | No (401/404 Deliberate) |
+| **Grant Access to Named User (`POST /documents/{id}/permissions`)**| Own only | **Yes** (Owner only) | No (404 Deliberate) | No (404 Deliberate) | No (401/404 Deliberate) |
+| **Revoke Access (`DELETE /documents/{id}/permissions/{user_id}`)** | Own only | **Yes** (Owner only) | No (404 Deliberate) | No (404 Deliberate) | No (401/404 Deliberate) |
+| **View Document Permissions (`GET /documents/{id}/permissions`)** | Own only | **Yes** (Owner only) | No (404 Deliberate) | No (404 Deliberate) | No (401/404 Deliberate) |
+| **Search Documents (`GET /documents/search`)** | **Planned** (own/granted only) | **Planned** (own docs only) | **Planned** (granted docs only) | **Planned** (granted docs only) | N/A (planned) |
 
-*\* Note on Administrative Access*: If an administrator needs access to a document for legal discovery, an audited administrative delegation request must be executed or ownership reassigned through an explicitly logged administrative workflow. Administrators cannot silently eavesdrop on user documents.
+**Note on Administrative Access**: If an administrator needs access to a document for legal discovery, an explicitly logged owner grant is currently required. A dedicated administrative delegation/reassignment workflow is not implemented in the current build. Administrators cannot silently browse or download user documents through the admin role.
 
 ---
 

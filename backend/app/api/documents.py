@@ -1,14 +1,14 @@
 """
 Document Management and Storage API Endpoints
-Handles: upload, list, metadata retrieval, secure streaming download, metadata updates, and deletion.
+Handles: upload, list, metadata retrieval, secure streaming download, metadata updates, deletion, and sharing grants.
 
 Security controls implemented:
 - Centralized authorization enforcement via AuthorizationService (default deny)
 - Private persistent storage isolation outside web root (StorageService)
 - Magic byte validation and extension whitelisting
 - Deliberate 404 responses for unauthorized resource access to prevent metadata existence leakage
-- Tamper-evident audit logging for all document actions (success and denial)
-- Defense-in-depth security headers and cache control enforcement
+- Tamper-evident audit logging for all document actions and permission grants (success and denial)
+- Immediate revocation enforcement on every request without caching
 """
 
 import logging
@@ -24,16 +24,26 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse
+from sqlalchemy import or_
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
 from backend.app.models.audit import AuditOutcome
+from backend.app.models.base import utc_now
 from backend.app.models.document import Document
+from backend.app.models.grant import DocumentGrant
 from backend.app.models.user import User, UserRole
 from backend.app.schemas.document import (
     DocumentListResponse,
     DocumentResponse,
     DocumentUpdateRequest,
+)
+from backend.app.schemas.grant import (
+    GrantCreateRequest,
+    GrantListResponse,
+    GrantResponse,
 )
 from backend.app.security.auth import get_current_user
 from backend.app.services.audit_service import AuditService
@@ -50,6 +60,94 @@ def _get_client_ip(request: Request) -> str | None:
     if forwarded_for:
         return forwarded_for.split(",")[0].strip()
     return request.client.host if request.client else None
+
+
+def _get_active_grant(db: Session, document_id: str, user_id: str) -> DocumentGrant | None:
+    return (
+        db.query(DocumentGrant)
+        .filter(
+            DocumentGrant.document_id == document_id,
+            DocumentGrant.user_id == user_id,
+            DocumentGrant.is_revoked.is_(False),
+        )
+        .first()
+    )
+
+
+def _upsert_grant(
+    db: Session,
+    document_id: str,
+    user_id: str,
+    permission: str,
+    granted_by_id: str,
+) -> DocumentGrant:
+    """
+    Atomically create or update a grant.
+
+    SQLite and PostgreSQL both support ON CONFLICT DO UPDATE, which keeps the
+    transaction valid when concurrent duplicate requests target the same
+    (document_id, user_id) unique constraint. Other dialects fall back to a
+    query-then-write flow and retain the database uniqueness constraint.
+    """
+    values = {
+        "document_id": document_id,
+        "user_id": user_id,
+        "permission": permission,
+        "granted_by_id": granted_by_id,
+        "is_revoked": False,
+    }
+
+    dialect = db.get_bind().dialect.name
+    insert_statement = None
+    if dialect == "postgresql":
+        insert_statement = postgresql_insert(DocumentGrant).values(**values)
+    elif dialect == "sqlite":
+        insert_statement = sqlite_insert(DocumentGrant).values(**values)
+
+    if insert_statement is not None:
+        db.execute(
+            insert_statement.on_conflict_do_update(
+                index_elements=[DocumentGrant.document_id, DocumentGrant.user_id],
+                set_={
+                    "permission": permission,
+                    "granted_by_id": granted_by_id,
+                    "is_revoked": False,
+                    "updated_at": utc_now(),
+                },
+            )
+        )
+    else:
+        grant = (
+            db.query(DocumentGrant)
+            .filter(
+                DocumentGrant.document_id == document_id,
+                DocumentGrant.user_id == user_id,
+            )
+            .first()
+        )
+        if grant is None:
+            grant = DocumentGrant(
+                document_id=document_id,
+                user_id=user_id,
+                permission=permission,
+                granted_by_id=granted_by_id,
+                is_revoked=False,
+            )
+            db.add(grant)
+        else:
+            grant.permission = permission
+            grant.granted_by_id = granted_by_id
+            grant.is_revoked = False
+        db.flush()
+
+    return (
+        db.query(DocumentGrant)
+        .filter(
+            DocumentGrant.document_id == document_id,
+            DocumentGrant.user_id == user_id,
+        )
+        .one()
+    )
 
 
 @router.post(
@@ -142,7 +240,10 @@ def upload_document(
     "",
     response_model=DocumentListResponse,
     summary="List authorized documents",
-    description="Returns a paginated list of documents the authenticated user is authorized to view.",
+    description=(
+        "Returns a paginated list of documents the authenticated user owns or has an active, "
+        "non-revoked grant for. Administrators are not exempt from this ownership/grant scope."
+    ),
 )
 def list_documents(
     request: Request,
@@ -160,13 +261,18 @@ def list_documents(
 
     query = db.query(Document).filter(Document.is_deleted.is_(False))
 
-    # Scope documents based on user role and ownership
-    if current_user.role == UserRole.ADMIN:
-        # Admins see system-wide active documents metadata
-        pass
-    else:
-        # Owners see their own documents; viewers see granted docs (Day 3: owner-only until grants)
-        query = query.filter(Document.owner_id == current_user.id)
+    # Least privilege: every caller, including administrators, sees only
+    # documents they own or hold an active grant for.
+    granted_doc_ids = db.query(DocumentGrant.document_id).filter(
+        DocumentGrant.user_id == current_user.id,
+        DocumentGrant.is_revoked.is_(False),
+    )
+    query = query.filter(
+        or_(
+            Document.owner_id == current_user.id,
+            Document.id.in_(granted_doc_ids),
+        )
+    )
 
     if category:
         query = query.filter(Document.category == category)
@@ -191,7 +297,7 @@ def list_documents(
     "/{document_id}",
     response_model=DocumentResponse,
     summary="Get document metadata",
-    description="Returns metadata for a specific document if authorized. Unshared or non-existent documents return 404.",
+    description="Returns metadata for a specific document if authorized (owner or active grant). Unshared documents return 404.",
 )
 def get_document(
     document_id: str,
@@ -207,10 +313,12 @@ def get_document(
     if document is None or document.is_deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
+    active_grant = _get_active_grant(db, document.id, current_user.id)
     authorized = AuthorizationService.authorize_document_access(
         user=current_user,
         document=document,
         action=DocumentAction.READ,
+        active_grant=active_grant,
     )
 
     if not authorized:
@@ -263,10 +371,12 @@ def download_document(
     if document is None or document.is_deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
+    active_grant = _get_active_grant(db, document.id, current_user.id)
     authorized = AuthorizationService.authorize_document_access(
         user=current_user,
         document=document,
         action=DocumentAction.DOWNLOAD,
+        active_grant=active_grant,
     )
 
     if not authorized:
@@ -317,7 +427,7 @@ def download_document(
     "/{document_id}",
     response_model=DocumentResponse,
     summary="Update document metadata",
-    description="Updates document title or category if authorized.",
+    description="Updates document title or category if authorized (owner or edit grant).",
 )
 def update_document(
     document_id: str,
@@ -334,10 +444,12 @@ def update_document(
     if document is None or document.is_deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
+    active_grant = _get_active_grant(db, document.id, current_user.id)
     authorized = AuthorizationService.authorize_document_access(
         user=current_user,
         document=document,
         action=DocumentAction.EDIT,
+        active_grant=active_grant,
     )
 
     if not authorized:
@@ -386,7 +498,7 @@ def update_document(
     "/{document_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete a document",
-    description="Soft-deletes a document and removes physical storage file (Owner only).",
+    description="Soft-deletes a document and removes physical storage file (Document Owner ONLY).",
 )
 def delete_document(
     document_id: str,
@@ -402,10 +514,12 @@ def delete_document(
     if document is None or document.is_deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
+    active_grant = _get_active_grant(db, document.id, current_user.id)
     authorized = AuthorizationService.authorize_document_access(
         user=current_user,
         document=document,
         action=DocumentAction.DELETE,
+        active_grant=active_grant,
     )
 
     if not authorized:
@@ -440,3 +554,221 @@ def delete_document(
         details={"title": document.title},
     )
     db.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grant Management / Sharing Endpoints (Day 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/{document_id}/permissions",
+    response_model=GrantListResponse,
+    summary="List document permissions",
+    description="Returns all permission grants for a document (Document Owner ONLY).",
+)
+def list_document_permissions(
+    document_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> GrantListResponse:
+    ip = _get_client_ip(request) or "127.0.0.1"
+    user_agent = request.headers.get("User-Agent")
+    request_id = getattr(request.state, "request_id", None)
+
+    document = db.get(Document, document_id)
+    if document is None or document.is_deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    active_grant = _get_active_grant(db, document.id, current_user.id)
+    authorized = AuthorizationService.authorize_document_access(
+        user=current_user,
+        document=document,
+        action=DocumentAction.VIEW_PERMISSIONS,
+        active_grant=active_grant,
+    )
+
+    if not authorized:
+        AuditService.log_event(
+            db,
+            action="permission.list_denied",
+            outcome=AuditOutcome.DENIED,
+            actor_id=current_user.id,
+            resource_type="document",
+            resource_id=document_id,
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+        )
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    grants = db.query(DocumentGrant).filter(DocumentGrant.document_id == document.id).all()
+    return GrantListResponse(grants=[GrantResponse.model_validate(g) for g in grants])
+
+
+@router.post(
+    "/{document_id}/permissions",
+    response_model=GrantResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Grant access to a document",
+    description="Grants read or edit permission to a named existing user (Document Owner ONLY).",
+)
+def create_document_permission(
+    document_id: str,
+    body: GrantCreateRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> GrantResponse:
+    ip = _get_client_ip(request) or "127.0.0.1"
+    user_agent = request.headers.get("User-Agent")
+    request_id = getattr(request.state, "request_id", None)
+
+    document = db.get(Document, document_id)
+    if document is None or document.is_deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    active_grant = _get_active_grant(db, document.id, current_user.id)
+    authorized = AuthorizationService.authorize_document_access(
+        user=current_user,
+        document=document,
+        action=DocumentAction.SHARE,
+        active_grant=active_grant,
+    )
+
+    if not authorized:
+        AuditService.log_event(
+            db,
+            action="permission.grant",
+            outcome=AuditOutcome.DENIED,
+            actor_id=current_user.id,
+            resource_type="document",
+            resource_id=document_id,
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={"recipient_id": body.user_id},
+        )
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    # Prevent owner granting to themselves
+    if body.user_id == document.owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Document owner already has full ownership rights",
+        )
+
+    # Verify recipient user exists and is active
+    recipient = db.get(User, body.user_id)
+    if recipient is None or not recipient.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Recipient user not found or inactive",
+        )
+
+    grant = _upsert_grant(
+        db=db,
+        document_id=document.id,
+        user_id=recipient.id,
+        permission=body.permission,
+        granted_by_id=current_user.id,
+    )
+
+    AuditService.log_event(
+        db,
+        action="permission.grant",
+        outcome=AuditOutcome.SUCCESS,
+        actor_id=current_user.id,
+        resource_type="document_grant",
+        resource_id=grant.id,
+        ip_address=ip,
+        user_agent=user_agent,
+        request_id=request_id,
+        details={
+            "document_id": document.id,
+            "recipient_id": recipient.id,
+            "permission": grant.permission,
+        },
+    )
+    db.commit()
+    db.refresh(grant)
+
+    return GrantResponse.model_validate(grant)
+
+
+@router.delete(
+    "/{document_id}/permissions/{user_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Revoke document access",
+    description="Immediately revokes a user's active grant for a document (Document Owner ONLY).",
+)
+def revoke_document_permission(
+    document_id: str,
+    user_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    ip = _get_client_ip(request) or "127.0.0.1"
+    user_agent = request.headers.get("User-Agent")
+    request_id = getattr(request.state, "request_id", None)
+
+    document = db.get(Document, document_id)
+    if document is None or document.is_deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    active_grant = _get_active_grant(db, document.id, current_user.id)
+    authorized = AuthorizationService.authorize_document_access(
+        user=current_user,
+        document=document,
+        action=DocumentAction.SHARE,
+        active_grant=active_grant,
+    )
+
+    if not authorized:
+        AuditService.log_event(
+            db,
+            action="permission.revoke",
+            outcome=AuditOutcome.DENIED,
+            actor_id=current_user.id,
+            resource_type="document",
+            resource_id=document_id,
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={"target_user_id": user_id},
+        )
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    grant = _get_active_grant(db, document.id, user_id)
+    if grant is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Active permission grant not found for this user",
+        )
+
+    grant.is_revoked = True
+    db.flush()
+
+    AuditService.log_event(
+        db,
+        action="permission.revoke",
+        outcome=AuditOutcome.SUCCESS,
+        actor_id=current_user.id,
+        resource_type="document_grant",
+        resource_id=grant.id,
+        ip_address=ip,
+        user_agent=user_agent,
+        request_id=request_id,
+        details={
+            "document_id": document.id,
+            "target_user_id": user_id,
+        },
+    )
+    db.commit()
+
+    return {"detail": "Permission successfully revoked"}

@@ -45,18 +45,18 @@ Status Classifications:
 - **Status**: **Mitigated**
 
 ### TV-02: Broken Function-Level Authorization
-- **Attack Scenario**: Regular viewer attempts to invoke administrative endpoints such as `GET /admin/audit` or `GET /admin/documents/activity`.
-- **Impact**: Exposure of system-wide audit telemetry and user activity logs.
-- **Mitigation**: Route-level dependency `require_role({UserRole.ADMIN})` verifies the authenticated session's server-stored user role. Client-supplied role claims in cookies or bodies are never parsed or trusted.
-- **Test Evidence**: `test_viewer_cannot_access_admin_endpoints`, `test_owner_cannot_access_admin_endpoints`.
+- **Attack Scenario**: A regular viewer or document owner attempts to invoke administrative user-management endpoints such as `GET /admin/users` or `PATCH /admin/users/{user_id}`. Read-only admin audit endpoints are planned but not registered in the current build.
+- **Impact**: Unauthorized user administration or privilege changes.
+- **Mitigation**: Route-level dependency `require_admin` verifies the authenticated session's server-stored user role. Client-supplied role claims in cookies or bodies are never parsed or trusted.
+- **Test Evidence**: `test_admin_list_users_requires_admin`, `test_admin_list_users_requires_admin_owner`, `test_unauthenticated_admin_endpoints_return_401`.
 - **Residual Risk**: Low. Server-side session validation only.
 - **Status**: **Mitigated**
 
 ### TV-03: Privilege Escalation
 - **Attack Scenario**: User submits `{"role": "admin"}` in `PATCH /auth/me` or user profile updates.
 - **Impact**: Vertical privilege escalation resulting in full system administrative control.
-- **Mitigation**: Strict Pydantic input schemas whitelist only user-editable profile fields (`full_name`, `password`). Role mutation is strictly reserved for administrative endpoints with explicit audit logging.
-- **Test Evidence**: `test_user_cannot_elevate_own_role`.
+- **Mitigation**: Strict Pydantic input schemas whitelist only user-editable profile fields (`full_name`, `password`); `UserUpdateRequest` has no role field. Role mutation is reserved for the admin-only user endpoint with explicit audit logging.
+- **Test Evidence**: `test_register_sets_viewer_role`, `test_admin_update_user_role`, `test_admin_cannot_remove_own_admin_role`; schema field whitelist verified by inspection.
 - **Residual Risk**: None. Roles are immutable via self-service APIs.
 - **Status**: **Mitigated**
 
@@ -71,10 +71,10 @@ Status Classifications:
 ### TV-05: Revocation Races and Stale Authorization
 - **Attack Scenario**: Document owner revokes access for user B. User B attempts to download the file 1 second later using a cached session or active connection.
 - **Impact**: Unauthorized retrieval of documents after access was formally revoked.
-- **Mitigation**: No caching of authorization decisions is permitted. Every single request queries the live database transaction for the current state of `DocumentGrant.is_revoked`. If revoked, download is immediately denied.
-- **Test Evidence**: Scheduled for Day 4 implementation.
+- **Mitigation**: No caching of authorization decisions is permitted. Every single request queries the live database transaction for the current state of `DocumentGrant.is_revoked`; there are no authorization tokens, signed URLs, or permission snapshots. Revoking a grant sets `is_revoked = True` in the same transaction that records the audit event, so the recipient's next metadata read, download, or edit is denied. Revoked grant rows are retained for audit history, and re-granting reactivates the row only after an explicit owner action.
+- **Test Evidence**: `test_immediate_revocation_sequence` (grant → verified access → revoke → immediate 404 on metadata, download, and edit), `test_read_grant_permissions_enforced`, `test_edit_grant_permissions_enforced`, `test_regrant_after_revocation_restores_requested_permission`, `test_document_list_excludes_revoked_grant`.
 - **Residual Risk**: Standard limitation: cannot erase a file that a recipient already physically downloaded to their local disk prior to revocation.
-- **Status**: **Planned (Day 4)**
+- **Status**: **Mitigated**
 
 ### TV-06: Session Theft and Cross-Site Request Forgery (CSRF)
 - **Attack Scenario**: Cross-site script steals session tokens or malicious site submits state-changing requests using ambient credentials.
@@ -96,7 +96,7 @@ Status Classifications:
 - **Attack Scenario**: SQL injection payloads in search queries (`GET /documents/search?q=' OR 1=1--`) or HTML/JS payloads in document titles.
 - **Impact**: Database exfiltration or stored script execution in viewer browsers.
 - **Mitigation**: SQLAlchemy 2.0 ORM with 100% parameterized statements; no raw string concatenation in queries. Security headers middleware injects `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, and `Content-Security-Policy`. React frontend escapes rendered content by default.
-- **Test Evidence**: `test_security_headers_present`, `test_sql_injection_attempt_fails_safely`.
+- **Test Evidence**: `test_security_headers_present`; SQLAlchemy parameterized-query usage verified by code inspection. No dedicated SQL-injection test is present.
 - **Residual Risk**: None identified within application codebase.
 - **Status**: **Mitigated**
 
@@ -104,7 +104,7 @@ Status Classifications:
 - **Attack Scenario**: Attacker uploads a file with filename `../../../../etc/passwd` or attempts to download with manipulated storage key.
 - **Impact**: Arbitrary file read or overwrite on the server host.
 - **Mitigation**: Client-supplied filenames are purely stored as metadata in DB (`original_filename`) and sanitized for `Content-Disposition`. The physical filename on disk is generated on the server using `secrets.token_hex(32)`. `StorageService` verifies `target_path.is_relative_to(storage_dir)`.
-- **Test Evidence**: `StorageService.get_file_path` rejects non-hex keys and traversal attempts; verified in test suite.
+- **Test Evidence**: `StorageService.get_file_path` rejects non-hex keys and traversal attempts; verified by code inspection. No dedicated path-traversal test is present.
 - **Residual Risk**: Negligible.
 - **Status**: **Mitigated**
 
@@ -119,8 +119,8 @@ Status Classifications:
 ### TV-11: Search and Metadata Leakage
 - **Attack Scenario**: User searches `GET /documents/search?q=Confidential` hoping to see titles or existence of documents they are not authorized to view.
 - **Impact**: Information disclosure / confidential metadata discovery.
-- **Mitigation**: Search query filters are constructed with mandatory authorization criteria joined at the SQL level (User is owner OR User has active, unrevoked grant). Documents the user cannot access are completely excluded from query results. Non-existent and unauthorized single-document requests return deliberate 404 or 403 without metadata leakage.
-- **Test Evidence**: `test_owner_lifecycle_operations`, `test_cross_user_document_isolation`.
+- **Mitigation**: Document listing and search filters are constructed with mandatory authorization criteria joined at the SQL level (User is owner OR User has active, unrevoked grant). This applies equally to administrators; admin role alone does not widen metadata visibility. Documents the user cannot access are completely excluded from query results. Non-existent and unauthorized single-document requests return deliberate 404 without metadata leakage. A search route is documented as planned but is not registered in the current build.
+- **Test Evidence**: `test_owner_lifecycle_operations`, `test_cross_user_document_isolation`, `test_admin_cannot_list_unshared_document_metadata`, `test_admin_list_includes_owned_and_explicitly_granted_documents`, `test_document_list_excludes_revoked_grant`.
 - **Residual Risk**: Low.
 - **Status**: **Mitigated**
 
@@ -135,17 +135,17 @@ Status Classifications:
 ### TV-13: Administrator Misuse (Overprivileged Administrator)
 - **Attack Scenario**: Rogue administrator uses admin role to browse and download confidential proprietary documents belonging to other users.
 - **Impact**: Insider threat data breach.
-- **Mitigation**: Administrators are NOT automatically granted content read or download permissions. Admin capabilities are restricted to user account management, audit investigation, and platform health. Every administrative action is recorded in the tamper-evident audit log with the admin's actor ID.
-- **Test Evidence**: `test_admin_cannot_download_unshared_document`, `test_admin_actions_are_audited`.
+- **Mitigation**: Administrators are NOT automatically granted metadata, content read, or download permissions. Listing, metadata retrieval, downloads, edits, deletion, and grant management all follow the same owner-or-active-grant policy for administrators as for every other user. Administrative capabilities are restricted to user account management and platform health; document actions are available only under the same ownership/grant rules as other users. Audit records remain in the tamper-evident store and verifiable through `AuditService`, while read-only admin audit HTTP endpoints are planned but not implemented. Every administrative action is recorded in the tamper-evident audit log with the admin's actor ID.
+- **Test Evidence**: `test_admin_cannot_access_document_contents`, `test_admin_cannot_list_unshared_document_metadata`, `test_admin_list_includes_owned_and_explicitly_granted_documents`, `test_audit_chain_integrity`.
 - **Residual Risk**: Database superusers with direct OS/DB shell access can inspect physical storage; addressed by host encryption and access controls.
 - **Status**: **Mitigated**
 
 ### TV-14: Concurrent Modification & Race Conditions
 - **Attack Scenario**: Simultaneous grant and revoke requests or parallel edits leading to inconsistent grant state.
 - **Impact**: Inconsistent permissions or corrupted document state.
-- **Mitigation**: Database-level unique constraints (`uq_doc_user_grant`), transactions with rollback on exception, and pessimistic/optimistic concurrency control where appropriate.
-- **Test Evidence**: `test_concurrent_grant_modifications_are_atomic`.
-- **Residual Risk**: Edge-case database deadlocks under extreme load; handled via automatic transaction retries.
+- **Mitigation**: Database-level unique constraints (`uq_doc_user_grant`) prevent duplicate grant rows for the same document/recipient pair. Grant creation is an explicit atomic upsert: SQLite and PostgreSQL use `INSERT ... ON CONFLICT DO UPDATE`, which reactivates an existing row, updates the requested permission and grantor, and applies the latest write without leaving the transaction invalid. Unsupported dialects fall back to query-then-write while retaining the unique constraint. Every mutation executes inside a single transaction with the corresponding audit event.
+- **Test Evidence**: `test_owner_can_grant_read_and_edit`, `test_immediate_revocation_sequence`, `test_regrant_after_revocation_restores_requested_permission`, `test_duplicate_grant_requests_keep_single_record`.
+- **Residual Risk**: Concurrent duplicate writes are resolved last-writer-wins at the database. A dedicated simultaneous-request stress test is not implemented because the test suite shares one in-memory SQLite session; the uniqueness constraint and atomic upsert remain enforced. Extreme-load database deadlocks are not retried automatically by the application; they would surface as a server error and are left to deployment-level connection/transaction management.
 - **Status**: **Partially Mitigated**
 
 ### TV-15: Public Storage Configuration

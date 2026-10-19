@@ -12,8 +12,8 @@ This document details the complete API contract for TrustVault, including authen
 - `204 No Content`: Resource successfully deleted or updated without body response.
 - `400 Bad Request`: Validation failure, invalid payload, or malformed parameter.
 - `401 Unauthorized`: Authentication required or invalid/expired session cookie.
-- `403 Forbidden`: Authenticated identity lacks necessary role or document permission.
-- `404 Not Found`: Deliberate 404 returned for unshared documents to prevent existence discovery, or non-existent endpoint.
+- `403 Forbidden`: Authenticated identity lacks the required platform role (for example, an admin-only endpoint).
+- `404 Not Found`: Deliberate 404 returned for inaccessible or non-existent documents to prevent existence discovery, or a non-existent endpoint/resource.
 - `413 Payload Too Large`: Upload exceeds maximum allowed file size (10MB).
 - `429 Too Many Requests`: Rate limit exceeded (e.g. login brute-force throttle).
 - `503 Service Unavailable`: Database or storage health failure.
@@ -44,19 +44,22 @@ This document details the complete API contract for TrustVault, including authen
     "id": "u_984f1b...",
     "email": "user@trustvault.local",
     "full_name": "Alice Smith",
-    "role": "owner"
+    "role": "owner",
+    "is_active": true,
+    "created_at": "2026-10-19T10:00:00.000000Z",
+    "updated_at": "2026-10-19T10:00:00.000000Z"
   }
   ```
 - **Cookies Set**:
   - `trustvault_session`: HttpOnly, SameSite=Lax, Secure (in production).
   - `trustvault_csrf`: SameSite=Lax (readable by frontend for inclusion in `X-CSRF-Token` headers).
-- **Audit Event**: `auth.login.success` or `auth.login.failure`
+- **Audit Events**: `user.login`, `user.login_failed`, or `user.login_rate_limited`
 
 ### `POST /api/v1/auth/logout`
 - **Authentication**: Required (`SessionCookie`)
 - **Action**: Revokes session in database, clears session cookies.
-- **Response `200 OK`**: `{"detail": "Logged out successfully"}`
-- **Audit Event**: `auth.logout`
+- **Response `204 No Content`**: Empty body.
+- **Audit Event**: `user.logout`
 
 ### `GET /api/v1/auth/me`
 - **Authentication**: Required
@@ -84,26 +87,27 @@ This document details the complete API contract for TrustVault, including authen
     "mime_type": "application/pdf",
     "category": "Financial",
     "owner_id": "u_984f1b...",
-    "created_at": "2026-10-19T10:00:00.000000Z"
+    "is_deleted": false,
+    "created_at": "2026-10-19T10:00:00.000000Z",
+    "updated_at": "2026-10-19T10:00:00.000000Z"
   }
   ```
 - **Audit Event**: `document.upload`
 
 ### `GET /api/v1/documents`
 - **Authentication**: Required
-- **Authorization Rule**: Returns only documents owned by user OR documents where user has an active, non-revoked grant.
-- **Response `200 OK`**: List of document summaries with user's effective permission (`owner`, `edit`, or `read`).
+- **Authorization Rule**: Returns only documents owned by the caller OR documents where the caller has an active, non-revoked grant. This scope applies equally to administrators; admin role alone does not expose other users' document metadata.
+- **Response `200 OK`**: Paginated document summaries using the same fields as the upload response (`documents`, `total`, `page`, `page_size`).
 
-### `GET /api/v1/documents/search`
-- **Authentication**: Required
-- **Query Parameters**: `q` (name/title search), `owner`, `category`, `date_from`, `date_to`.
-- **Authorization Rule**: Database query joins on ownership and active grant table. Zero inaccessible documents or metadata returned.
+### `GET /api/v1/documents/search` — Planned (not implemented)
+- **Status**: Planned for a later milestone. The route is not registered in the current API.
+- **Intended Authorization Rule**: Same ownership/active-grant scope as `GET /documents`; no inaccessible metadata may be returned.
 
 ### `GET /api/v1/documents/{id}`
 - **Authentication**: Required
-- **Authorization Rule**: Must be owner or have active grant. Unauthorized callers receive `404 Not Found` (or `403 Forbidden`).
-- **Response `200 OK`**: Full document metadata and version history.
-- **Audit Event**: `document.read` or `document.access.denied`
+- **Authorization Rule**: Must be owner or have an active grant. All other callers receive `404 Not Found`.
+- **Response `200 OK`**: Document metadata (no version-history field is exposed by the current schema).
+- **Audit Event**: `document.read` (Outcome: SUCCESS or DENIED)
 
 ### `GET /api/v1/documents/{id}/download`
 - **Authentication**: Required
@@ -113,15 +117,16 @@ This document details the complete API contract for TrustVault, including authen
 
 ### `PATCH /api/v1/documents/{id}`
 - **Authentication**: Required
-- **Authorization Rule**: Owner or active grant with `edit`.
-- **Request Body**: Editable metadata (title, category) or replacement file stream.
-- **Audit Event**: `document.edit`
+- **Authorization Rule**: Owner or active grant with `edit`. Other callers receive `404 Not Found`.
+- **Request Body**: Editable metadata only (`title`, `category`). Replacement-file upload is **not implemented** on this endpoint.
+- **Response `200 OK`**: Updated document metadata.
+- **Audit Event**: `document.edit` (SUCCESS when fields change; DENIED on unauthorized attempts)
 
 ### `DELETE /api/v1/documents/{id}`
 - **Authentication**: Required
-- **Authorization Rule**: Document Owner ONLY. Viewers and editors cannot delete documents.
-- **Response `200 OK`**: `{"detail": "Document successfully deleted"}`
-- **Audit Event**: `document.delete`
+- **Authorization Rule**: Document Owner ONLY. Viewers, editors, and administrators cannot delete another user's document.
+- **Response `204 No Content`**: Empty body; the document is soft-deleted and the physical file is removed.
+- **Audit Event**: `document.delete` (Outcome: SUCCESS or DENIED)
 
 ---
 
@@ -129,12 +134,30 @@ This document details the complete API contract for TrustVault, including authen
 
 ### `GET /api/v1/documents/{id}/permissions`
 - **Authentication**: Required
-- **Authorization Rule**: Document Owner ONLY.
-- **Response `200 OK`**: List of named users and active/revoked grant status.
+- **Authorization Rule**: Document Owner ONLY. Non-owners (including active grantees) receive `404 Not Found` to avoid disclosing sharing relationships.
+- **Response `200 OK`**:
+  ```json
+  {
+    "grants": [
+      {
+        "id": "gr_5c9d...",
+        "document_id": "doc_a1b2c3...",
+        "user_id": "u_recipient_123",
+        "permission": "read",
+        "granted_by_id": "u_owner_456",
+        "is_revoked": false,
+        "created_at": "2026-10-19T10:00:00.000000Z",
+        "updated_at": "2026-10-19T10:00:00.000000Z"
+      }
+    ]
+  }
+  ```
+- **Notes**: Includes revoked grants so owners can see historical sharing state.
+- **Audit Event**: `permission.list_denied` on unauthorized attempts.
 
 ### `POST /api/v1/documents/{id}/permissions`
 - **Authentication**: Required
-- **Authorization Rule**: Document Owner ONLY.
+- **Authorization Rule**: Document Owner ONLY. Non-owners receive `404 Not Found`.
 - **Request Body**:
   ```json
   {
@@ -142,27 +165,50 @@ This document details the complete API contract for TrustVault, including authen
     "permission": "read"
   }
   ```
-- **Audit Event**: `permission.grant`
+- **Validation**: `permission` must be `read` or `edit`; recipient must exist and be active; granting to the owner is rejected with `400 Bad Request`.
+- **Upsert Semantics**: Re-granting to a previously revoked user reactivates the existing grant row, updates `granted_by_id`/`permission`, and clears `is_revoked`. The write uses the database `(document_id, user_id)` unique constraint with `ON CONFLICT DO UPDATE` on SQLite and PostgreSQL, so duplicate/concurrent requests leave exactly one grant row and apply the latest requested permission.
+- **Response `201 Created`**: Grant representation (same shape as list items).
+- **Audit Event**: `permission.grant` (Outcome: SUCCESS or DENIED)
 
 ### `DELETE /api/v1/documents/{id}/permissions/{user_id}`
 - **Authentication**: Required
-- **Authorization Rule**: Document Owner ONLY.
-- **Action**: Immediately sets `is_revoked = True` in current database transaction.
+- **Authorization Rule**: Document Owner ONLY. Non-owners receive `404 Not Found`.
+- **Action**: Immediately sets `is_revoked = True` in the current database transaction. There are no cached tokens or pre-signed URLs, so the very next request from the recipient is denied.
 - **Response `200 OK`**: `{"detail": "Permission successfully revoked"}`
-- **Audit Event**: `permission.revoke`
+- **Error**: `404 Not Found` when no active grant exists for that recipient.
+- **Audit Event**: `permission.revoke` (Outcome: SUCCESS or DENIED)
 
 ---
 
 ## 4. Administration Endpoints
 
-### `GET /api/v1/admin/audit`
-- **Authentication**: Required
-- **Role Requirement**: Administrator ONLY (`UserRole.ADMIN`).
-- **Query Parameters**: `limit`, `offset`, `actor_id`, `action`, `outcome`, `start_date`, `end_date`.
-- **Response `200 OK`**: Chronological audit trail with hash-chain verification status.
-- **Audit Event**: `admin.audit.query`
+All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 
-### `GET /api/v1/admin/documents/activity`
+### `GET /api/v1/admin/users`
 - **Authentication**: Required
-- **Role Requirement**: Administrator ONLY (`UserRole.ADMIN`).
-- **Response `200 OK`**: Document lifecycle events (uploads, deletions, sharing volume) across system without exposing file contents.
+- **Query Parameters**: `page`, `page_size`
+- **Response `200 OK`**: Paginated user list (`users`, `total`, `page`, `page_size`).
+
+### `GET /api/v1/admin/users/{user_id}`
+- **Authentication**: Required
+- **Response `200 OK`**: User profile.
+- **Error**: `404 Not Found` for an unknown user.
+
+### `PATCH /api/v1/admin/users/{user_id}`
+- **Authentication**: Required
+- **Request Body**: `role` (`admin`, `owner`, or `viewer`) and/or `is_active`.
+- **Response `200 OK`**: Updated user profile.
+- **Errors**: `400 Bad Request` when an administrator attempts to remove their own admin role; `404 Not Found` for an unknown user.
+- **Audit Events**: `user.role_change`, `user.deactivate`, or `user.reactivate`
+
+### `POST /api/v1/admin/users/{user_id}/revoke-sessions`
+- **Authentication**: Required
+- **Action**: Immediately invalidates all active sessions for the target user.
+- **Response `200 OK`**: `{"user_id": "...", "sessions_revoked": N}`
+- **Audit Event**: `user.sessions_revoked`
+
+### `GET /api/v1/admin/audit` — Planned (not implemented)
+- **Status**: Planned for a later milestone. System-wide audit records continue to be written to the tamper-evident audit store; a read-only admin query API is not registered in the current build.
+
+### `GET /api/v1/admin/documents/activity` — Planned (not implemented)
+- **Status**: Planned for a later milestone. Document lifecycle events remain available in the audit store without exposing file contents; no HTTP activity endpoint is registered in the current build.
