@@ -1,7 +1,8 @@
 """
 TrustVault Private Storage Service
 Manages confidential document byte streams strictly outside the web root.
-Enforces unguessable random storage keys, path traversal defenses, and collision resistance.
+Enforces unguessable random storage keys, path traversal defenses,
+extension whitelisting, and magic byte validation.
 """
 
 import secrets
@@ -29,11 +30,58 @@ class StorageService:
         """
         return secrets.token_hex(32)
 
+    @staticmethod
+    def validate_file_header(header_bytes: bytes, filename: str) -> None:
+        """
+        Validates file extension and inspects magic bytes (content sniffing)
+        to prevent malicious or executable uploads disguised as permitted types.
+        """
+        ext = Path(filename).suffix.lower()
+        if ext not in settings.allowed_extensions_set:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File extension '{ext}' is not permitted. Allowed: {settings.ALLOWED_EXTENSIONS}",
+            )
+
+        # Check for dangerous executable signatures regardless of extension
+        if header_bytes.startswith((b"MZ", b"\x7fELF", b"#!")):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Security violation: Executable or script content detected",
+            )
+
+        # Format-specific magic byte checks for strict verification
+        if ext == ".pdf" and not header_bytes.startswith(b"%PDF"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file format: File does not match PDF magic bytes",
+            )
+        elif ext == ".png" and not header_bytes.startswith(b"\x89PNG"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file format: File does not match PNG magic bytes",
+            )
+        elif ext in {".jpg", ".jpeg"} and not header_bytes.startswith(b"\xff\xd8\xff"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file format: File does not match JPEG magic bytes",
+            )
+        elif ext in {".docx", ".xlsx"} and not header_bytes.startswith(b"PK\x03\x04"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file format: File does not match Office archive magic bytes",
+            )
+
     @classmethod
-    def save_file(cls, file_obj: BinaryIO, max_size_bytes: int = settings.MAX_FILE_SIZE_BYTES) -> tuple[str, int]:
+    def save_file(
+        cls,
+        file_obj: BinaryIO,
+        original_filename: str,
+        max_size_bytes: int = settings.MAX_FILE_SIZE_BYTES,
+    ) -> tuple[str, int]:
         """
         Streams file contents to private storage safely.
-        Validates maximum size during streaming to prevent disk exhaustion / DoS attacks.
+        Validates maximum size and magic bytes during streaming to prevent DoS and malicious uploads.
         Returns: (storage_key, bytes_written)
         """
         storage_key = cls.generate_storage_key()
@@ -49,6 +97,7 @@ class StorageService:
 
         total_bytes = 0
         chunk_size = 64 * 1024  # 64KB chunks
+        first_chunk = True
 
         try:
             with open(target_path, "wb") as dest:
@@ -56,6 +105,12 @@ class StorageService:
                     chunk = file_obj.read(chunk_size)
                     if not chunk:
                         break
+                    
+                    if first_chunk:
+                        # Validate extension and magic bytes on the first chunk
+                        cls.validate_file_header(chunk[:512], original_filename)
+                        first_chunk = False
+
                     total_bytes += len(chunk)
                     if total_bytes > max_size_bytes:
                         dest.close()
@@ -65,10 +120,22 @@ class StorageService:
                             detail=f"File exceeds maximum allowed size of {max_size_bytes} bytes",
                         )
                     dest.write(chunk)
+        except HTTPException:
+            if target_path.exists():
+                target_path.unlink(missing_ok=True)
+            raise
         except Exception:
             if target_path.exists():
                 target_path.unlink(missing_ok=True)
             raise
+
+        if total_bytes == 0:
+            if target_path.exists():
+                target_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file is empty",
+            )
 
         return storage_key, total_bytes
 
@@ -78,7 +145,6 @@ class StorageService:
         Safely retrieves physical path for an authorized download.
         Guarantees path traversal prevention and file existence.
         """
-        # Storage keys must be 64-char hex strings
         if not storage_key or len(storage_key) != 64 or not all(c in "0123456789abcdef" for c in storage_key.lower()):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

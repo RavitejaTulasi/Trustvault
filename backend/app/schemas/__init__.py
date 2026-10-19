@@ -10,10 +10,18 @@ from backend.app.schemas.auth import (
     UserResponse,
     UserUpdateRequest,
 )
+from backend.app.schemas.document import (
+    DocumentListResponse,
+    DocumentResponse,
+    DocumentUpdateRequest,
+)
 from backend.app.schemas.health import HealthResponse
 
 __all__ = [
     "AdminUserUpdateRequest",
+    "DocumentListResponse",
+    "DocumentResponse",
+    "DocumentUpdateRequest",
     "HealthResponse",
     "UserListResponse",
     "UserLoginRequest",

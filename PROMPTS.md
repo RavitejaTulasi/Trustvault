@@ -33,17 +33,18 @@ When collaborating with AI on TrustVault, the following engineering prompts and 
 
 ---
 
-### Entry 2 (Day 2.1 Security Remediation — 2026-10-19): CSRF Protection and Login Rate Limiting Implementation
-- **Category**: Security Remediation (HIGH-01 & HIGH-02)
+### Entry 3 (Day 3 — 2026-10-19): Private Document Management, Storage Isolation, and Authorization
+- **Category**: Secure Document Storage & Server-Side Authorization
 - **Prompt Summary**:
-  "Remediate Findings HIGH-01 (Missing CSRF protection) and HIGH-02 (Missing login rate limiting) identified in the Day 1 & Day 2 Security Audit. Implement double-submit cookie CSRF validation middleware and in-memory sliding-window login rate limiting with unit/integration test coverage."
+  "Implement secure document management with private file storage and strict server-side ownership authorization (`POST /documents`, `GET /documents`, `GET /documents/{id}`, `GET /documents/{id}/download`, `PATCH /documents/{id}`, `DELETE /documents/{id}`), extension whitelisting, magic byte sniffing, deliberate 404 responses, and audit logging."
 - **What the AI Produced**:
-  - Implemented `backend/app/security/csrf.py` providing `CSRFMiddleware` (double-submit cookie validation with constant-time `secrets.compare_digest` and Origin/Referer defense-in-depth checks).
-  - Implemented `backend/app/security/rate_limiter.py` providing `LoginRateLimiter` (sliding-window tracking across IP and email, returning HTTP 429 with `Retry-After` on exhaustion).
-  - Updated `backend/app/api/auth.py` to set both session and CSRF cookies on login/registration, clear both on logout, and enforce rate limiting in `POST /auth/login`.
-  - Added automated tests in `backend/tests/test_security_remediation.py` covering CSRF success/failure and rate-limit thresholds.
+  - Implemented `backend/app/schemas/document.py` for document validation and response serialization.
+  - Enhanced `backend/app/services/storage_service.py` with extension whitelisting, magic byte inspection (content sniffing for PDF, PNG, JPEG, Office archives), and executable blocklists.
+  - Implemented `backend/app/api/documents.py` providing endpoints for upload, listing, metadata retrieval, secure download streaming, metadata updates, and deletion.
+  - Integrated document API routes into `backend/app/api/router.py`.
+  - Added comprehensive automated security tests in `backend/tests/test_documents.py` covering all 14 required test cases (owner lifecycle, cross-user isolation, admin access restriction, file type/magic byte rejection, audit logging).
 - **What was Specifically Wrong or Incomplete**:
-  Initial test runs with `AsyncClient` failed because HTTPX did not automatically copy the `trustvault_csrf` cookie into the `X-CSRF-Token` request header.
+  Initial test implementation had minor linter findings regarding unused test fixtures/variables and type annotations (`Optional[str]` vs `str | None`).
 - **What was Changed and How Verified**:
-  Created a request event hook `_inject_csrf_header_hook` in `conftest.py` that automatically mirrors the `trustvault_csrf` cookie into the `X-CSRF-Token` header for test requests (simulating legitimate frontend SPA behavior). Verified by running `pytest backend/tests/ -v`, resulting in 37/37 tests passing green.
-- **Git Status**: Uncommitted changes staged/ready for review.
+  Cleaned up unused variables and updated type hints and import sorting. Verified by executing `pytest backend/tests/ -v` (45/45 tests passing successfully) and `ruff check .`.
+- **Git Status**: Uncommitted changes ready for review.
