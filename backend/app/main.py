@@ -1,7 +1,7 @@
 """
 TrustVault FastAPI Application Entrypoint
 Applies security middleware, defense-in-depth headers, request tracking,
-and registers API routers.
+CSRF protection, and registers API routers.
 """
 
 import time
@@ -15,6 +15,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from backend.app.api.health import router as health_router
 from backend.app.api.router import api_router
 from backend.app.config import settings
+from backend.app.security.csrf import CSRFMiddleware
 
 
 @asynccontextmanager
@@ -45,6 +46,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     - Strict Referrer policies
     - Content Security Policy
     """
+
     async def dispatch(self, request: Request, call_next):
         response: Response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -52,11 +54,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-XSS-Protection"] = "0"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
-        
+
         if settings.ENVIRONMENT == "production":
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
-            response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none';"
-        
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=31536000; includeSubDomains; preload"
+            )
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; frame-ancestors 'none';"
+            )
+
         return response
 
 
@@ -64,13 +70,14 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     """
     Attaches a unique UUID request ID to every incoming request for tracing in audit logs.
     """
+
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
         request.state.request_id = request_id
         start_time = time.time()
-        
+
         response: Response = await call_next(request)
-        
+
         process_time = time.time() - start_time
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time"] = f"{process_time:.4f}s"
@@ -78,6 +85,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
 
 # Register middleware in order
+app.add_middleware(CSRFMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIDMiddleware)
 

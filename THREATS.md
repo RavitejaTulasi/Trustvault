@@ -40,9 +40,9 @@ Status Classifications:
 - **Attack Scenario**: Attacker modifies document UUID in `GET /documents/{id}`, `GET /documents/{id}/download`, or `PATCH /documents/{id}` to access or alter another user's private file.
 - **Impact**: Critical confidentiality and integrity breach. Unauthorized access to proprietary documents.
 - **Mitigation**: Centralized `AuthorizationService.authorize_document_access()` is executed unconditionally in every document route handler. Authorization checks verify active account, ownership, or valid non-revoked grant before returning any byte stream or metadata.
-- **Test Evidence**: `test_unrelated_user_cannot_access_document`, `test_changing_document_ids_fails`.
+- **Test Evidence**: Scheduled for Day 3 / Day 6 implementation.
 - **Residual Risk**: Zero at the application layer; rely on server-side authorization rather than frontend filtering or unguessable IDs.
-- **Status**: **Mitigated**
+- **Status**: **Planned (Day 3)**
 
 ### TV-02: Broken Function-Level Authorization
 - **Attack Scenario**: Regular viewer attempts to invoke administrative endpoints such as `GET /admin/audit` or `GET /admin/documents/activity`.
@@ -64,23 +64,23 @@ Status Classifications:
 - **Attack Scenario**: Attacker probes static web root paths (e.g., `https://example.com/uploads/document_1.pdf`) to bypass API authentication.
 - **Impact**: Total confidentiality breach bypassing all authorization logic.
 - **Mitigation**: Files are persisted outside the application web root in `STORAGE_DIR`. Files are named with 256-bit cryptographically random hex keys (`secrets.token_hex(32)`). Physical storage paths are never exposed to clients. All downloads must flow through `GET /documents/{id}/download` which verifies authorization immediately prior to streaming.
-- **Test Evidence**: Verified by private storage architecture and integration test `test_unauthorized_download_returns_no_bytes`.
+- **Test Evidence**: Scheduled for Day 3 implementation.
 - **Residual Risk**: Low. Storage access relies on OS filesystem permissions for the backend service user.
-- **Status**: **Mitigated**
+- **Status**: **Planned (Day 3)**
 
 ### TV-05: Revocation Races and Stale Authorization
 - **Attack Scenario**: Document owner revokes access for user B. User B attempts to download the file 1 second later using a cached session or active connection.
 - **Impact**: Unauthorized retrieval of documents after access was formally revoked.
 - **Mitigation**: No caching of authorization decisions is permitted. Every single request queries the live database transaction for the current state of `DocumentGrant.is_revoked`. If revoked, download is immediately denied.
-- **Test Evidence**: `test_revocation_blocks_next_request`.
+- **Test Evidence**: Scheduled for Day 4 implementation.
 - **Residual Risk**: Standard limitation: cannot erase a file that a recipient already physically downloaded to their local disk prior to revocation.
-- **Status**: **Mitigated**
+- **Status**: **Planned (Day 4)**
 
 ### TV-06: Session Theft and Cross-Site Request Forgery (CSRF)
 - **Attack Scenario**: Cross-site script steals session tokens or malicious site submits state-changing requests using ambient credentials.
 - **Impact**: Account takeover or unauthorized document deletion/sharing.
 - **Mitigation**: Server-side session tokens stored in `HttpOnly`, `SameSite=Lax` (or `Strict` for mutations), `Secure` (in production) cookies. Session tokens stored in database are SHA-256 hashed so DB leakage does not reveal valid session tokens. CSRF double-submit token headers required for state-changing mutations (`POST`, `PATCH`, `DELETE`).
-- **Test Evidence**: `test_session_cookie_flags`, `test_csrf_token_required_for_state_change`.
+- **Test Evidence**: `test_csrf_missing_header_rejected`, `test_csrf_mismatched_token_rejected`, `test_csrf_valid_token_succeeds`.
 - **Residual Risk**: Browser-level XSS could compromise client context; mitigated with strict CSP headers.
 - **Status**: **Mitigated**
 
@@ -88,8 +88,8 @@ Status Classifications:
 - **Attack Scenario**: Automated dictionary attack against `POST /auth/login`.
 - **Impact**: Compromise of user credentials.
 - **Mitigation**: Argon2id password hashing with modern memory/time parameters. In-memory / Redis sliding-window rate limiting on login attempts (maximum 5 attempts per 5 minutes per IP/email). Failed attempts logged as audit events.
-- **Test Evidence**: `test_login_rate_limiting`, `test_failed_login_creates_audit_event`.
-- **Residual Risk**: Distributed attacks across multiple IPs require edge/WAF rate limiting (Cloudflare/AWS WAF).
+- **Test Evidence**: `test_login_rate_limiting_exceeded`, `test_login_rate_limit_reset_on_success`.
+- **Residual Risk**: Distributed attacks across multiple IPs require edge/WAF rate limiting (Cloudflare/AWS WAF). In-memory rate limiter is process-local.
 - **Status**: **Mitigated**
 
 ### TV-08: SQL Injection and Cross-Site Scripting (XSS)
@@ -112,17 +112,17 @@ Status Classifications:
 - **Attack Scenario**: Attacker uploads a 10GB archive to exhaust server disk space (DoS) or uploads a `.exe`/malicious script disguised as `.pdf`.
 - **Impact**: Server disk exhaustion, denial of service, or malware distribution.
 - **Mitigation**: Chunked streaming writes with immediate size check aborting when accumulated bytes exceed `MAX_FILE_SIZE_BYTES` (10MB). Extension whitelist combined with magic byte inspection (first 512 bytes) for supported formats.
-- **Test Evidence**: `test_oversized_upload_rejected`, `test_disallowed_extension_rejected`.
+- **Test Evidence**: Scheduled for Day 3 implementation.
 - **Residual Risk**: Zero-day exploit payloads inside valid PDF formats; production environments should integrate ClamAV or virus scanning pipelines.
-- **Status**: **Mitigated**
+- **Status**: **Planned (Day 3)**
 
 ### TV-11: Search and Metadata Leakage
 - **Attack Scenario**: User searches `GET /documents/search?q=Confidential` hoping to see titles or existence of documents they are not authorized to view.
 - **Impact**: Information disclosure / confidential metadata discovery.
 - **Mitigation**: Search query filters are constructed with mandatory authorization criteria joined at the SQL level (User is owner OR User has active, unrevoked grant). Documents the user cannot access are completely excluded from query results. Non-existent and unauthorized single-document requests return deliberate 404 or 403 without metadata leakage.
-- **Test Evidence**: `test_search_does_not_expose_inaccessible_metadata`.
+- **Test Evidence**: Scheduled for Day 3 implementation.
 - **Residual Risk**: Low.
-- **Status**: **Mitigated**
+- **Status**: **Planned (Day 3)**
 
 ### TV-12: Audit Log Tampering or Omission
 - **Attack Scenario**: Malicious actor or compromised account attempts to modify or delete audit log entries to conceal unauthorized actions.

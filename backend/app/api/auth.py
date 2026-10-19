@@ -5,9 +5,10 @@ Handles: registration, login, logout, current user retrieval, and self-service p
 Security controls implemented:
 - Argon2id password hashing (OWASP-recommended)
 - Server-side session tokens (HTTP-only, SameSite=Lax cookies)
+- Double-submit CSRF cookie protection
+- Sliding-window login rate limiting per IP and email
 - Constant-time login (always verify password, always hash-check session)
-- Audit logging for every auth event (success and failure)
-- Rate-limiting hint: use a reverse proxy or middleware layer for production
+- Audit logging for every auth event (success, failure, rate-limited)
 - No enumeration: registration/login errors use generic messages
 """
 
@@ -27,7 +28,9 @@ from backend.app.schemas.auth import (
     UserUpdateRequest,
 )
 from backend.app.security.auth import get_current_user
+from backend.app.security.csrf import generate_csrf_token
 from backend.app.security.passwords import hash_password, password_needs_rehash, verify_password
+from backend.app.security.rate_limiter import login_rate_limiter
 from backend.app.security.sessions import create_session, revoke_all_user_sessions, revoke_session
 from backend.app.services.audit_service import AuditService
 
@@ -45,7 +48,7 @@ def _get_client_ip(request: Request) -> str | None:
 
 
 def _set_session_cookie(response: Response, raw_token: str) -> None:
-    """Attach the session token as an HTTP-only, SameSite cookie."""
+    """Attach the session token (HttpOnly) and CSRF token (accessible to JS)."""
     response.set_cookie(
         key=settings.SESSION_COOKIE_NAME,
         value=raw_token,
@@ -55,14 +58,30 @@ def _set_session_cookie(response: Response, raw_token: str) -> None:
         max_age=settings.SESSION_MAX_AGE_SECONDS,
         path="/",
     )
+    csrf_token = generate_csrf_token()
+    response.set_cookie(
+        key=settings.CSRF_COOKIE_NAME,
+        value=csrf_token,
+        httponly=False,  # Accessible by frontend JS for X-CSRF-Token header
+        secure=settings.SESSION_COOKIE_SECURE,
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+        max_age=settings.SESSION_MAX_AGE_SECONDS,
+        path="/",
+    )
 
 
 def _clear_session_cookie(response: Response) -> None:
-    """Remove the session cookie from the client."""
+    """Remove the session and CSRF cookies from the client."""
     response.delete_cookie(
         key=settings.SESSION_COOKIE_NAME,
         path="/",
         httponly=True,
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+    )
+    response.delete_cookie(
+        key=settings.CSRF_COOKIE_NAME,
+        path="/",
+        httponly=False,
         samesite=settings.SESSION_COOKIE_SAMESITE,
     )
 
@@ -83,7 +102,7 @@ def register(
     response: Response,
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    ip = _get_client_ip(request)
+    ip = _get_client_ip(request) or "127.0.0.1"
     user_agent = request.headers.get("User-Agent")
     request_id = getattr(request.state, "request_id", None)
 
@@ -152,7 +171,8 @@ def register(
     description=(
         "Verifies credentials and issues an HTTP-only session cookie. "
         "Always performs a full Argon2id verification regardless of whether the email exists "
-        "to prevent user enumeration via timing."
+        "to prevent user enumeration via timing. "
+        "Applies sliding window rate limiting on failed attempts."
     ),
 )
 def login(
@@ -161,9 +181,28 @@ def login(
     response: Response,
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    ip = _get_client_ip(request)
+    ip = _get_client_ip(request) or "127.0.0.1"
     user_agent = request.headers.get("User-Agent")
     request_id = getattr(request.state, "request_id", None)
+
+    # Rate limiting check
+    is_limited, retry_after = login_rate_limiter.is_rate_limited(ip, body.email)
+    if is_limited:
+        AuditService.log_event(
+            db,
+            action="user.login_rate_limited",
+            outcome=AuditOutcome.DENIED,
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={"email": body.email, "reason": "rate_limit_exceeded"},
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts. Please try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     # Load user by email
     user: User | None = db.query(User).filter(User.email == body.email.lower()).first()
@@ -176,6 +215,8 @@ def login(
 
     # Reject if user doesn't exist, password is wrong, or account is deactivated
     if not user or not password_ok or not user.is_active:
+        login_rate_limiter.record_failure(ip, body.email)
+
         AuditService.log_event(
             db,
             action="user.login_failed",
@@ -191,6 +232,9 @@ def login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
         )
+
+    # Credentials valid -> clear recorded failed attempts
+    login_rate_limiter.record_success(ip, body.email)
 
     # Rehash password if parameters are outdated (transparent upgrade)
     if password_needs_rehash(user.hashed_password):
@@ -234,7 +278,7 @@ def logout(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> None:
-    ip = _get_client_ip(request)
+    ip = _get_client_ip(request) or "127.0.0.1"
     user_agent = request.headers.get("User-Agent")
     request_id = getattr(request.state, "request_id", None)
 
@@ -281,7 +325,7 @@ def update_me(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    ip = _get_client_ip(request)
+    ip = _get_client_ip(request) or "127.0.0.1"
     user_agent = request.headers.get("User-Agent")
     request_id = getattr(request.state, "request_id", None)
 

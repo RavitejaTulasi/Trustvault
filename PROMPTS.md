@@ -33,8 +33,17 @@ When collaborating with AI on TrustVault, the following engineering prompts and 
 
 ---
 
-### [Upcoming Entries for Days 2–7]
-- **Entry 2 (Day 2)**: Centralized authorization policy and cross-user grant resolution.
-- **Entry 3 (Day 3)**: Private storage streaming size validation and magic byte content sniffing.
-- **Entry 4 (Day 4)**: Immediate revocation propagation and race-free permission grants.
-- **Entry 5 (Day 5)**: React frontend state synchronization, CSRF cookie handling, and admin activity filtering.
+### Entry 2 (Day 2.1 Security Remediation — 2026-10-19): CSRF Protection and Login Rate Limiting Implementation
+- **Category**: Security Remediation (HIGH-01 & HIGH-02)
+- **Prompt Summary**:
+  "Remediate Findings HIGH-01 (Missing CSRF protection) and HIGH-02 (Missing login rate limiting) identified in the Day 1 & Day 2 Security Audit. Implement double-submit cookie CSRF validation middleware and in-memory sliding-window login rate limiting with unit/integration test coverage."
+- **What the AI Produced**:
+  - Implemented `backend/app/security/csrf.py` providing `CSRFMiddleware` (double-submit cookie validation with constant-time `secrets.compare_digest` and Origin/Referer defense-in-depth checks).
+  - Implemented `backend/app/security/rate_limiter.py` providing `LoginRateLimiter` (sliding-window tracking across IP and email, returning HTTP 429 with `Retry-After` on exhaustion).
+  - Updated `backend/app/api/auth.py` to set both session and CSRF cookies on login/registration, clear both on logout, and enforce rate limiting in `POST /auth/login`.
+  - Added automated tests in `backend/tests/test_security_remediation.py` covering CSRF success/failure and rate-limit thresholds.
+- **What was Specifically Wrong or Incomplete**:
+  Initial test runs with `AsyncClient` failed because HTTPX did not automatically copy the `trustvault_csrf` cookie into the `X-CSRF-Token` request header.
+- **What was Changed and How Verified**:
+  Created a request event hook `_inject_csrf_header_hook` in `conftest.py` that automatically mirrors the `trustvault_csrf` cookie into the `X-CSRF-Token` header for test requests (simulating legitimate frontend SPA behavior). Verified by running `pytest backend/tests/ -v`, resulting in 37/37 tests passing green.
+- **Git Status**: Uncommitted changes staged/ready for review.
