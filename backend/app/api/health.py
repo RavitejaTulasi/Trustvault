@@ -41,6 +41,11 @@ def get_health(response: Response) -> HealthResponse:
     if not is_healthy:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
+    anchor_mode = settings.AUDIT_ANCHOR_MODE
+    anchor_status = (
+        "not_configured" if anchor_mode == "disabled" else "local_development_only"
+    )
+
     return HealthResponse(
         status="healthy" if is_healthy else "unhealthy",
         app=settings.APP_NAME,
@@ -54,6 +59,11 @@ def get_health(response: Response) -> HealthResponse:
             "storage": {
                 "status": "ok" if storage_ok else "down",
                 "path": str(storage_path),
+            },
+            "audit_anchor": {
+                "status": anchor_status,
+                "mode": anchor_mode,
+                "independent": False,
             },
         },
     )

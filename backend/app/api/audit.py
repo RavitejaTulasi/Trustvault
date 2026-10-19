@@ -12,6 +12,7 @@ Security controls:
 """
 
 import json
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
@@ -30,15 +31,61 @@ from backend.app.schemas.audit import (
     AuditEventListResponse,
     AuditEventResponse,
     AuditVerificationResponse,
+    CheckpointCreateResponse,
+    CheckpointInfoResponse,
+    CheckpointVerificationResponse,
 )
 from backend.app.security.auth import require_admin
-from backend.app.security.rate_limiter import audit_verification_rate_limiter
+from backend.app.security.rate_limiter import (
+    audit_checkpoint_rate_limiter,
+    audit_verification_rate_limiter,
+)
 from backend.app.services.audit_service import AuditService
+from backend.app.services.checkpoint_service import (
+    CheckpointCreationError,
+    CheckpointService,
+)
+from backend.app.services.checkpoint_store import (
+    CheckpointIntegrityError,
+    CheckpointStore,
+    CheckpointStoreUnavailableError,
+    LocalFileCheckpointStore,
+    UnavailableCheckpointStore,
+)
 
 router = APIRouter(prefix="/admin", tags=["Admin – Audit Trail"])
+logger = logging.getLogger(__name__)
 
 AuditOutcomeFilter = Literal["SUCCESS", "DENIED", "FAILURE"]
 _HASH_PATTERN = re.compile(r"\b[0-9a-f]{64}\b")
+_CHECKPOINT_FAILURE_DETAILS = {
+    "chain_invalid": "Checkpoint creation refused: audit chain verification failed",
+    "chain_incomplete": (
+        "Checkpoint creation refused: audit chain verification was incomplete"
+    ),
+    "anchor_unavailable": "Checkpoint anchoring is not configured or unavailable",
+    "anchor_integrity_failure": (
+        "Checkpoint creation refused: stored checkpoint failed its integrity check"
+    ),
+    "anchor_format_unsupported": (
+        "Checkpoint creation refused: stored checkpoint format is not supported"
+    ),
+    "anchor_stream_mismatch": (
+        "Checkpoint creation refused: stored checkpoint belongs to a different audit stream"
+    ),
+    "anchor_ahead_of_chain": (
+        "Checkpoint creation refused: stored checkpoint is ahead of the audit chain"
+    ),
+    "anchor_chain_mismatch": (
+        "Checkpoint creation refused: stored checkpoint conflicts with the audit chain"
+    ),
+    "anchor_rollback_detected": (
+        "Checkpoint creation refused: checkpoint sequence would move backwards"
+    ),
+    "anchor_conflict": (
+        "Checkpoint creation refused: a conflicting checkpoint already exists"
+    ),
+}
 
 
 def _clean_filter(value: str | None, name: str, max_length: int) -> str | None:
@@ -95,6 +142,66 @@ def _disable_caching(response: Response) -> None:
     """Prevent caching of sensitive audit and activity responses."""
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
+
+
+def get_checkpoint_store() -> CheckpointStore:
+    """
+    Instantiate the configured checkpoint adapter.
+
+    Disabled or invalid configuration resolves to a fail-closed store so that
+    administrative operations surface unavailability instead of claiming that an
+    external anchor exists.
+    """
+    if settings.AUDIT_ANCHOR_MODE == "local_file":
+        try:
+            return LocalFileCheckpointStore(
+                settings.resolved_audit_anchor_path,
+                settings.AUDIT_ANCHOR_HMAC_KEY.encode("utf-8"),
+            )
+        except (OSError, ValueError):
+            logger.error("Audit checkpoint store initialization failed")
+    return UnavailableCheckpointStore()
+
+
+def _enforce_checkpoint_rate_limit(actor_id: str) -> None:
+    """Bound expensive checkpoint operations per administrator."""
+    allowed, retry_after = audit_checkpoint_rate_limiter.allow(actor_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Checkpoint operation rate limit exceeded; retry later",
+            headers={
+                "Retry-After": str(retry_after),
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+            },
+        )
+
+
+def _record_checkpoint_failure(
+    db: Session,
+    *,
+    actor_id: str,
+    request: Request,
+    reason: str,
+) -> None:
+    """Best-effort audit record for a refused checkpoint creation."""
+    try:
+        AuditService.log_event(
+            db,
+            action="audit.checkpoint_created",
+            outcome=AuditOutcome.FAILURE,
+            actor_id=actor_id,
+            resource_type="audit",
+            ip_address=_get_client_ip(request) or "127.0.0.1",
+            user_agent=request.headers.get("User-Agent"),
+            request_id=getattr(request.state, "request_id", None),
+            details={"reason": reason},
+        )
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.warning("Failed to persist audit checkpoint failure event")
 
 
 def _get_client_ip(request: Request) -> str | None:
@@ -265,6 +372,171 @@ def verify_audit_chain(
         is_valid=result.status == "VALID",
         records_verified=result.records_verified,
         failure_reason=_sanitize_failure_reason(result.failure_reason),
+    )
+
+
+@router.post(
+    "/audit/checkpoints",
+    response_model=CheckpointCreateResponse,
+    summary="Create an audit-chain checkpoint",
+    description=(
+        "Admin only. Verifies the committed audit chain and stores a checkpoint "
+        "binding the highest verified sequence number and its record hash. "
+        "Checkpoint creation is refused when the chain cannot be verified, when "
+        "the anchor is unavailable, or when the stored checkpoint conflicts with "
+        "or is ahead of the live chain. Raw hashes and keys are never returned."
+    ),
+)
+def create_audit_checkpoint(
+    request: Request,
+    response: Response,
+    current_user: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    store: Annotated[CheckpointStore, Depends(get_checkpoint_store)],
+) -> CheckpointCreateResponse:
+    _disable_caching(response)
+    _enforce_checkpoint_rate_limit(current_user.id)
+
+    try:
+        result = CheckpointService.create_checkpoint(
+            db,
+            store,
+            max_records=settings.AUDIT_VERIFY_MAX_RECORDS,
+            batch_size=settings.AUDIT_VERIFY_BATCH_SIZE,
+            timeout_seconds=settings.AUDIT_VERIFY_TIMEOUT_SECONDS,
+        )
+    except CheckpointCreationError as exc:
+        _record_checkpoint_failure(
+            db, actor_id=current_user.id, request=request, reason=exc.reason
+        )
+        status_code = (
+            503 if exc.reason == "anchor_unavailable" else 409
+        )
+        raise HTTPException(
+            status_code=status_code,
+            detail=_CHECKPOINT_FAILURE_DETAILS.get(
+                exc.reason, "Checkpoint creation refused"
+            ),
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        ) from None
+
+    response.status_code = 200 if result.already_present else 201
+    _record_admin_audit_read(
+        db,
+        action="audit.checkpoint_created",
+        actor_id=current_user.id,
+        request=request,
+        details={
+            "checkpoint_sequence": result.checkpoint.sequence_number,
+            "already_present": result.already_present,
+        },
+    )
+    return CheckpointCreateResponse(
+        status="ALREADY_PRESENT" if result.already_present else "CREATED",
+        anchor_mode=settings.AUDIT_ANCHOR_MODE,
+        stream_id=result.checkpoint.stream_id,
+        sequence_number=result.checkpoint.sequence_number,
+        created_at=result.checkpoint.created_at,
+    )
+
+
+@router.get(
+    "/audit/checkpoints",
+    response_model=CheckpointInfoResponse,
+    summary="Inspect the latest audit checkpoint",
+    description=(
+        "Admin only. Returns non-sensitive metadata for the most recently stored "
+        "checkpoint. Raw record hashes, HMAC tags, signing keys, and storage paths "
+        "are never returned."
+    ),
+)
+def get_audit_checkpoint(
+    request: Request,
+    response: Response,
+    current_user: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    store: Annotated[CheckpointStore, Depends(get_checkpoint_store)],
+) -> CheckpointInfoResponse:
+    _disable_caching(response)
+    available = settings.AUDIT_ANCHOR_MODE != "disabled"
+    checkpoint = None
+    if available:
+        try:
+            checkpoint = store.read_latest()
+        except CheckpointStoreUnavailableError:
+            raise HTTPException(
+                status_code=503,
+                detail="Checkpoint store unavailable",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            ) from None
+        except CheckpointIntegrityError:
+            raise HTTPException(
+                status_code=409,
+                detail="Checkpoint store integrity check failed",
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            ) from None
+
+    _record_admin_audit_read(
+        db, action="audit.checkpoint_read", actor_id=current_user.id, request=request
+    )
+    return CheckpointInfoResponse(
+        anchor_mode=settings.AUDIT_ANCHOR_MODE,
+        available=available,
+        stream_id=checkpoint.stream_id if checkpoint is not None else None,
+        sequence_number=(
+            checkpoint.sequence_number if checkpoint is not None else None
+        ),
+        created_at=checkpoint.created_at if checkpoint is not None else None,
+        format_version=(
+            checkpoint.format_version if checkpoint is not None else None
+        ),
+    )
+
+
+@router.get(
+    "/audit/checkpoints/verify",
+    response_model=CheckpointVerificationResponse,
+    summary="Verify the audit chain against its checkpoint",
+    description=(
+        "Admin only. Performs a bounded verification of the live audit chain and "
+        "compares the checkpointed sequence and hash with the independently stored "
+        "checkpoint. An unavailable anchor, a missing checkpoint, or a bounded "
+        "verification limit produces INCOMPLETE rather than VALID. Raw hashes are "
+        "never returned."
+    ),
+)
+def verify_audit_checkpoint(
+    request: Request,
+    response: Response,
+    current_user: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    store: Annotated[CheckpointStore, Depends(get_checkpoint_store)],
+) -> CheckpointVerificationResponse:
+    _disable_caching(response)
+    _enforce_checkpoint_rate_limit(current_user.id)
+
+    result = CheckpointService.verify_checkpoint(
+        db,
+        store,
+        max_records=settings.AUDIT_VERIFY_MAX_RECORDS,
+        batch_size=settings.AUDIT_VERIFY_BATCH_SIZE,
+        timeout_seconds=settings.AUDIT_VERIFY_TIMEOUT_SECONDS,
+    )
+    _record_admin_audit_read(
+        db,
+        action="audit.checkpoint_verify",
+        actor_id=current_user.id,
+        request=request,
+        details={"verification_status": result.status},
+    )
+    return CheckpointVerificationResponse(
+        status=result.status,
+        is_valid=result.status == "VALID",
+        records_verified=result.records_verified,
+        checkpoint_sequence=result.checkpoint_sequence,
+        chain_head_sequence=result.chain_head_sequence,
+        failure_reason=_sanitize_failure_reason(result.failure_reason),
+        anchor_mode=settings.AUDIT_ANCHOR_MODE,
     )
 
 

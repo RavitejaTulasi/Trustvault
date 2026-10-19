@@ -41,6 +41,8 @@ venv.bak/
 private_storage/
 storage/
 uploads/
+# Development-only audit checkpoint directory (never commit anchor data)
+audit_checkpoints/
 
 # Testing and linters
 .pytest_cache/

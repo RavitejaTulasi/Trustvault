@@ -152,3 +152,9 @@ audit_verification_rate_limiter = SlidingWindowRateLimiter(
     max_requests=settings.AUDIT_VERIFY_RATE_LIMIT_MAX_REQUESTS,
     window_seconds=settings.AUDIT_VERIFY_RATE_LIMIT_WINDOW_SECONDS,
 )
+
+# Process-local limiter for audit checkpoint creation and checkpoint verification
+audit_checkpoint_rate_limiter = SlidingWindowRateLimiter(
+    max_requests=settings.AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS,
+    window_seconds=settings.AUDIT_CHECKPOINT_RATE_LIMIT_WINDOW_SECONDS,
+)

@@ -19,6 +19,7 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 from backend.app.database import Base, get_db
 from backend.app.main import app
 from backend.app.security.rate_limiter import (
+    audit_checkpoint_rate_limiter,
     audit_verification_rate_limiter,
     login_rate_limiter,
 )
@@ -47,9 +48,11 @@ def reset_rate_limiter_fixture():
     """Resets rate limiter state before and after each test."""
     login_rate_limiter.reset()
     audit_verification_rate_limiter.reset()
+    audit_checkpoint_rate_limiter.reset()
     yield
     login_rate_limiter.reset()
     audit_verification_rate_limiter.reset()
+    audit_checkpoint_rate_limiter.reset()
 
 
 @pytest.fixture

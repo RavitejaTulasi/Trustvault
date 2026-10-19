@@ -11,7 +11,9 @@ from pydantic import BaseModel, field_validator
 REDACTED_VALUE = "[redacted]"
 SAFE_DETAIL_KEYS = frozenset(
     {
+        "already_present",
         "changed_fields",
+        "checkpoint_sequence",
         "document_id",
         "email",
         "from_role",
@@ -92,3 +94,36 @@ class AuditVerificationResponse(BaseModel):
     is_valid: bool
     records_verified: int
     failure_reason: str | None = None
+
+
+class CheckpointCreateResponse(BaseModel):
+    """Result of an audit checkpoint creation request."""
+
+    status: Literal["CREATED", "ALREADY_PRESENT"]
+    anchor_mode: str
+    stream_id: str
+    sequence_number: int
+    created_at: datetime
+
+
+class CheckpointInfoResponse(BaseModel):
+    """Metadata for the most recently stored checkpoint without raw hashes."""
+
+    anchor_mode: str
+    available: bool
+    stream_id: str | None = None
+    sequence_number: int | None = None
+    created_at: datetime | None = None
+    format_version: int | None = None
+
+
+class CheckpointVerificationResponse(BaseModel):
+    """Result of comparing the live audit chain with a stored checkpoint."""
+
+    status: Literal["VALID", "INVALID", "INCOMPLETE"]
+    is_valid: bool
+    records_verified: int
+    checkpoint_sequence: int | None = None
+    chain_head_sequence: int | None = None
+    failure_reason: str | None = None
+    anchor_mode: str

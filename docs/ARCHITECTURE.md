@@ -12,7 +12,7 @@ TrustVault is engineered around five mandatory security pillars:
 2. **Server-Side Trust Boundary**: Frontend checks exist solely for user interface ergonomics. The backend is the sole authority; client-supplied role parameters or user IDs are rejected.
 3. **Storage Decoupling**: Stored files are kept strictly outside the web server root. Physical file paths are generated via 256-bit unguessable random keys and are never exposed to clients.
 4. **Immediate Revocation**: No cached authorization tokens or long-lived download URLs are used. When an access grant is revoked, the very next download or read attempt is blocked.
-5. **Tamper-Evident Auditability**: Every instrumented authentication, state-changing, document access, access-denial, and administrative audit-read action produces a cryptographically hash-chained audit record. The exact recorded actions and the remaining gaps are listed in Section 5.
+5. **Tamper-Evident Auditability**: Every instrumented authentication, state-changing, document access, access-denial, and administrative audit-read action produces a cryptographically hash-chained audit record, and independently stored HMAC-protected checkpoints anchor the chain outside the audit database (adapter-based; a development-only local file adapter is implemented, a production provider is not configured). The exact recorded actions and the remaining gaps are listed in Section 5.
 
 ---
 
@@ -37,6 +37,8 @@ TrustVault enforces three distinct roles, with fine-grained document-level permi
 | **System-wide Audit Trail (`GET /admin/audit`)** | **Yes** (read-only) | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
 | **Verify Audit Hash Chain (`GET /admin/audit/verify`)** | **Yes** (read-only) | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
 | **Document Activity History (`GET /admin/documents/activity`)** | **Yes** (read-only) | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
+| **Create/Inspect Audit Checkpoints (`POST/GET /admin/audit/checkpoints`)** | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
+| **Verify Audit Checkpoint (`GET /admin/audit/checkpoints/verify`)** | **Yes** (read-only) | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
 | **Upload New Document (`POST /documents`)** | **Yes** (creates an admin-owned document) | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
 | **List Documents (`GET /documents`)** | Own/granted only | Own docs only | Granted docs only | Granted docs only | No (401 Unauthorized) |
 | **Read Document Metadata (`GET /documents/{id}`)** | Own/granted only | **Yes** | **Yes** | **Yes** | No (401/404 Deliberate) |
@@ -88,6 +90,13 @@ Search, category, owner, and created-date filters are AND-combined and are appli
 |  - users, sessions, documents, document_grants, audit_events            |
 |  - Cryptographic Hash Chaining on audit_events                          |
 +-------------------------------------------------------------------------+
+       |
+       v
++-------------------------------------------------------------------------+
+|             Audit Checkpoint Anchor (CheckpointStore adapter)           |
+|  - HMAC-SHA256 protected checkpoints bound to stream + sequence         |
+|  - local_file = development only; production provider not configured    |
++-------------------------------------------------------------------------+
 ```
 
 ---
@@ -120,33 +129,52 @@ Administrators can invoke this verification through the read-only `GET /api/v1/a
 ### Verification Consistency and Limits
 The high-water mark prevents verification from chasing audit writes that are appended during the pass: only records at or below the maximum sequence observed at the start are examined. This is not a single repeatable-read database snapshot. A record modified between batch reads can cause a mixed read, and a modification made after a record was already examined is not re-checked until the next run. For a stronger point-in-time result, run verification during a quiet window or against a database snapshot/read replica. The rate limiter is process-local and is not shared across workers or instances; deployment-level or Redis-backed enforcement is required to bound aggregate concurrency. If the chain exceeds the configured record limit or the time budget expires, the endpoint returns an explicit `INCOMPLETE` result rather than a partial success.
 
+### Independently Stored Checkpoints
+Hash chaining alone cannot detect a database-level attacker who rewrites the entire chain from an arbitrary sequence forward, or who truncates the current tail before a pass begins. To detect those cases, TrustVault anchors the chain in independently stored checkpoints through a `CheckpointStore` adapter (`backend/app/services/checkpoint_store.py`):
+
+- A checkpoint records the audit stream identifier (`trustvault.audit`), the highest verified sequence number, that record's hash, a format version, a creation timestamp, and the previous checkpoint's HMAC tag, and is protected by an HMAC-SHA256 integrity tag computed with the configured `AUDIT_ANCHOR_HMAC_KEY`.
+- Creation (`POST /admin/audit/checkpoints`) runs the bounded chain verification first and refuses to anchor an invalid or incompletely verified chain. It then reads the latest stored checkpoint, refuses to move backwards (rollback) or to silently overwrite a conflicting checkpoint at the same sequence, and writes through compare-and-swap semantics. Repeating creation for the current chain head is idempotent and reports `ALREADY_PRESENT`; extending the chain and retrying advances the checkpoint.
+- The checkpoint covers the verified prefix only. The `audit.checkpoint_created` event is appended after the checkpoint is stored, so a checkpoint never binds its own creation record, and a failure to append that event does not invalidate or roll back the checkpoint (retrying is safe).
+- Verification (`GET /admin/audit/checkpoints/verify`) re-verifies the bounded chain and compares it with the stored checkpoint. A rewritten hash, a missing checkpointed sequence, or a checkpoint that does not match the chain reports `INVALID`; an unavailable anchor store, a missing/corrupt checkpoint, or the bounded-verification `INCOMPLETE` outcome reports `INCOMPLETE` and never `VALID`. The chain may legitimately extend beyond the checkpoint without affecting validity.
+
+The only adapter implemented in this build is a development-only local file store (`AUDIT_ANCHOR_MODE=local_file`), which writes HMAC-signed checkpoint documents to `AUDIT_ANCHOR_DIR`. It shares the application's host and filesystem failure domain and is explicitly **not** independent production anchoring; the settings validator rejects it in `ENVIRONMENT=production`, and it must only be used for local development and testing. With the default `AUDIT_ANCHOR_MODE=disabled`, no adapter is configured: checkpoint creation fails closed with `503`, and checkpoint verification honestly reports `INCOMPLETE`. The `CheckpointStore` interface is the extension point for a production provider (for example a WORM/object-lock store or a separate permissioned service), which remains unimplemented and unconfigured.
+
 ### Limitation & Production Anchoring
-Hash chaining reliably detects unauthorized modification, insertion, or deletion of individual records within the observed chain. However, an attacker with full database superuser privileges could theoretically rewrite the entire chain from an arbitrary record forward. Truncating the current tail before a verification pass is also undetectable from database-internal state alone: the high-water mark is derived from the remaining rows, and the chain contains no self-authenticating record count. For high-assurance production environments, TrustVault supports streaming audit hashes to immutable external storage (e.g., AWS S3 Object Lock in Compliance Mode or RFC 3161 timestamping authorities) and recommends periodic external root-hash publication.
+Hash chaining reliably detects unauthorized modification, insertion, or deletion of individual records within the observed chain, and stored checkpoints extend that detection to whole-chain rewrites and tail truncation at or below the checkpointed sequence — provided the checkpoint store and HMAC key are outside the database attacker's control. The following boundaries remain and are not solved by this build:
+
+- A local `local_file` checkpoint store sits on the same host as the application; an attacker who compromises both the database and the anchor directory (or the HMAC key) can rewrite or roll back checkpoints. The local adapter cannot prevent deletion of its own files.
+- No production external provider (immutable/WORM object storage, a separately administered anchor service, or an RFC 3161 timestamping authority) is configured. Production-grade anchoring with provider-managed keys and retention is a documented operational requirement, not an implemented control.
+- History rewritten strictly after the latest checkpoint is not detected by the checkpoint comparison alone; it is caught only by the ordinary full-chain verification, and the high-water mark still derives from the remaining rows.
+
+For high-assurance production environments, deploy the `CheckpointStore` interface against immutable external storage (e.g., AWS S3 Object Lock in Compliance Mode) or a separately administered anchoring service, and create checkpoints on a regular schedule so the unanchored window stays small.
 
 ---
 
 ## 5. Administrative Audit API and Coverage
 
 ### API Surface
-All three endpoints require the authenticated `admin` role and are registered under `/api/v1`:
+All six endpoints require the authenticated `admin` role and are registered under `/api/v1`:
 
 - `GET /admin/audit`: filtered, paginated audit-event inspection across all actors and resources.
 - `GET /admin/audit/verify`: bounded hash-chain verification with explicit `VALID`, `INVALID`, or `INCOMPLETE` outcomes and per-administrator rate limiting.
 - `GET /admin/documents/activity`: filtered, paginated document and document-grant activity.
+- `POST /admin/audit/checkpoints`: verifies the committed chain and stores a checkpoint through the configured `CheckpointStore`; returns `201 CREATED` or `200 ALREADY_PRESENT`, `409` for an invalid/incomplete chain or a rejected rollback/conflict, and `503` when no anchor is configured or available.
+- `GET /admin/audit/checkpoints`: returns checkpoint metadata (stream ID, sequence number, created-at, format version, anchor mode, availability) without hash values, HMAC tags, keys, or paths; reports `available: false` when no anchor is configured.
+- `GET /admin/audit/checkpoints/verify`: bounded chain verification compared against the stored checkpoint with explicit `VALID`, `INVALID`, or `INCOMPLETE` outcomes and a separate per-administrator rate limiter.
 
-The audit and activity response schemas expose only `id`, `sequence_number`, `timestamp`, `actor_id`, `action`, `resource_type`, `resource_id`, `outcome`, `request_id`, `ip_address`, `user_agent`, and sanitized `details`. `previous_hash` and `record_hash` are deliberately excluded, as are any credential fields. `details` uses a default-deny allowlist that preserves correlation and account-management keys (`document_id`, `recipient_id`, `target_user_id`, `permission`, `reason`, `changed_fields`, `role`, `from_role`, `to_role`, `email`, `sessions_revoked`, and `verification_status`) and returns `[redacted]` for every other key, including document title, filename, size, category, MIME type, storage path/key, password, and token values. Raw audit rows are unchanged. Verification failure diagnostics redact full hash values. All three endpoints also return `Cache-Control: no-store` and `Pragma: no-cache`. String filters are trimmed, length-bounded, and exact-matched through bound SQLAlchemy expressions. `document_id` activity filtering matches direct document events by `resource_id` and grant events by the recorded `details.document_id`; LIKE metacharacters in the supplied ID are escaped.
+The audit and activity response schemas expose only `id`, `sequence_number`, `timestamp`, `actor_id`, `action`, `resource_type`, `resource_id`, `outcome`, `request_id`, `ip_address`, `user_agent`, and sanitized `details`. `previous_hash` and `record_hash` are deliberately excluded, as are any credential fields and checkpoint HMAC tags. `details` uses a default-deny allowlist that preserves correlation, account-management, and checkpoint keys (`document_id`, `recipient_id`, `target_user_id`, `permission`, `reason`, `changed_fields`, `role`, `from_role`, `to_role`, `email`, `sessions_revoked`, `verification_status`, `already_present`, and `checkpoint_sequence`) and returns `[redacted]` for every other key, including document title, filename, size, category, MIME type, storage path/key, password, and token values. Raw audit rows are unchanged. Verification and checkpoint failure diagnostics redact full hash values. All audit, activity, and checkpoint endpoints also return `Cache-Control: no-store` and `Pragma: no-cache`. String filters are trimmed, length-bounded, and exact-matched through bound SQLAlchemy expressions. `document_id` activity filtering matches direct document events by `resource_id` and grant events by the recorded `details.document_id`; LIKE metacharacters in the supplied ID are escaped.
 
 These endpoints are read-only. They do not return document metadata values or bytes and do not create an alternative path to document access. An administrator querying audit data remains subject to the same owner-or-active-grant policy on document routes.
 
 ### Administrative Read Auditing
-Each successful administrative read appends its own audit event with `resource_type` set to `audit` and no resource ID: `audit.read` for `GET /admin/audit`, `audit.verify` for `GET /admin/audit/verify` (with allowlisted `details.verification_status` recording `VALID`, `INVALID`, or `INCOMPLETE`), and `audit.activity_read` for `GET /admin/documents/activity`. The event is committed before the response is returned; if the event cannot be durably persisted, the endpoint returns `503 Audit trail unavailable` with `Cache-Control: no-store` instead of serving an unaudited response. Rate-limited (`429`) and non-administrator (`403`) requests do not create read events because no audit data is served. Verification still inspects only records at or below the high-water mark observed before its own read event is appended, so the read event never inflates `records_verified` for that pass.
+Each successful administrative read appends its own audit event with `resource_type` set to `audit` and no resource ID: `audit.read` for `GET /admin/audit`, `audit.verify` for `GET /admin/audit/verify` (with allowlisted `details.verification_status` recording `VALID`, `INVALID`, or `INCOMPLETE`), `audit.activity_read` for `GET /admin/documents/activity`, `audit.checkpoint_read` for `GET /admin/audit/checkpoints`, and `audit.checkpoint_verify` for `GET /admin/audit/checkpoints/verify` (with allowlisted `details.verification_status`). Checkpoint creation records `audit.checkpoint_created` (outcome `SUCCESS` with allowlisted `details.already_present` and `details.checkpoint_sequence`, or `FAILURE` with an allowlisted `details.reason`) after the anchor write. The event is committed before the response is returned; if the event cannot be durably persisted, the endpoint returns `503 Audit trail unavailable` with `Cache-Control: no-store` instead of serving an unaudited response. Rate-limited (`429`) and non-administrator (`403`) requests do not create read events because no audit data is served. Verification still inspects only records at or below the high-water mark observed before its own read event is appended, so the read event never inflates `records_verified` for that pass.
 
 ### Recorded Audit Actions
 The current build records the following events:
 
 - Authentication and self-service: `user.register`, `user.login`, `user.login_failed`, `user.login_rate_limited`, `user.logout`, `user.update`.
 - Administrative user management: `user.role_change`, `user.deactivate`, `user.reactivate`, `user.sessions_revoked`.
-- Administrative audit inspection: `audit.read`, `audit.verify`, `audit.activity_read`.
+- Administrative audit inspection and anchoring: `audit.read`, `audit.verify`, `audit.activity_read`, `audit.checkpoint_read`, `audit.checkpoint_verify`, `audit.checkpoint_created`.
 - Documents: `document.upload`, `document.read`, `document.download`, `document.edit`, `document.delete`, including success and authorization-denial outcomes. Rejected uploads are recorded as `document.upload` with `DENIED` and an allowlisted `details.reason` (`insufficient_role`, `missing_filename`, `invalid_upload`, or `size_limit_exceeded`).
 - Sharing: `permission.grant`, `permission.revoke`, and `permission.list_denied`.
 

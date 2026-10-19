@@ -5,8 +5,9 @@ Enforces defense-in-depth defaults.
 """
 
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -85,6 +86,32 @@ class Settings(BaseSettings):
         description="Sliding window for verification request rate limiting",
     )
 
+    # Audit Checkpoint Anchoring
+    # "local_file" is a development adapter only. It is not independent of the
+    # application host and must never be treated as production-grade anchoring.
+    AUDIT_ANCHOR_MODE: Literal["disabled", "local_file"] = Field(
+        default="disabled",
+        description="Checkpoint anchoring adapter: 'disabled' or development-only 'local_file'",
+    )
+    AUDIT_ANCHOR_DIR: str = Field(
+        default="./audit_checkpoints",
+        description="Directory used by the development-only local checkpoint adapter",
+    )
+    AUDIT_ANCHOR_HMAC_KEY: str = Field(
+        default="",
+        description="HMAC key (>= 32 characters) used to integrity-protect local checkpoints",
+    )
+    AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS: int = Field(
+        default=5,
+        ge=1,
+        description="Checkpoint create/verify requests allowed per administrator per window",
+    )
+    AUDIT_CHECKPOINT_RATE_LIMIT_WINDOW_SECONDS: int = Field(
+        default=60,
+        ge=1,
+        description="Sliding window for checkpoint operation rate limiting",
+    )
+
     # CORS
     CORS_ORIGINS: str | list[str] = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000"
 
@@ -103,6 +130,22 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in v.split(",") if origin.strip()]
         return v
 
+    @model_validator(mode="after")
+    def validate_anchor_settings(self) -> "Settings":
+        if self.AUDIT_ANCHOR_MODE == "local_file":
+            if self.ENVIRONMENT == "production":
+                raise ValueError(
+                    "AUDIT_ANCHOR_MODE=local_file is development-only; it is not "
+                    "independent production anchoring. Disable it or configure a "
+                    "supported external checkpoint adapter."
+                )
+            if len(self.AUDIT_ANCHOR_HMAC_KEY) < 32:
+                raise ValueError(
+                    "AUDIT_ANCHOR_HMAC_KEY must be at least 32 characters when "
+                    "AUDIT_ANCHOR_MODE=local_file."
+                )
+        return self
+
     @property
     def allowed_extensions_set(self) -> set[str]:
         return {ext.strip().lower() for ext in self.ALLOWED_EXTENSIONS.split(",") if ext.strip()}
@@ -110,6 +153,13 @@ class Settings(BaseSettings):
     @property
     def resolved_storage_path(self) -> Path:
         path = Path(self.STORAGE_DIR)
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        return path
+
+    @property
+    def resolved_audit_anchor_path(self) -> Path:
+        path = Path(self.AUDIT_ANCHOR_DIR)
         if not path.is_absolute():
             path = BASE_DIR / path
         return path

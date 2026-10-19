@@ -41,6 +41,7 @@ class AuditVerificationResult:
     status: VerificationStatus
     records_verified: int
     failure_reason: str | None = None
+    tail_hash: str | None = None
 
 
 class AuditService:
@@ -218,7 +219,7 @@ class AuditService:
             )
         ).one()
         if high_water_mark is None:
-            return AuditVerificationResult("VALID", 0)
+            return AuditVerificationResult("VALID", 0, tail_hash=GENESIS_HASH)
         if low_sequence is None or low_sequence < 1:
             return AuditVerificationResult(
                 "INVALID",
@@ -317,7 +318,9 @@ class AuditService:
                 expected_sequence += 1
 
             if last_sequence >= high_water_mark:
-                return AuditVerificationResult("VALID", last_sequence)
+                return AuditVerificationResult(
+                    "VALID", last_sequence, tail_hash=expected_prev_hash
+                )
 
         if expected_sequence <= high_water_mark:
             return AuditVerificationResult(
@@ -330,7 +333,9 @@ class AuditService:
                 ),
             )
 
-        return AuditVerificationResult("VALID", expected_sequence - 1)
+        return AuditVerificationResult(
+            "VALID", expected_sequence - 1, tail_hash=expected_prev_hash
+        )
 
     @classmethod
     def verify_chain_integrity(cls, db: Session) -> tuple[bool, str | None, int]:

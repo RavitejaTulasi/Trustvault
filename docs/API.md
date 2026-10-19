@@ -14,6 +14,7 @@ This document details the complete API contract for TrustVault, including authen
 - `401 Unauthorized`: Authentication required or invalid/expired session cookie.
 - `403 Forbidden`: Authenticated identity lacks the required platform role (for example, an admin-only endpoint).
 - `404 Not Found`: Deliberate 404 returned for inaccessible or non-existent documents to prevent existence discovery, or a non-existent endpoint/resource.
+- `409 Conflict`: The audit chain could not be anchored because it is invalid or incompletely verified, or the stored checkpoint rejected a rollback or conflicting write.
 - `413 Payload Too Large`: Upload exceeds maximum allowed file size (10MB).
 - `422 Unprocessable Entity`: Malformed query parameter, invalid filter value, or invalid date range.
 - `429 Too Many Requests`: Rate limit exceeded (e.g. login brute-force throttle).
@@ -278,9 +279,9 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
   }
   ```
 - **Response Safety**: Only the fields shown above are exposed. Internal hash-chain fields (`previous_hash`, `record_hash`) and user credential fields are never returned. Verification diagnostics redact full hash values before returning a failure reason. Stored JSON `details` is parsed into an object; malformed or non-object details are returned as `null`.
-- **Detail Redaction**: `details` uses a default-deny key allowlist for `changed_fields`, `document_id`, `email`, `from_role`, `permission`, `reason`, `recipient_id`, `role`, `sessions_revoked`, `target_user_id`, `to_role`, and `verification_status`. Every other key is returned as `[redacted]`, including document title, filename, size, category, MIME type, storage path/key, password, and token values. Redaction applies only to API serialization; stored audit records remain unchanged.
-- **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache` on all three audit/activity endpoints.
-- **Read Auditing**: Each successful read of these endpoints is itself recorded as an audit event (`audit.read`, `audit.verify`, or `audit.activity_read`, with `resource_type` `audit`). The event commits before the response is sent; if it cannot be persisted, the endpoint returns `503` with detail `Audit trail unavailable` instead of serving an unaudited response. Requests denied by role (`403`) or verification rate limiting (`429`) do not create read events.
+- **Detail Redaction**: `details` uses a default-deny key allowlist for `already_present`, `changed_fields`, `checkpoint_sequence`, `document_id`, `email`, `from_role`, `permission`, `reason`, `recipient_id`, `role`, `sessions_revoked`, `target_user_id`, `to_role`, and `verification_status`. Every other key is returned as `[redacted]`, including document title, filename, size, category, MIME type, storage path/key, password, and token values. Redaction applies only to API serialization; stored audit records remain unchanged.
+- **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache` on all audit, activity, and checkpoint endpoints.
+- **Read Auditing**: Each successful read of these endpoints is itself recorded as an audit event (`audit.read`, `audit.verify`, `audit.activity_read`, `audit.checkpoint_read`, or `audit.checkpoint_verify`, with `resource_type` `audit`). The event commits before the response is sent; if it cannot be persisted, the endpoint returns `503` with detail `Audit trail unavailable` instead of serving an unaudited response. Requests denied by role (`403`) or rate limiting (`429`) do not create read events.
 - **Filtering Safety**: All filters use parameterized SQLAlchemy expressions. String filters are trimmed and exact-matched; document activity uses escaped literal matching where text search is required.
 
 ### `GET /api/v1/admin/audit/verify`
@@ -317,6 +318,74 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 - **Concurrency Limitation**: The high-water mark excludes later writes and prevents an endless verification chase, but the batch reads are not a single repeatable-read snapshot. A tampering write that lands between batch reads may not be reflected consistently in one pass; re-run verification after writes are quiesced for a stronger point-in-time check.
 - **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
 
+### `POST /api/v1/admin/audit/checkpoints`
+- **Authentication**: Required
+- **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
+- **Action**: Runs the same bounded chain verification as `GET /api/v1/admin/audit/verify` and, only if the committed chain is valid, stores a checkpoint through the configured checkpoint anchor adapter. A checkpoint binds the audit stream ID (`trustvault.audit`), the highest verified `sequence_number`, that record's hash, the checkpoint format version, a creation timestamp, and the preceding checkpoint's HMAC tag, protected by an HMAC-SHA256 integrity tag. The `audit.checkpoint_created` event is appended after the checkpoint is stored, so the checkpoint always covers a prefix that does not include its own creation event.
+- **Request Body**: None.
+- **Idempotency and Monotonicity**: Repeating the call for the current chain head is idempotent and returns the existing checkpoint. The anchor store rejects backwards writes (rollback) and conflicting checkpoints at the same sequence; extending the chain and calling again advances the checkpoint.
+- **Response `201 Created`** (new checkpoint) or **`200 OK`** (checkpoint for this head already present):
+  ```json
+  {
+    "status": "CREATED",
+    "stream_id": "trustvault.audit",
+    "sequence_number": 42,
+    "created_at": "2026-10-19T10:00:00.000000Z",
+    "anchor_mode": "local_file"
+  }
+  ```
+  `status` is `CREATED` or `ALREADY_PRESENT`. Response fields never include record hashes, HMAC tags, signing keys, or filesystem paths.
+- **Refusal `409 Conflict`**: Returned when the chain fails verification (altered record, broken link, gap), when the bounded pass was incomplete, when the stored checkpoint is ahead of the chain, or when the anchor store rejects a rollback or conflicting write. The detail is a generic message; the stored `audit.checkpoint_created` failure event records an allowlisted `reason` such as `chain_invalid`, `chain_incomplete`, `anchor_ahead_of_chain`, `anchor_chain_mismatch`, `anchor_rollback_detected`, or `anchor_conflict`.
+- **Unavailable `503 Service Unavailable`**: Returned with a generic detail when no anchor adapter is configured (`AUDIT_ANCHOR_MODE=disabled`) or the configured adapter is not reachable. The failure is recorded as `audit.checkpoint_created` with outcome `FAILURE` and `reason: anchor_unavailable` where the audit trail is available. Other refusal reasons (`anchor_integrity_failure`, `anchor_format_unsupported`, `anchor_stream_mismatch`, `anchor_ahead_of_chain`, `anchor_chain_mismatch`, `anchor_rollback_detected`, `anchor_conflict`) return `409 Conflict`.
+- **Rate Limit Response**: Checkpoint creation shares a separate per-administrator limiter from hash-chain verification. Exceeding `AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS` per `AUDIT_CHECKPOINT_RATE_LIMIT_WINDOW_SECONDS` returns `429` with `Retry-After`.
+- **Audit Event**: `audit.checkpoint_created` (SUCCESS with allowlisted `details.already_present` and `details.checkpoint_sequence`; FAILURE with allowlisted `details.reason`). The chain verification and anchor comparison inspect only records committed before the event is appended.
+- **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
+
+### `GET /api/v1/admin/audit/checkpoints`
+- **Authentication**: Required
+- **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
+- **Action**: Returns metadata for the latest stored checkpoint without running chain verification. It does not return record hashes, HMAC tags, signing keys, or filesystem paths.
+- **Response `200 OK`**:
+  ```json
+  {
+    "available": true,
+    "anchor_mode": "local_file",
+    "stream_id": "trustvault.audit",
+    "sequence_number": 42,
+    "created_at": "2026-10-19T10:00:00.000000Z",
+    "format_version": 1
+  }
+  ```
+  When no anchor adapter is configured (`AUDIT_ANCHOR_MODE=disabled`), the endpoint returns `200 OK` with `available: false` and `null` checkpoint fields instead of failing. If the adapter is configured but no checkpoint has been written yet, it returns `200 OK` with `available: false`.
+- **Unavailable `503 Service Unavailable` / Conflict `409 Conflict`**: `503` is returned when a configured adapter cannot be reached; `409` is returned when the stored checkpoint fails its integrity check. The details are generic.
+- **Audit Event**: `audit.checkpoint_read` (with `resource_type` `audit`). If the event cannot be persisted, the endpoint returns `503` with detail `Audit trail unavailable` instead of serving an unaudited response.
+- **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
+
+### `GET /api/v1/admin/audit/checkpoints/verify`
+- **Authentication**: Required
+- **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
+- **Action**: Runs the same bounded chain verification as `GET /api/v1/admin/audit/verify`, then compares the verified chain against the latest stored checkpoint. The chain is verified first, so integrity failures take precedence over anchor state.
+- **Status Semantics**:
+  - `VALID`: the bounded chain verification passed and the record hash at the checkpointed sequence equals the checkpoint's stored hash. The chain may legitimately extend beyond the checkpoint; `chain_head_sequence` reports the verified head. `is_valid` is `true`.
+  - `INVALID`: the chain failed verification, the checkpointed sequence no longer exists (tail truncation), the chain's hash at that sequence no longer matches the checkpoint (history rewrite), or the stored checkpoint fails its HMAC integrity check. `is_valid` is `false`.
+  - `INCOMPLETE`: the chain passed verification but no anchor is configured or available, no checkpoint has been stored yet, or the bounded pass hit the record limit or time budget. `is_valid` is `false` and `failure_reason` states why a complete comparison could not be made. `INCOMPLETE` is never reported as `VALID`.
+- **Response `200 OK`**:
+  ```json
+  {
+    "status": "VALID",
+    "is_valid": true,
+    "records_verified": 42,
+    "checkpoint_sequence": 40,
+    "chain_head_sequence": 42,
+    "failure_reason": null,
+    "anchor_mode": "local_file"
+  }
+  ```
+- **Resource Limits**: Uses the same `AUDIT_VERIFY_*` settings as `GET /api/v1/admin/audit/verify`. Full 64-character hash values in the underlying diagnostic are redacted as `[redacted]`.
+- **Rate Limit Response**: Exceeding `AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS` per `AUDIT_CHECKPOINT_RATE_LIMIT_WINDOW_SECONDS` returns `429` with `Retry-After`. This limiter is separate from the hash-chain verification limiter.
+- **Audit Event**: `audit.checkpoint_verify` (with allowlisted `details.verification_status` recording `VALID`, `INVALID`, or `INCOMPLETE`). The event commits before the response is sent; if it cannot be persisted, the endpoint returns `503` with detail `Audit trail unavailable`.
+- **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
+
 ### `GET /api/v1/admin/documents/activity`
 - **Authentication**: Required
 - **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
@@ -331,4 +400,4 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
   - `timestamp_from` / `timestamp_to`: optional inclusive ISO-8601 bounds, normalized to UTC.
 - **Response `200 OK`**: Same paginated envelope and safe event shape as `GET /api/v1/admin/audit`, limited to document activity.
 - **Boundary**: This endpoint does not return document metadata values or bytes and does not grant any document access. Document title, filename, size, category, and MIME type values in `details` are redacted through the same default-deny allowlist as the audit endpoint. The administrator remains subject to the normal owner-or-active-grant rules on document endpoints.
-- **Audit Coverage Note**: Reading audit or activity data through these endpoints is itself recorded as `audit.read`, `audit.verify`, and `audit.activity_read` events with `resource_type` `audit`, and the response is withheld with `503` if that event cannot be persisted. Known remaining read gaps (document listing/search, successful permission listing, administrative user-listing) are documented in `docs/ARCHITECTURE.md`.
+- **Audit Coverage Note**: Reading audit, activity, or checkpoint data through these endpoints is itself recorded as `audit.read`, `audit.verify`, `audit.activity_read`, `audit.checkpoint_read`, and `audit.checkpoint_verify` events with `resource_type` `audit`, and the response is withheld with `503` if that event cannot be persisted. Checkpoint creation is recorded as `audit.checkpoint_created` after the anchor write. Known remaining read gaps (document listing/search, successful permission listing, administrative user-listing) are documented in `docs/ARCHITECTURE.md`.
