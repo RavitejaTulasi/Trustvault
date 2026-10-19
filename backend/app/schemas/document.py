@@ -3,6 +3,7 @@ Pydantic Schemas for Document Management and Storage
 """
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +23,12 @@ class DocumentResponse(BaseModel):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class DocumentListItem(DocumentResponse):
+    """Document list entry with the caller's server-derived effective permission."""
+
+    effective_permission: Literal["owner", "edit", "read"]
 
 
 class DocumentUpdateRequest(BaseModel):
@@ -44,7 +51,7 @@ class DocumentUpdateRequest(BaseModel):
 class DocumentListResponse(BaseModel):
     """Paginated document list response."""
 
-    documents: list[DocumentResponse]
+    documents: list[DocumentListItem]
     total: int
     page: int
     page_size: int

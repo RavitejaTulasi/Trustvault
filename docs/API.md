@@ -15,6 +15,7 @@ This document details the complete API contract for TrustVault, including authen
 - `403 Forbidden`: Authenticated identity lacks the required platform role (for example, an admin-only endpoint).
 - `404 Not Found`: Deliberate 404 returned for inaccessible or non-existent documents to prevent existence discovery, or a non-existent endpoint/resource.
 - `413 Payload Too Large`: Upload exceeds maximum allowed file size (10MB).
+- `422 Unprocessable Entity`: Malformed query parameter, invalid filter value, or invalid date range.
 - `429 Too Many Requests`: Rate limit exceeded (e.g. login brute-force throttle).
 - `503 Service Unavailable`: Database or storage health failure.
 
@@ -96,12 +97,42 @@ This document details the complete API contract for TrustVault, including authen
 
 ### `GET /api/v1/documents`
 - **Authentication**: Required
-- **Authorization Rule**: Returns only documents owned by the caller OR documents where the caller has an active, non-revoked grant. This scope applies equally to administrators; admin role alone does not expose other users' document metadata.
-- **Response `200 OK`**: Paginated document summaries using the same fields as the upload response (`documents`, `total`, `page`, `page_size`).
-
-### `GET /api/v1/documents/search` — Planned (not implemented)
-- **Status**: Planned for a later milestone. The route is not registered in the current API.
-- **Intended Authorization Rule**: Same ownership/active-grant scope as `GET /documents`; no inaccessible metadata may be returned.
+- **Authorization Rule**: Returns only documents owned by the caller OR documents where the caller has an active, non-revoked grant. This scope is applied before any search or filter and applies equally to administrators; admin role alone does not expose other users' document metadata.
+- **Query Parameters**:
+  - `page`: integer, minimum 1 (default: 1).
+  - `page_size`: integer, 1-100 (default: 25).
+  - `q`: optional string, 1-255 characters. Case-insensitive literal substring match against `title` and `original_filename`. SQL LIKE wildcards (`%`, `_`) are escaped and matched literally.
+  - `category`: optional string, 1-100 characters. Exact category match.
+  - `owner_id`: optional string, 1-64 characters. Exact owner ID match, evaluated inside the caller's authorized scope. Filtering by another user's ID returns only the caller's visible matches (normally an empty result); it cannot expand access.
+  - `created_from`: optional ISO-8601 datetime. Inclusive lower bound on `created_at`. Naive datetimes are interpreted as UTC; timezone offsets are normalized to UTC.
+  - `created_to`: optional ISO-8601 datetime. Inclusive upper bound on `created_at`. Naive datetimes are interpreted as UTC; timezone offsets are normalized to UTC.
+- **Validation**: Invalid pagination, blank/oversized string filters, malformed datetimes, or `created_from > created_to` return `422 Unprocessable Entity`.
+- **Sorting**: `created_at` descending. Pagination and sorting match the previous list behavior.
+- **Response `200 OK`**:
+  ```json
+  {
+    "documents": [
+      {
+        "id": "doc_a1b2c3...",
+        "title": "Quarterly Financial Audit",
+        "original_filename": "q3_audit.pdf",
+        "file_size_bytes": 1048576,
+        "mime_type": "application/pdf",
+        "category": "Financial",
+        "owner_id": "u_984f1b...",
+        "is_deleted": false,
+        "created_at": "2026-10-19T10:00:00.000000Z",
+        "updated_at": "2026-10-19T10:00:00.000000Z",
+        "effective_permission": "owner"
+      }
+    ],
+    "total": 1,
+    "page": 1,
+    "page_size": 25
+  }
+  ```
+- **Effective Permission**: Calculated server-side from the current database state for each visible document: `owner` (caller owns it), `edit` (active edit grant), or `read` (active read grant). It is never accepted from the client. Revoked grants are excluded.
+- **Notes**: Search and filtering are provided by this endpoint; there is no separate `/documents/search` route.
 
 ### `GET /api/v1/documents/{id}`
 - **Authentication**: Required

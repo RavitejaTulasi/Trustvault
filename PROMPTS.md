@@ -86,3 +86,26 @@ When collaborating with AI on TrustVault, the following engineering prompts and 
   - Corrected this log's Day 4 provenance using `git log`/`git diff` evidence.
   - Verified with `pytest backend/tests/ -v`: 59/59 tests passing. `ruff check .` reports the same 45 pre-existing findings (mostly FastAPI `B008`, plus existing `I001`, `F401`, `F841`, `BLE001`) with no new rule categories introduced by this remediation.
 - **Git Status**: Included in the Day 4 commit (`feat(security): add document sharing grants and revocation`) after final verification (59/59 tests).
+
+---
+
+### Entry 6 (Day 5 — 2026-10-19): Secure Document Search, Filtering, and Effective-Permission Visibility
+- **Category**: Secure Search / Authorization-Scoped Filtering / Effective Permissions
+- **Prompt Summary** (abridged from the actual Day 5 prompt):
+  "Implement Day 5 secure document search, filtering, and effective-permission visibility. Extend the existing document-list endpoint with title/filename search plus category, owner, and created-date filters; preserve pagination and sorting; enforce owner-or-active-grant visibility before filtering; validate invalid date ranges and malformed parameters; expose a server-derived `owner`/`edit`/`read` effective permission; add security and regression tests; and update API, architecture, threat-model, and prompt-history documentation."
+- **What the AI Produced**:
+  - Extended `GET /api/v1/documents` with `q`, `category`, `owner_id`, `created_from`, and `created_to` query parameters. Search matches `title` and `original_filename` case-insensitively with parameterized SQLAlchemy expressions.
+  - Preserved `created_at` descending sort and existing `page`/`page_size` behavior, with validation for pagination, blank/oversized string filters, malformed datetimes, and reversed date ranges.
+  - Applied the owner-or-active-grant visibility scope before all optional filters, so filters can only narrow results. Admin role does not widen visibility.
+  - Added `DocumentListItem` with server-derived `effective_permission` (`owner`, `edit`, or `read`) and batched the active-grant lookup for the current page to avoid per-document queries.
+  - Added `backend/tests/test_search.py` with 10 tests covering title/filename search, SQL wildcard escaping and injection payloads, category, owner isolation, date ranges, combined filters, effective permissions, revoked/deleted exclusion, admin scope, empty results, and malformed parameters.
+  - Updated `docs/API.md`, `docs/ARCHITECTURE.md`, and `THREATS.md`.
+- **Issues Discovered and Corrections Made**:
+  - `docs/API.md` and the architecture matrix still described search as a separate planned route; corrected to document search on the existing list endpoint and removed the nonexistent `/documents/search` route.
+  - Adding `effective_permission` directly to `DocumentResponse` would have changed upload/get/update response contracts unnecessarily; introduced a list-specific `DocumentListItem` schema instead.
+  - Raw LIKE input would have treated `%` and `_` as wildcards; escaped them so search terms are literal.
+  - Mixed timezone-aware and naive datetimes could fail comparison; normalized both bounds to UTC before validating and querying.
+  - No model or migration change was required because `title`, `original_filename`, `category`, `owner_id`, and `created_at` already exist.
+- **What was Changed and How Verified**:
+  Verified with `pytest backend/tests/ -v`: 69/69 tests passing (59 prior + 10 new). `ruff check .` still reports the same 45 pre-existing findings (38 `B008`, 3 `I001`, 2 `F401`, 1 `BLE001`, 1 `F841`) with no new findings or rule categories.
+- **Git Status**: Uncommitted changes pending user review; commit hash to be added after an approved commit exists.

@@ -23,9 +23,9 @@ Status Classifications:
 | **TV-08** | SQL Injection & Stored/Reflected XSS | OWASP A03:2021 | **Mitigated** | SQLAlchemy 2.0 parameterized queries, CSP headers, nosniff |
 | **TV-09** | Path Traversal / Directory Traversal | CWE-22 / CWE-23 | **Mitigated** | Decoupled server keys, `is_relative_to` containment verification |
 | **TV-10** | Malicious & Oversized File Uploads | CWE-434 / CWE-400 | **Mitigated** | Chunked stream size enforcement (10MB limit), magic byte validation |
-| **TV-11** | Search & Metadata Leakage | CWE-200 / CWE-209 | **Mitigated** | DB-level authorization filter on queries, uniform 404/403 responses |
+| **TV-11** | Search & Metadata Leakage | CWE-200 / CWE-209 | **Mitigated** | DB-level authorization scope applied before search filters |
 | **TV-12** | Audit Log Tampering or Omission | CWE-778 / CWE-353 | **Partially Mitigated** | SHA-256 cryptographic hash-chaining; external WORM anchoring noted |
-| **TV-13** | Administrator Misuse & Overprivileged Admin | Principle of Least Privilege | **Mitigated** | Admins denied content read/download; all admin operations audited |
+| **TV-13** | Administrator Misuse & Overprivileged Admin | Principle of Least Privilege | **Mitigated** | No implicit document access; ownership/grant checks apply to admins |
 | **TV-14** | Concurrent Modification & Race Conditions | CWE-362 | **Partially Mitigated** | Database transactions, unique constraints, atomic SQL updates |
 | **TV-15** | Public Storage Misconfiguration | OWASP A05:2021 | **Mitigated** | Storage path strictly outside web root; no static routing to storage |
 | **TV-16** | Secret Leakage through Git & Version Control | CWE-798 | **Mitigated** | `.gitignore` filters `.env`, `private_storage/`, `*.db`; `.env.example` template |
@@ -93,10 +93,10 @@ Status Classifications:
 - **Status**: **Mitigated**
 
 ### TV-08: SQL Injection and Cross-Site Scripting (XSS)
-- **Attack Scenario**: SQL injection payloads in search queries (`GET /documents/search?q=' OR 1=1--`) or HTML/JS payloads in document titles.
+- **Attack Scenario**: SQL injection payloads in document search/filter parameters (`GET /documents?q=' OR 1=1--`) or HTML/JS payloads in document titles.
 - **Impact**: Database exfiltration or stored script execution in viewer browsers.
-- **Mitigation**: SQLAlchemy 2.0 ORM with 100% parameterized statements; no raw string concatenation in queries. Security headers middleware injects `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, and `Content-Security-Policy`. React frontend escapes rendered content by default.
-- **Test Evidence**: `test_security_headers_present`; SQLAlchemy parameterized-query usage verified by code inspection. No dedicated SQL-injection test is present.
+- **Mitigation**: SQLAlchemy 2.0 ORM with 100% parameterized statements; no raw string concatenation in queries. Search terms are passed as bound parameters, and SQL LIKE wildcards (`%`, `_`) are escaped so user input is matched literally. Security headers middleware injects `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, and `Content-Security-Policy`. React frontend escapes rendered content by default.
+- **Test Evidence**: `test_security_headers_present`, `test_search_treats_sql_injection_and_wildcards_as_literal`.
 - **Residual Risk**: None identified within application codebase.
 - **Status**: **Mitigated**
 
@@ -117,11 +117,11 @@ Status Classifications:
 - **Status**: **Mitigated**
 
 ### TV-11: Search and Metadata Leakage
-- **Attack Scenario**: User searches `GET /documents/search?q=Confidential` hoping to see titles or existence of documents they are not authorized to view.
+- **Attack Scenario**: User searches or filters `GET /documents` with `q`, `category`, `owner_id`, or created-date ranges to discover titles, filenames, ownership, or existence of documents they are not authorized to view.
 - **Impact**: Information disclosure / confidential metadata discovery.
-- **Mitigation**: Document listing and search filters are constructed with mandatory authorization criteria joined at the SQL level (User is owner OR User has active, unrevoked grant). This applies equally to administrators; admin role alone does not widen metadata visibility. Documents the user cannot access are completely excluded from query results. Non-existent and unauthorized single-document requests return deliberate 404 without metadata leakage. A search route is documented as planned but is not registered in the current build.
-- **Test Evidence**: `test_owner_lifecycle_operations`, `test_cross_user_document_isolation`, `test_admin_cannot_list_unshared_document_metadata`, `test_admin_list_includes_owned_and_explicitly_granted_documents`, `test_document_list_excludes_revoked_grant`.
-- **Residual Risk**: Low.
+- **Mitigation**: Search and filtering are implemented on the existing document-list endpoint rather than a separate bypass-prone route. The SQL query first applies the mandatory authorization criteria (User is owner OR User has an active, unrevoked grant), then ANDs the optional filters. Filters can only narrow visible results; they cannot widen access. Owner filters are evaluated inside this scope, so filtering by another user's ID does not reveal their documents. This applies equally to administrators; admin role alone does not widen metadata visibility. Search matches title/filename with bound parameters and escaped LIKE wildcards, and list responses expose only the caller's server-derived effective permission. Unauthorized single-document requests return deliberate 404 without metadata leakage.
+- **Test Evidence**: `test_search_matches_title_and_filename_case_insensitively`, `test_owner_filter_never_expands_visibility`, `test_category_filter_and_empty_results`, `test_created_date_range_and_invalid_ranges`, `test_multiple_filters_combine`, `test_effective_permissions_for_owner_editor_and_reader`, `test_search_excludes_revoked_grants_and_deleted_documents`, `test_admin_search_scope_includes_only_owned_and_granted`, `test_owner_lifecycle_operations`, `test_cross_user_document_isolation`, `test_admin_cannot_list_unshared_document_metadata`, `test_document_list_excludes_revoked_grant`.
+- **Residual Risk**: Low. Substring search uses a leading-wildcard `LIKE`, which may require a full scan as document volume grows; authorization filtering remains mandatory regardless of performance optimizations.
 - **Status**: **Mitigated**
 
 ### TV-12: Audit Log Tampering or Omission
@@ -136,7 +136,7 @@ Status Classifications:
 - **Attack Scenario**: Rogue administrator uses admin role to browse and download confidential proprietary documents belonging to other users.
 - **Impact**: Insider threat data breach.
 - **Mitigation**: Administrators are NOT automatically granted metadata, content read, or download permissions. Listing, metadata retrieval, downloads, edits, deletion, and grant management all follow the same owner-or-active-grant policy for administrators as for every other user. Administrative capabilities are restricted to user account management and platform health; document actions are available only under the same ownership/grant rules as other users. Audit records remain in the tamper-evident store and verifiable through `AuditService`, while read-only admin audit HTTP endpoints are planned but not implemented. Every administrative action is recorded in the tamper-evident audit log with the admin's actor ID.
-- **Test Evidence**: `test_admin_cannot_access_document_contents`, `test_admin_cannot_list_unshared_document_metadata`, `test_admin_list_includes_owned_and_explicitly_granted_documents`, `test_audit_chain_integrity`.
+- **Test Evidence**: `test_admin_cannot_access_document_contents`, `test_admin_cannot_list_unshared_document_metadata`, `test_admin_list_includes_owned_and_explicitly_granted_documents`, `test_admin_search_scope_includes_only_owned_and_granted`, `test_audit_chain_integrity`.
 - **Residual Risk**: Database superusers with direct OS/DB shell access can inspect physical storage; addressed by host encryption and access controls.
 - **Status**: **Mitigated**
 

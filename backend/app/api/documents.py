@@ -12,6 +12,7 @@ Security controls implemented:
 """
 
 import logging
+from datetime import UTC, datetime
 
 from fastapi import (
     APIRouter,
@@ -33,9 +34,10 @@ from backend.app.database import get_db
 from backend.app.models.audit import AuditOutcome
 from backend.app.models.base import utc_now
 from backend.app.models.document import Document
-from backend.app.models.grant import DocumentGrant
+from backend.app.models.grant import DocumentGrant, PermissionLevel
 from backend.app.models.user import User, UserRole
 from backend.app.schemas.document import (
+    DocumentListItem,
     DocumentListResponse,
     DocumentResponse,
     DocumentUpdateRequest,
@@ -72,6 +74,37 @@ def _get_active_grant(db: Session, document_id: str, user_id: str) -> DocumentGr
         )
         .first()
     )
+
+
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE metacharacters so user input is matched literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _to_utc(value: datetime) -> datetime:
+    """Normalize query datetimes so naive and timezone-aware values compare safely."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _get_effective_permissions(
+    db: Session, user_id: str, document_ids: list[str]
+) -> dict[str, str]:
+    """Return active grant permissions for the caller across the given documents."""
+    if not document_ids:
+        return {}
+
+    rows = (
+        db.query(DocumentGrant.document_id, DocumentGrant.permission)
+        .filter(
+            DocumentGrant.user_id == user_id,
+            DocumentGrant.document_id.in_(document_ids),
+            DocumentGrant.is_revoked.is_(False),
+        )
+        .all()
+    )
+    return {document_id: permission for document_id, permission in rows}
 
 
 def _upsert_grant(
@@ -239,30 +272,69 @@ def upload_document(
 @router.get(
     "",
     response_model=DocumentListResponse,
-    summary="List authorized documents",
+    summary="List, search, and filter authorized documents",
     description=(
         "Returns a paginated list of documents the authenticated user owns or has an active, "
-        "non-revoked grant for. Administrators are not exempt from this ownership/grant scope."
+        "non-revoked grant for. Filters never expand this visibility scope, and administrators "
+        "are not exempt. Each entry includes the caller's server-derived effective permission."
     ),
 )
 def list_documents(
     request: Request,
     page: int = 1,
     page_size: int = 25,
+    q: str | None = None,
     category: str | None = None,
+    owner_id: str | None = None,
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> DocumentListResponse:
     if page < 1 or page_size < 1 or page_size > 100:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail="page must be >= 1; page_size must be 1–100",
+        )
+
+    if q is not None:
+        q = q.strip()
+        if not q or len(q) > 255:
+            raise HTTPException(
+                status_code=422,
+                detail="q must contain between 1 and 255 characters",
+            )
+
+    if category is not None:
+        category = category.strip()
+        if not category or len(category) > 100:
+            raise HTTPException(
+                status_code=422,
+                detail="category must contain between 1 and 100 characters",
+            )
+
+    if owner_id is not None:
+        owner_id = owner_id.strip()
+        if not owner_id or len(owner_id) > 64:
+            raise HTTPException(
+                status_code=422,
+                detail="owner_id must contain between 1 and 64 characters",
+            )
+
+    if created_from is not None:
+        created_from = _to_utc(created_from)
+    if created_to is not None:
+        created_to = _to_utc(created_to)
+    if created_from is not None and created_to is not None and created_from > created_to:
+        raise HTTPException(
+            status_code=422,
+            detail="created_from must be earlier than or equal to created_to",
         )
 
     query = db.query(Document).filter(Document.is_deleted.is_(False))
 
     # Least privilege: every caller, including administrators, sees only
-    # documents they own or hold an active grant for.
+    # documents they own or hold an active grant for. Apply this before filters.
     granted_doc_ids = db.query(DocumentGrant.document_id).filter(
         DocumentGrant.user_id == current_user.id,
         DocumentGrant.is_revoked.is_(False),
@@ -274,8 +346,22 @@ def list_documents(
         )
     )
 
+    if q:
+        pattern = f"%{_escape_like(q)}%"
+        query = query.filter(
+            or_(
+                Document.title.ilike(pattern, escape="\\"),
+                Document.original_filename.ilike(pattern, escape="\\"),
+            )
+        )
     if category:
         query = query.filter(Document.category == category)
+    if owner_id:
+        query = query.filter(Document.owner_id == owner_id)
+    if created_from is not None:
+        query = query.filter(Document.created_at >= created_from)
+    if created_to is not None:
+        query = query.filter(Document.created_at <= created_to)
 
     total = query.count()
     documents = (
@@ -285,8 +371,30 @@ def list_documents(
         .all()
     )
 
+    grant_permissions = _get_effective_permissions(
+        db=db,
+        user_id=current_user.id,
+        document_ids=[document.id for document in documents],
+    )
+
+    items = []
+    for document in documents:
+        if document.owner_id == current_user.id:
+            effective_permission = "owner"
+        else:
+            effective_permission = grant_permissions.get(document.id)
+            if effective_permission not in {PermissionLevel.READ, PermissionLevel.EDIT}:
+                continue
+
+        items.append(
+            DocumentListItem(
+                **DocumentResponse.model_validate(document).model_dump(),
+                effective_permission=effective_permission,
+            )
+        )
+
     return DocumentListResponse(
-        documents=[DocumentResponse.model_validate(d) for d in documents],
+        documents=items,
         total=total,
         page=page,
         page_size=page_size,

@@ -11,6 +11,7 @@ from backend.app.schemas.auth import (
     UserUpdateRequest,
 )
 from backend.app.schemas.document import (
+    DocumentListItem,
     DocumentListResponse,
     DocumentResponse,
     DocumentUpdateRequest,
@@ -24,6 +25,7 @@ from backend.app.schemas.health import HealthResponse
 
 __all__ = [
     "AdminUserUpdateRequest",
+    "DocumentListItem",
     "DocumentListResponse",
     "DocumentResponse",
     "DocumentUpdateRequest",
