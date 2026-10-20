@@ -6,15 +6,13 @@ services:
     container_name: trustvault_db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-trustvault_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trustvault_password}
-      POSTGRES_DB: ${POSTGRES_DB:-trustvault_db}
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER must be set}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+      POSTGRES_DB: "${POSTGRES_DB:?POSTGRES_DB must be set}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trustvault_user} -d ${POSTGRES_DB:-trustvault_db}"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -30,11 +28,33 @@ services:
         condition: service_healthy
     environment:
       ENVIRONMENT: production
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-trustvault_user}:${POSTGRES_PASSWORD:-trustvault_password}@db:5432/${POSTGRES_DB:-trustvault_db}
-      SECRET_KEY: ${SECRET_KEY:-insecure_dev_secret_please_change_in_production_32bytes}
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set}"
+      SECRET_KEY: "${SECRET_KEY:?SECRET_KEY must be set}"
       STORAGE_DIR: /app/private_storage
-      SESSION_COOKIE_SECURE: "false" # Set true behind HTTPS reverse proxy
+      MAX_FILE_SIZE_BYTES: "${MAX_FILE_SIZE_BYTES:-10485760}"
+      MAX_MULTIPART_OVERHEAD_BYTES: "${MAX_MULTIPART_OVERHEAD_BYTES:-1048576}"
+      MAX_JSON_BODY_BYTES: "${MAX_JSON_BODY_BYTES:-65536}"
+      STORAGE_ORPHAN_GRACE_SECONDS: "${STORAGE_ORPHAN_GRACE_SECONDS:-3600}"
+      MAX_USER_STORAGE_BYTES: "${MAX_USER_STORAGE_BYTES:-104857600}"
+      MAX_GLOBAL_STORAGE_BYTES: "${MAX_GLOBAL_STORAGE_BYTES:-1073741824}"
+      MAX_UPLOADS_PER_USER: "${MAX_UPLOADS_PER_USER:-1000}"
+      AUDIT_RETENTION_DAYS: "${AUDIT_RETENTION_DAYS:-2555}"
+      AUDIT_RETENTION_AUTO_DELETE: "false"
+      SESSION_COOKIE_SECURE: "true"
       CORS_ORIGINS: http://localhost:5173,http://localhost:3000
+      # Production startup requires external checkpoint anchoring. Configure a
+      # real independently controlled S3-compatible bucket before starting.
+      AUDIT_ANCHOR_MODE: s3
+      AUDIT_ANCHOR_HMAC_KEY: "${AUDIT_ANCHOR_HMAC_KEY:?AUDIT_ANCHOR_HMAC_KEY must be set}"
+      AUDIT_ANCHOR_S3_BUCKET: "${AUDIT_ANCHOR_S3_BUCKET:?AUDIT_ANCHOR_S3_BUCKET must be set}"
+      AUDIT_ANCHOR_S3_REGION: "${AUDIT_ANCHOR_S3_REGION:?AUDIT_ANCHOR_S3_REGION must be set}"
+      AUDIT_ANCHOR_S3_PREFIX: "${AUDIT_ANCHOR_S3_PREFIX:-trustvault-audit-checkpoints}"
+      AUDIT_CHECKPOINT_INTERVAL_SECONDS: "${AUDIT_CHECKPOINT_INTERVAL_SECONDS:-3600}"
+      AUDIT_CHECKPOINT_MAX_AGE_SECONDS: "${AUDIT_CHECKPOINT_MAX_AGE_SECONDS:-7200}"
+      # This Compose service publishes the backend directly. Leave this empty
+      # unless a trusted reverse proxy is placed in front of it.
+      TRUSTED_PROXY_IPS: "${TRUSTED_PROXY_IPS:-}"
+      LOGIN_RATE_LIMIT_MAX_BUCKETS: "${LOGIN_RATE_LIMIT_MAX_BUCKETS:-50000}"
     volumes:
       - private_storage_data:/app/private_storage
     ports:

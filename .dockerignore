@@ -1,0 +1,56 @@
+# Version control and local tooling
+.git
+.gitignore
+.github
+.vscode
+.idea
+opencode.json
+
+# Environment files and secrets
+**/.env
+**/.env.*
+!**/.env.example
+**/.aws
+*.pem
+*.key
+*.crt
+*.log
+
+# Local databases and private data
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+private_storage/
+storage/
+uploads/
+audit_checkpoints/
+
+# Python caches and test artifacts
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+backend/tests/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Node and frontend build artifacts
+node_modules/
+dist/
+build/
+
+# Documentation and repository-only files
+docs/
+README.md
+THREATS.md
+PROMPTS.md

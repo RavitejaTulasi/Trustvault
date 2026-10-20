@@ -15,10 +15,50 @@ services:
         generateValue: true
       - key: STORAGE_DIR
         value: /var/data/private_storage
+      - key: MAX_FILE_SIZE_BYTES
+        value: "10485760"
+      - key: MAX_MULTIPART_OVERHEAD_BYTES
+        value: "1048576"
+      - key: MAX_JSON_BODY_BYTES
+        value: "65536"
+      - key: STORAGE_ORPHAN_GRACE_SECONDS
+        value: "3600"
+      - key: MAX_USER_STORAGE_BYTES
+        value: "104857600"
+      - key: MAX_GLOBAL_STORAGE_BYTES
+        value: "1073741824"
+      - key: MAX_UPLOADS_PER_USER
+        value: "1000"
+      - key: AUDIT_RETENTION_DAYS
+        value: "2555"
+      - key: AUDIT_RETENTION_AUTO_DELETE
+        value: "false"
       - key: SESSION_COOKIE_SECURE
         value: "true"
       - key: CORS_ORIGINS
         value: https://trustvault.onrender.com
+      # Production startup requires external checkpoint anchoring. Supply these
+      # values from the Render dashboard before deploying. No bucket, endpoint,
+      # credentials, or HMAC key is stored in this repository.
+      - key: AUDIT_ANCHOR_MODE
+        value: s3
+      - key: AUDIT_ANCHOR_S3_BUCKET
+        sync: false
+      - key: AUDIT_ANCHOR_S3_REGION
+        sync: false
+      - key: AUDIT_ANCHOR_HMAC_KEY
+        sync: false
+      - key: AUDIT_CHECKPOINT_INTERVAL_SECONDS
+        value: "3600"
+      - key: AUDIT_CHECKPOINT_MAX_AGE_SECONDS
+        value: "7200"
+      # Render terminates public traffic at its load balancer. Supply the exact
+      # proxy CIDR(s) for this service via the dashboard; do not use a wildcard
+      # or trust forwarded headers from arbitrary peers. Until configured, the
+      # app safely ignores X-Forwarded-For and uses the immediate peer address,
+      # which may be a shared proxy and therefore a shared login limit.
+      - key: TRUSTED_PROXY_IPS
+        sync: false
     disk:
       name: private-storage
       mountPath: /var/data/private_storage
