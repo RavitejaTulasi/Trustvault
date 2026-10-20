@@ -41,6 +41,7 @@ from backend.app.security.rate_limiter import (
     audit_verification_rate_limiter,
 )
 from backend.app.services.audit_service import AuditService
+from backend.app.services.checkpoint_runtime import acquire_checkpoint_writer_lock
 from backend.app.services.checkpoint_service import (
     CheckpointCreationError,
     CheckpointService,
@@ -384,6 +385,7 @@ def create_audit_checkpoint(
 ) -> CheckpointCreateResponse:
     _disable_caching(response)
     _enforce_checkpoint_rate_limit(current_user.id)
+    acquire_checkpoint_writer_lock(db)
 
     try:
         result = CheckpointService.create_checkpoint(

@@ -6,7 +6,7 @@ Supports immediate revocation and transaction-safe modifications.
 
 from typing import TYPE_CHECKING, ClassVar, Optional
 
-from sqlalchemy import Boolean, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.database import Base
@@ -39,6 +39,12 @@ class DocumentGrant(Base, TimestampMixin):
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     is_revoked: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
+    revocation_version: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
 
     # Relationships
     document: Mapped["Document"] = relationship("Document", back_populates="grants")

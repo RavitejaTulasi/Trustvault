@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_SCHEDULER_LOCK_KEY = 0x54565253
 
 
+def acquire_checkpoint_writer_lock(db: Session) -> None:
+    """Serialize checkpoint writers across PostgreSQL workers."""
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(select(func.pg_advisory_xact_lock(CHECKPOINT_SCHEDULER_LOCK_KEY)))
+
+
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -210,8 +216,7 @@ class CheckpointScheduler:
 
     def _acquire_writer_lock(self, db: Session) -> None:
         """Serialize scheduled writers across PostgreSQL workers."""
-        if db.get_bind().dialect.name == "postgresql":
-            db.execute(select(func.pg_advisory_xact_lock(CHECKPOINT_SCHEDULER_LOCK_KEY)))
+        acquire_checkpoint_writer_lock(db)
 
     def run_once(self, db: Session | None = None) -> CheckpointCreationResult | None:
         """Run one scheduled checkpoint attempt and update health state."""

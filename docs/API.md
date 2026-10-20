@@ -219,14 +219,18 @@ This document details the complete API contract for TrustVault, including authen
   }
   ```
 - **Validation**: `permission` must be `read` or `edit`; recipient must exist and be active; granting to the owner is rejected with `400 Bad Request`.
-- **Upsert Semantics**: Re-granting to a previously revoked user reactivates the existing grant row, updates `granted_by_id`/`permission`, and clears `is_revoked`. The write uses the database `(document_id, user_id)` unique constraint with `ON CONFLICT DO UPDATE` on SQLite and PostgreSQL, so duplicate/concurrent requests leave exactly one grant row and apply the latest requested permission.
+- **Upsert Semantics**: Re-granting to a previously revoked user reactivates the existing grant row, updates `granted_by_id`/`permission`, and clears `is_revoked`. The write uses the database `(document_id, user_id)` unique constraint with a conditional `ON CONFLICT DO UPDATE` on SQLite and PostgreSQL, so duplicate/concurrent requests leave exactly one grant row. Without an intervening revocation, the latest requested permission wins. Each grant row has an internal monotonic `revocation_version` that only revocation increments; the write is applied only if it still matches the generation captured before authorization, so a revocation that wins the race cannot be silently undone by a request that started earlier. The generation is not exposed in API responses.
+- **Concurrency Errors**:
+  - `409 Conflict` with detail `Permission grant was revoked concurrently` when the generation changed while the request was in flight.
+  - `409 Conflict` with detail `Permission grant changed concurrently; retry` when the target row disappeared while the request was in flight.
+  Both append a `permission.grant` event with outcome `FAILURE`, `resource_type` `document` or `document_grant`, and an allowlisted `details.reason` of `revoked_concurrently` or `concurrent_update`.
 - **Response `201 Created`**: Grant representation (same shape as list items).
-- **Audit Event**: `permission.grant` (Outcome: SUCCESS or DENIED)
+- **Audit Event**: `permission.grant` (Outcome: SUCCESS, DENIED, or FAILURE for the concurrency errors above)
 
 ### `DELETE /api/v1/documents/{id}/permissions/{user_id}`
 - **Authentication**: Required
 - **Authorization Rule**: Document Owner ONLY. Non-owners receive `404 Not Found`.
-- **Action**: Immediately sets `is_revoked = True` in the current database transaction. There are no cached tokens or pre-signed URLs, so the very next request from the recipient is denied.
+- **Action**: Immediately sets `is_revoked = True` and increments the grant's internal `revocation_version` in the current database transaction. There are no cached tokens or pre-signed URLs, so the very next request from the recipient is denied, and an in-flight grant request whose captured generation no longer matches is refused with `409 Conflict`.
 - **Response `200 OK`**: `{"detail": "Permission successfully revoked"}`
 - **Error**: `404 Not Found` when no active grant exists for that recipient.
 - **Audit Event**: `permission.revoke` (Outcome: SUCCESS or DENIED)
@@ -353,7 +357,7 @@ When anchoring is enabled, an in-process scheduler attempts a checkpoint every `
 ### `POST /api/v1/admin/audit/checkpoints`
 - **Authentication**: Required
 - **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
-- **Action**: Runs the same bounded chain verification as `GET /api/v1/admin/audit/verify` and, only if the committed chain is valid, stores a checkpoint through the configured checkpoint anchor adapter. A checkpoint binds the audit stream ID (`trustvault.audit`), the highest verified `sequence_number`, that record's hash, the checkpoint format version, a creation timestamp, and the preceding checkpoint's HMAC tag, protected by an HMAC-SHA256 integrity tag. The `audit.checkpoint_created` event is appended after the checkpoint is stored, so the checkpoint always covers a prefix that does not include its own creation event.
+- **Action**: Runs the same bounded chain verification as `GET /api/v1/admin/audit/verify` and, only if the committed chain is valid, stores a checkpoint through the configured checkpoint anchor adapter. On PostgreSQL, the request acquires the same transaction-scoped advisory lock used by scheduled checkpoint creation, so manual and scheduled writers cannot overlap across workers; the store's conditional writes remain the final guard. A checkpoint binds the audit stream ID (`trustvault.audit`), the highest verified `sequence_number`, that record's hash, the checkpoint format version, a creation timestamp, and the preceding checkpoint's HMAC tag, protected by an HMAC-SHA256 integrity tag. The `audit.checkpoint_created` event is appended after the checkpoint is stored, so the checkpoint always covers a prefix that does not include its own creation event.
 - **Request Body**: None.
 - **Idempotency and Monotonicity**: Repeating the call for the current chain head is idempotent and returns the existing checkpoint. The anchor store rejects backwards writes (rollback) and conflicting checkpoints at the same sequence; extending the chain and calling again advances the checkpoint.
 - **Response `201 Created`** (new checkpoint) or **`200 OK`** (checkpoint for this head already present):

@@ -12,6 +12,7 @@ Security controls implemented:
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from fastapi import (
@@ -79,6 +80,17 @@ def _get_active_grant(db: Session, document_id: str, user_id: str) -> DocumentGr
     )
 
 
+def _get_grant(db: Session, document_id: str, user_id: str) -> DocumentGrant | None:
+    return (
+        db.query(DocumentGrant)
+        .filter(
+            DocumentGrant.document_id == document_id,
+            DocumentGrant.user_id == user_id,
+        )
+        .first()
+    )
+
+
 def _escape_like(value: str) -> str:
     """Escape SQL LIKE metacharacters so user input is matched literally."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -110,80 +122,125 @@ def _get_effective_permissions(
     return {document_id: permission for document_id, permission in rows}
 
 
+class GrantConcurrentUpdateError(Exception):
+    """Raised when a grant race cannot be resolved safely."""
+
+
+@dataclass(frozen=True)
+class GrantUpsertOutcome:
+    """Result of a grant upsert, including whether the write was applied."""
+
+    grant: DocumentGrant
+    applied: bool
+
+
 def _upsert_grant(
     db: Session,
     document_id: str,
     user_id: str,
     permission: str,
     granted_by_id: str,
-) -> DocumentGrant:
+    *,
+    expected_revocation_version: int | None,
+) -> GrantUpsertOutcome:
     """
-    Atomically create or update a grant.
+    Atomically create or update a grant with revoke-wins semantics.
+
+    ``revocation_version`` is a monotonic generation incremented only by
+    revocation. The caller captures it before starting the grant workflow and
+    passes ``None`` when no grant row existed. The write is refused if the
+    generation changed in the meantime, even when a later re-grant has already
+    made the row active again.
 
     SQLite and PostgreSQL both support ON CONFLICT DO UPDATE, which keeps the
     transaction valid when concurrent duplicate requests target the same
     (document_id, user_id) unique constraint. Other dialects fall back to a
-    query-then-write flow and retain the database uniqueness constraint.
+    conditional query-then-write flow and retain the database uniqueness
+    constraint.
     """
-    values = {
-        "document_id": document_id,
-        "user_id": user_id,
-        "permission": permission,
-        "granted_by_id": granted_by_id,
-        "is_revoked": False,
-    }
-
+    expected_generation = (
+        expected_revocation_version if expected_revocation_version is not None else 0
+    )
     dialect = db.get_bind().dialect.name
-    insert_statement = None
+    insert_factory = None
     if dialect == "postgresql":
-        insert_statement = postgresql_insert(DocumentGrant).values(**values)
+        insert_factory = postgresql_insert
     elif dialect == "sqlite":
-        insert_statement = sqlite_insert(DocumentGrant).values(**values)
+        insert_factory = sqlite_insert
 
-    if insert_statement is not None:
-        db.execute(
-            insert_statement.on_conflict_do_update(
-                index_elements=[DocumentGrant.document_id, DocumentGrant.user_id],
-                set_={
+    current = _get_grant(db, document_id, user_id)
+    if current is None and expected_generation != 0:
+        raise GrantConcurrentUpdateError
+
+    now = utc_now()
+    if insert_factory is not None:
+        values = {
+            "document_id": document_id,
+            "user_id": user_id,
+            "permission": permission,
+            "granted_by_id": granted_by_id,
+            "is_revoked": False,
+            "revocation_version": 0,
+            "updated_at": now,
+        }
+        applied = (
+            db.execute(
+                insert_factory(DocumentGrant)
+                .values(**values)
+                .on_conflict_do_update(
+                    index_elements=[
+                        DocumentGrant.document_id,
+                        DocumentGrant.user_id,
+                    ],
+                    set_={
+                        "permission": permission,
+                        "granted_by_id": granted_by_id,
+                        "is_revoked": False,
+                        "updated_at": now,
+                    },
+                    where=DocumentGrant.revocation_version == expected_generation,
+                )
+                .returning(DocumentGrant.id)
+            ).first()
+            is not None
+        )
+    elif current is None:
+        grant = DocumentGrant(
+            document_id=document_id,
+            user_id=user_id,
+            permission=permission,
+            granted_by_id=granted_by_id,
+            is_revoked=False,
+            revocation_version=0,
+            updated_at=now,
+        )
+        db.add(grant)
+        db.flush()
+        return GrantUpsertOutcome(grant, True)
+    else:
+        applied = (
+            db.query(DocumentGrant)
+            .filter(
+                DocumentGrant.id == current.id,
+                DocumentGrant.revocation_version == expected_generation,
+            )
+            .update(
+                {
                     "permission": permission,
                     "granted_by_id": granted_by_id,
                     "is_revoked": False,
-                    "updated_at": utc_now(),
+                    "updated_at": now,
                 },
+                synchronize_session=False,
             )
+            == 1
         )
-    else:
-        grant = (
-            db.query(DocumentGrant)
-            .filter(
-                DocumentGrant.document_id == document_id,
-                DocumentGrant.user_id == user_id,
-            )
-            .first()
-        )
-        if grant is None:
-            grant = DocumentGrant(
-                document_id=document_id,
-                user_id=user_id,
-                permission=permission,
-                granted_by_id=granted_by_id,
-                is_revoked=False,
-            )
-            db.add(grant)
-        else:
-            grant.permission = permission
-            grant.granted_by_id = granted_by_id
-            grant.is_revoked = False
-        db.flush()
 
-    return (
-        db.query(DocumentGrant)
-        .filter(
-            DocumentGrant.document_id == document_id,
-            DocumentGrant.user_id == user_id,
-        )
-        .one()
-    )
+    db.expire_all()
+    grant = _get_grant(db, document_id, user_id)
+    if grant is None:
+        raise GrantConcurrentUpdateError
+    return GrantUpsertOutcome(grant, applied)
 
 
 @router.post(
@@ -882,6 +939,13 @@ def create_document_permission(
     if document is None or document.is_deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
+    existing_recipient_grant = _get_grant(db, document.id, body.user_id)
+    expected_revocation_version = (
+        existing_recipient_grant.revocation_version
+        if existing_recipient_grant is not None
+        else None
+    )
+
     active_grant = _get_active_grant(db, document.id, current_user.id)
     authorized = AuthorizationService.authorize_document_access(
         user=current_user,
@@ -921,13 +985,63 @@ def create_document_permission(
             detail="Recipient user not found or inactive",
         )
 
-    grant = _upsert_grant(
-        db=db,
-        document_id=document.id,
-        user_id=recipient.id,
-        permission=body.permission,
-        granted_by_id=current_user.id,
-    )
+    try:
+        outcome = _upsert_grant(
+            db=db,
+            document_id=document.id,
+            user_id=recipient.id,
+            permission=body.permission,
+            granted_by_id=current_user.id,
+            expected_revocation_version=expected_revocation_version,
+        )
+    except GrantConcurrentUpdateError:
+        AuditService.log_event(
+            db,
+            action="permission.grant",
+            outcome=AuditOutcome.FAILURE,
+            actor_id=current_user.id,
+            resource_type="document",
+            resource_id=document.id,
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={
+                "document_id": document.id,
+                "recipient_id": recipient.id,
+                "permission": body.permission,
+                "reason": "concurrent_update",
+            },
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Permission grant changed concurrently; retry",
+        ) from None
+
+    grant = outcome.grant
+    if not outcome.applied:
+        AuditService.log_event(
+            db,
+            action="permission.grant",
+            outcome=AuditOutcome.FAILURE,
+            actor_id=current_user.id,
+            resource_type="document_grant",
+            resource_id=grant.id,
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={
+                "document_id": document.id,
+                "recipient_id": recipient.id,
+                "permission": body.permission,
+                "reason": "revoked_concurrently",
+            },
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Permission grant was revoked concurrently",
+        ) from None
 
     AuditService.log_event(
         db,
@@ -1004,6 +1118,7 @@ def revoke_document_permission(
         )
 
     grant.is_revoked = True
+    grant.revocation_version = DocumentGrant.revocation_version + 1
     db.flush()
 
     AuditService.log_event(

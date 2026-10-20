@@ -160,17 +160,17 @@ Run the full integration test suite with Pytest:
 pytest backend/tests/ -v
 ```
 
-All default tests are offline. Most use isolated in-memory SQLite; append-serialization tests use temporary file-backed SQLite so independent sessions contend for a real write lock. That is a portability check, not PostgreSQL verification.
+All default tests are offline. Most use isolated in-memory SQLite; append-serialization tests use temporary file-backed SQLite so independent sessions contend for a real write lock. Those SQLite checks are portability checks, not PostgreSQL verification.
 
-PostgreSQL append-concurrency verification is opt-in and creates an isolated temporary schema with eight concurrent writers:
+PostgreSQL multi-worker verification is opt-in. Each module creates an isolated temporary schema and covers audit-chain append serialization, grant revocation races, shared login rate-limit admission, storage-quota admission, and checkpoint writer serialization:
 
 ```powershell
 $env:TRUSTVAULT_POSTGRES_INTEGRATION = "1"
 $env:TRUSTVAULT_TEST_POSTGRES_URL = "postgresql+psycopg://user:password@host:5432/database"
-python -m pytest backend/tests/test_audit_concurrency_postgres.py -v
+python -m pytest backend/tests/test_audit_concurrency_postgres.py backend/tests/test_postgres_audit_transactions.py backend/tests/test_postgres_grant_concurrency.py backend/tests/test_postgres_login_rate_limit.py backend/tests/test_postgres_storage_quota.py backend/tests/test_postgres_checkpoint_concurrency.py -v
 ```
 
-The PostgreSQL test is skipped by default and has not been run against a live database in this build. It verifies unique, contiguous sequence allocation and a consistent chain head; it does not exercise provider-side checkpoint anchoring.
+The suite is skipped by default. In this build it was executed against a local PostgreSQL 16 instance: 287 tests passed with the PostgreSQL modules enabled and 8 opt-in AWS tests skipped. That run verifies database-level serialization, the revoke-wins grant path, and the Alembic upgrade/downgrade path for the new grant column. It is not a production-scale load test, and it does not exercise provider-side checkpoint anchoring.
 
 Real AWS S3 checkpoint integration tests are separately opt-in, skipped unless explicitly enabled, and require an independently approved test bucket; see [`docs/AWS_INTEGRATION_TESTING.md`](docs/AWS_INTEGRATION_TESTING.md). They have not been run against live AWS in this build.
 
@@ -239,18 +239,22 @@ No seed script ships in this repository, so these accounts are not created autom
 4. **Audit Append Retries and Deadlocks**:
    - Concurrent audit appends serialize on the singleton `audit_chain_state` row; the sequence allocation, event insert, and chain-head update commit or roll back together.
    - A PostgreSQL deadlock or serialization failure aborts the whole transaction, including the associated business mutation. The application does not automatically retry inside an aborted transaction; callers must retry the complete request.
-   - The SQLite append test does not establish PostgreSQL behavior. The opt-in PostgreSQL concurrency test and migration path remain unverified in this build.
+   - The opt-in PostgreSQL suite exercises eight concurrent first appends, rollback/commit sequence reuse, a concurrent append during bounded verification, and checkpoint writer serialization against PostgreSQL 16. It does not establish behavior under production-scale load or automate deadlock retries.
 5. **Storage Crash Recovery**:
    - Uploads and deletes favor a recoverable ordering: files are atomically published before commit, and soft-deletes commit before unlink. A crash can leave an unreferenced file or a file for a soft-deleted document.
    - Startup reconciliation removes deleted-document files immediately and removes other unreferenced files only after `STORAGE_ORPHAN_GRACE_SECONDS`. Missing active files are reported, not recreated. The filesystem and database are not a single atomic transaction.
 6. **Storage Quotas**:
    - Admission serializes on the `storage_quota_state` row and checks active documents for the user and platform. Count and byte limits are per database, not per worker.
-   - The SQLite test suite verifies admission logic and cleanup, not multi-worker PostgreSQL lock contention.
-7. **Request-Size Enforcement**:
+   - Both SQLite unit tests and the opt-in PostgreSQL concurrency suite verify admission serialization; the latter also covers cross-owner global byte limits.
+7. **Grant Revocation Races**:
+   - Grant writes capture the grant's monotonic `revocation_version` and apply only if it is unchanged. A revocation that wins the race makes the stale grant request return `409 Conflict` instead of silently reactivating access, even if a later re-grant has changed the row again.
+   - Concurrent grant requests without an intervening revocation remain last-writer-wins. The behavior is verified against PostgreSQL 16; retries are caller-visible and are not automatic.
+8. **Request-Size Enforcement**:
    - The application rejects declared over-limit bodies and counts streamed bytes for bodies without a trusted length. Production reverse proxies should also enforce equivalent limits before forwarding; no proxy is included in this repository, so that layer remains deployment configuration.
-8. **Audit Retention**:
+9. **Audit Retention**:
    - The online hash chain is retained indefinitely so checkpoints and verification remain possible. `AUDIT_RETENTION_DAYS` describes the retention objective for independently managed archive copies only.
    - Automatic online audit deletion is deliberately rejected. No archive/export job ships in this repository.
-9. **Schema Downgrades**:
+10. **Schema Downgrades**:
    - Forward migrations are supported. Downgrading below `c3d4e5f6a7b8` is refused once any version 2 audit record exists, because the legacy schema cannot represent the per-record hash version; a downgrade/re-upgrade cycle would relabel V2 evidence as V1 and verification would report tampering.
    - Back up the database before any migration. Recover from a failed release by restoring a snapshot taken before V2 records were written, or by remaining on the current schema; never delete or rewrite audit rows to force a downgrade. V1-only chains downgrade and re-upgrade normally.
+   - Revision `e5f6a7b8c9d0` adds the internal grant `revocation_version`; its upgrade/downgrade/re-upgrade path was exercised on PostgreSQL 16. The V2 audit downgrade refusal remains intentionally unexercised against a populated production database.
