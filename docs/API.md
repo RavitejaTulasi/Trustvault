@@ -14,17 +14,25 @@ This document details the complete API contract for TrustVault, including authen
 - `401 Unauthorized`: Authentication required or invalid/expired session cookie.
 - `403 Forbidden`: Authenticated identity lacks the required platform role (for example, an admin-only endpoint).
 - `404 Not Found`: Deliberate 404 returned for inaccessible or non-existent documents to prevent existence discovery, or a non-existent endpoint/resource.
-- `409 Conflict`: The audit chain could not be anchored because it is invalid or incompletely verified, or the stored checkpoint rejected a rollback or conflicting write.
-- `413 Payload Too Large`: Upload exceeds maximum allowed file size (10MB).
+- `409 Conflict`: The audit chain could not be anchored because it is invalid or incompletely verified, or the stored checkpoint rejected a rollback or conflicting write; also returned when an upload would exceed the per-user active-document count.
+- `413 Payload Too Large`: Request body or upload exceeds its configured limit, or an upload would exceed per-user or platform storage bytes.
 - `422 Unprocessable Entity`: Malformed query parameter, invalid filter value, or invalid date range.
 - `429 Too Many Requests`: Rate limit exceeded (e.g. login brute-force throttle).
-- `503 Service Unavailable`: Database or storage health failure, or the configured checkpoint provider is unreachable or denies access.
+- `431 Request Header Fields Too Large`: A persisted user-agent value exceeds its bound or contains control characters.
+- `503 Service Unavailable`: Database or storage health failure, shared login rate-limit storage failure, or the configured checkpoint provider is unreachable or denies access.
 
 ### Security Headers on Every Response
 - `X-Content-Type-Options: nosniff`
 - `X-Frame-Options: DENY`
 - `Referrer-Policy: strict-origin-when-cross-origin`
 - `X-Request-ID: <uuid>`
+
+### Request Body and Metadata Boundaries
+- Non-multipart request bodies are limited to `MAX_JSON_BODY_BYTES` (default 64 KiB). Multipart bodies are limited to `MAX_FILE_SIZE_BYTES + MAX_MULTIPART_OVERHEAD_BYTES` (default 11 MiB), and the file itself is limited to `MAX_FILE_SIZE_BYTES`.
+- Declared over-limit bodies are rejected with `413` before parsing. Streamed/chunked bodies are counted and aborted when they exceed the limit. Rejections include `Connection: close`.
+- `X-Request-ID` must be 1-64 characters from `[A-Za-z0-9._:-]` (starting alphanumeric); invalid values return `400`. A generated request ID is used when the header is absent.
+- User-Agent is limited to 500 characters and must not contain control characters; violations return `431`.
+- Persisted IP addresses are canonicalized. Filenames are limited to 255 characters and must not contain controls, path separators, `.`, `..`, or surrounding whitespace. MIME types are limited to 100 characters and validated as `type/subtype`.
 
 ---
 
@@ -88,9 +96,10 @@ This document details the complete API contract for TrustVault, including authen
 - **Role Requirement**: Document Owner or Admin (Viewers receive `403 Forbidden`)
 - **Content-Type**: `multipart/form-data`
 - **Parameters**:
-  - `file`: UploadFile (binary, max 10MB, validated extension & magic bytes)
+  - `file`: UploadFile (binary, max `MAX_FILE_SIZE_BYTES`, validated extension & magic bytes)
   - `title`: string (1-255 chars)
-  - `category`: string (optional, default: "General")
+  - `category`: string (optional, 1-100 chars, default: "General")
+- **Storage Controls**: The file is streamed into a private staging directory, validated and fsynced, then atomically published before the document row commits. Rejected or failed uploads remove the staged/final file. Quota admission serializes on the `storage_quota_state` row and counts active documents only. Limits: `MAX_UPLOADS_PER_USER` (`409`), `MAX_USER_STORAGE_BYTES` (`413`), `MAX_GLOBAL_STORAGE_BYTES` (`413`).
 - **Response `201 Created`**:
   ```json
   {
@@ -106,7 +115,7 @@ This document details the complete API contract for TrustVault, including authen
     "updated_at": "2026-10-19T10:00:00.000000Z"
   }
   ```
-- **Audit Event**: `document.upload` (Outcome: `SUCCESS`, or `DENIED` with an allowlisted `details.reason` of `insufficient_role`, `missing_filename`, `invalid_upload`, or `size_limit_exceeded` when an upload attempt is rejected)
+- **Audit Event**: `document.upload` (Outcome: `SUCCESS`, or `DENIED` with an allowlisted `details.reason` of `insufficient_role`, `missing_filename`, `invalid_filename`, `invalid_mime_type`, `invalid_upload`, `size_limit_exceeded`, `upload_count_quota`, `user_storage_quota`, or `global_storage_quota` when an upload attempt is rejected)
 
 ### `GET /api/v1/documents`
 - **Authentication**: Required
@@ -169,7 +178,7 @@ This document details the complete API contract for TrustVault, including authen
 ### `DELETE /api/v1/documents/{id}`
 - **Authentication**: Required
 - **Authorization Rule**: Document Owner ONLY. Viewers, editors, and administrators cannot delete another user's document.
-- **Response `204 No Content`**: Empty body; the document is soft-deleted and the physical file is removed.
+- **Response `204 No Content`**: Empty body; the document is soft-deleted and the physical file is removed. The soft-delete and audit event commit before unlink. If cleanup fails, the response remains `204` and startup reconciliation retries removal after the configured grace period.
 - **Audit Event**: `document.delete` (Outcome: SUCCESS or DENIED)
 
 ---

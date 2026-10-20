@@ -11,7 +11,7 @@ TrustVault is a production-minded secure document sharing web application engine
   - **Administrator**: Governance, user lifecycle, and audit investigations. *Administrators cannot read or download document contents without explicit owner grants.*
   - **Document Owner**: Exclusive lifecycle control over their own documents (upload, read, download, edit, delete, grant permissions, revoke permissions).
   - **Viewer**: Read-only or read/edit access strictly constrained by active, unrevoked grants.
-- **Private Persistent Storage**: Document byte streams reside outside the web server root under 256-bit cryptographically random hex keys. Path traversal is strictly defended via filesystem containment checks.
+- **Private Persistent Storage**: Document byte streams reside outside the web server root under 256-bit cryptographically random hex keys. Uploads are written to private staging, fsynced, and atomically published before the database commit; startup reconciliation cleans crash debris. Path traversal is strictly defended via filesystem containment checks.
 - **Immediate Revocation**: Revoking a grant takes effect on the very next request. No authorization caches or long-lived presigned URLs are used.
 - **Tamper-Evident Audit Trail**: All authentication, access, mutation, grant modifications, and access denials are recorded in an append-only cryptographic hash chain using SHA-256. Version 2 records bind the event ID, client IP, and user agent in addition to the chain fields, while version 1 records continue to verify unchanged.
 

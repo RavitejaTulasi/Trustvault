@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import or_
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.app.database import get_db
@@ -48,20 +49,22 @@ from backend.app.schemas.grant import (
     GrantResponse,
 )
 from backend.app.security.auth import get_current_user
+from backend.app.security.request_validation import (
+    RequestMetadataValidationError,
+    validate_mime_type,
+    validate_original_filename,
+)
 from backend.app.services.audit_service import AuditService
 from backend.app.services.authorization import AuthorizationService, DocumentAction
+from backend.app.services.storage_quota import (
+    StorageQuotaExceeded,
+    StorageQuotaService,
+)
 from backend.app.services.storage_service import StorageService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["Documents & Storage"])
-
-
-def _get_client_ip(request: Request) -> str | None:
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    return request.client.host if request.client else None
 
 
 def _get_active_grant(db: Session, document_id: str, user_id: str) -> DocumentGrant | None:
@@ -190,8 +193,9 @@ def _upsert_grant(
     summary="Upload a new document",
     description=(
         "Uploads a document file with title and category. "
-        "Enforces max size limits, extension whitelisting, and magic byte content sniffing. "
-        "Persists file bytes outside web root with a 256-bit unguessable storage key."
+        "Enforces request, metadata, quota, and size limits with extension whitelisting "
+        "and magic byte content sniffing. File bytes are staged privately, atomically "
+        "published outside the web root, and cleaned up if the audit or database commit fails."
     ),
 )
 def upload_document(
@@ -202,9 +206,9 @@ def upload_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> DocumentResponse:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     # Enforce least privilege: Uploaders must be owners or admins
     if current_user.role not in {UserRole.OWNER, UserRole.ADMIN}:
@@ -225,7 +229,9 @@ def upload_document(
             detail="Document owner or administrator privileges required to upload documents",
         )
 
-    if not file.filename:
+    try:
+        normalized_filename = validate_original_filename(file.filename)
+    except RequestMetadataValidationError as exc:
         AuditService.log_event(
             db,
             action="document.upload",
@@ -235,17 +241,40 @@ def upload_document(
             ip_address=ip,
             user_agent=user_agent,
             request_id=request_id,
-            details={"reason": "missing_filename"},
+            details={
+                "reason": (
+                    "missing_filename" if not file.filename else "invalid_filename"
+                )
+            },
         )
         db.commit()
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No filename provided",
-        )
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from None
 
-    # Save and validate file via StorageService
     try:
-        storage_key, file_size = StorageService.save_file(file.file, file.filename)
+        mime_type = validate_mime_type(file.content_type)
+    except RequestMetadataValidationError as exc:
+        AuditService.log_event(
+            db,
+            action="document.upload",
+            outcome=AuditOutcome.DENIED,
+            actor_id=current_user.id,
+            resource_type="document",
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={"reason": "invalid_mime_type"},
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from None
+
+    try:
+        staged = StorageService.stage_file(file.file, normalized_filename)
     except HTTPException as exc:
         reason = (
             "size_limit_exceeded"
@@ -265,48 +294,107 @@ def upload_document(
         )
         db.commit()
         raise
-    except Exception as e:
-        logger.error(f"File upload storage error: {e}")
+    except OSError:
+        logger.exception("Private storage staging failed")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to save uploaded file",
-        )
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document storage is temporarily unavailable",
+        ) from None
 
-    mime_type = file.content_type or "application/octet-stream"
+    try:
+        StorageQuotaService.acquire_upload_slot(
+            db,
+            current_user.id,
+            staged.size_bytes,
+        )
+    except StorageQuotaExceeded as exc:
+        try:
+            AuditService.log_event(
+                db,
+                action="document.upload",
+                outcome=AuditOutcome.DENIED,
+                actor_id=current_user.id,
+                resource_type="document",
+                ip_address=ip,
+                user_agent=user_agent,
+                request_id=request_id,
+                details={"reason": exc.reason},
+            )
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("Failed to audit storage-quota denial")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Document storage transaction failed",
+            ) from None
+        finally:
+            staged.discard()
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from None
+    except SQLAlchemyError:
+        db.rollback()
+        staged.discard()
+        logger.exception("Storage quota admission failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document storage transaction failed",
+        ) from None
+    except Exception:
+        db.rollback()
+        staged.discard()
+        raise
 
     document = Document(
         title=title.strip(),
-        original_filename=file.filename,
-        storage_key=storage_key,
-        file_size_bytes=file_size,
+        original_filename=normalized_filename,
+        storage_key=staged.storage_key,
+        file_size_bytes=staged.size_bytes,
         mime_type=mime_type,
         category=category.strip(),
         owner_id=current_user.id,
         is_deleted=False,
     )
-    db.add(document)
-    db.flush()
 
-    AuditService.log_event(
-        db,
-        action="document.upload",
-        outcome=AuditOutcome.SUCCESS,
-        actor_id=current_user.id,
-        resource_type="document",
-        resource_id=document.id,
-        ip_address=ip,
-        user_agent=user_agent,
-        request_id=request_id,
-        details={
-            "title": document.title,
-            "filename": document.original_filename,
-            "size": document.file_size_bytes,
-            "category": document.category,
-        },
-    )
-    db.commit()
+    try:
+        db.add(document)
+        db.flush()
+
+        AuditService.log_event(
+            db,
+            action="document.upload",
+            outcome=AuditOutcome.SUCCESS,
+            actor_id=current_user.id,
+            resource_type="document",
+            resource_id=document.id,
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={
+                "title": document.title,
+                "filename": document.original_filename,
+                "size": document.file_size_bytes,
+                "category": document.category,
+            },
+        )
+        staged.finalize()
+        db.commit()
+    except (SQLAlchemyError, OSError):
+        db.rollback()
+        staged.discard()
+        logger.exception("Document upload transaction failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document storage transaction failed",
+        ) from None
+    except Exception:
+        db.rollback()
+        staged.discard()
+        raise
+
     db.refresh(document)
-
     return DocumentResponse.model_validate(document)
 
 
@@ -454,9 +542,9 @@ def get_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> DocumentResponse:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     document = db.get(Document, document_id)
     if document is None or document.is_deleted:
@@ -512,9 +600,9 @@ def download_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     document = db.get(Document, document_id)
     if document is None or document.is_deleted:
@@ -585,9 +673,9 @@ def update_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> DocumentResponse:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     document = db.get(Document, document_id)
     if document is None or document.is_deleted:
@@ -655,9 +743,9 @@ def delete_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> None:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     document = db.get(Document, document_id)
     if document is None or document.is_deleted:
@@ -686,23 +774,38 @@ def delete_document(
         db.commit()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    # Soft delete in DB and remove physical file
+    # Commit the authoritative soft-delete and audit event before removing bytes.
+    # If audit persistence fails, the transaction rolls back and the file remains
+    # consistent with an active document. If physical cleanup fails after commit,
+    # startup reconciliation retries it from the persisted deleted state.
     document.is_deleted = True
-    StorageService.delete_file(document.storage_key)
+    try:
+        AuditService.log_event(
+            db,
+            action="document.delete",
+            outcome=AuditOutcome.SUCCESS,
+            actor_id=current_user.id,
+            resource_type="document",
+            resource_id=document_id,
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={"title": document.title},
+        )
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Document delete transaction failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document deletion transaction failed",
+        ) from None
 
-    AuditService.log_event(
-        db,
-        action="document.delete",
-        outcome=AuditOutcome.SUCCESS,
-        actor_id=current_user.id,
-        resource_type="document",
-        resource_id=document_id,
-        ip_address=ip,
-        user_agent=user_agent,
-        request_id=request_id,
-        details={"title": document.title},
-    )
-    db.commit()
+    if not StorageService.delete_file(document.storage_key):
+        logger.warning(
+            "Physical cleanup deferred for a soft-deleted document; "
+            "startup reconciliation will retry"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -722,9 +825,9 @@ def list_document_permissions(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> GrantListResponse:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     document = db.get(Document, document_id)
     if document is None or document.is_deleted:
@@ -771,9 +874,9 @@ def create_document_permission(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> GrantResponse:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     document = db.get(Document, document_id)
     if document is None or document.is_deleted:
@@ -861,9 +964,9 @@ def revoke_document_permission(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     document = db.get(Document, document_id)
     if document is None or document.is_deleted:

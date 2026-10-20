@@ -4,6 +4,7 @@ Applies security middleware, defense-in-depth headers, request tracking,
 CSRF protection, and registers API routers.
 """
 
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -16,6 +17,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from backend.app.api.health import router as health_router
 from backend.app.api.router import api_router
 from backend.app.config import settings
+from backend.app.database import SessionLocal
+from backend.app.security.body_limit import RequestBodyLimitMiddleware
 from backend.app.security.client_ip import get_client_ip
 from backend.app.security.csrf import CSRFMiddleware
 from backend.app.security.request_validation import (
@@ -25,6 +28,9 @@ from backend.app.security.request_validation import (
     validate_user_agent,
 )
 from backend.app.services.checkpoint_runtime import checkpoint_scheduler
+from backend.app.services.storage_lifecycle import StorageLifecycleService
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -32,6 +38,23 @@ async def lifespan(app: FastAPI):
     # Ensure private storage directory exists on startup
     storage_path = settings.resolved_storage_path
     storage_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with SessionLocal() as db:
+            report = StorageLifecycleService.reconcile(db)
+        logger.info(
+            "Storage reconciliation completed: orphaned=%d deleted=%d "
+            "staging=%d missing_active=%d failures=%d bytes=%d",
+            report.removed_orphaned_files,
+            report.removed_deleted_files,
+            report.removed_staging_files,
+            report.missing_active_files,
+            report.cleanup_failures,
+            report.removed_bytes,
+        )
+    except Exception:
+        logger.exception("Storage reconciliation failed; application will continue")
+
     checkpoint_scheduler.start()
     try:
         yield
@@ -120,8 +143,10 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# Register middleware in order
+# Register middleware in order. CORS is outermost; body limits run before CSRF
+# or multipart parsing. Security headers wrap validation and limit responses.
 app.add_middleware(CSRFMiddleware)
+app.add_middleware(RequestBodyLimitMiddleware)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 

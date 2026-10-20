@@ -69,6 +69,7 @@ Search, category, owner, and created-date filters are AND-combined and are appli
 +-------------------------------------------------------------------------+
 |                             FastAPI Backend                             |
 |  - Request ID, Metadata Validation & Security Headers (nosniff, DENY)   |
+|  - Request Body Limits (declared and streamed)                          |
 |  - Session Authentication Middleware (Argon2, Server-side sessions)    |
 |  - Rate Limiter (Shared database-backed fixed window on login)          |
 +-------------------------------------------------------------------------+
@@ -131,7 +132,7 @@ Where:
 `audit_chain_state` from the existing head, and replaces the actor foreign key. Existing rows are marked version 1,
 and historical checkpoint comparisons continue to use their stored record hashes unchanged. Revision
 `b6f1c8e9a2d4` creates the shared login rate-limit table including the `denial_audit_recorded` marker used to bound
-login-denial audit events.
+login-denial audit events, and revision `d4e5f6a7b8c9` adds `storage_quota_state`.
 - **Downgrade policy**: forward upgrades are supported. Downgrading below `c3d4e5f6a7b8` is refused while any
 version 2 audit record exists: the legacy schema cannot store `hash_version`, so a downgrade followed by a
 re-upgrade would silently relabel those rows as version 1 and verification would then report a broken chain. The

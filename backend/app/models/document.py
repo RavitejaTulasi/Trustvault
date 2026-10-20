@@ -10,6 +10,10 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.database import Base
+from backend.app.limits import (
+    MAX_MIME_TYPE_LENGTH,
+    MAX_ORIGINAL_FILENAME_LENGTH,
+)
 from backend.app.models.base import TimestampMixin, generate_uuid, utc_now
 
 if TYPE_CHECKING:
@@ -23,12 +27,16 @@ class Document(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     title: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
-    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    original_filename: Mapped[str] = mapped_column(
+        String(MAX_ORIGINAL_FILENAME_LENGTH), nullable=False
+    )
     
     # Internal random key used in private storage - physical paths are NEVER exposed to clients
     storage_key: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     file_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
-    mime_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    mime_type: Mapped[str] = mapped_column(
+        String(MAX_MIME_TYPE_LENGTH), nullable=False
+    )
     category: Mapped[str] = mapped_column(String(100), default="General", index=True, nullable=False)
     
     owner_id: Mapped[str] = mapped_column(

@@ -10,6 +10,7 @@ from backend.app.models.document import Document, DocumentVersion
 from backend.app.models.grant import DocumentGrant, PermissionLevel
 from backend.app.models.rate_limit import LoginRateLimitBucket
 from backend.app.models.session import SessionModel
+from backend.app.models.storage_quota import StorageQuotaState
 from backend.app.models.user import User, UserRole
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "LoginRateLimitBucket",
     "PermissionLevel",
     "SessionModel",
+    "StorageQuotaState",
     "TimestampMixin",
     "User",
     "UserRole",
