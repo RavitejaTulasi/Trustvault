@@ -80,9 +80,10 @@ Search, category, owner, and created-date filters are AND-combined and are appli
 | (backend/app/services/           |   | (Outside Web Root)               |
 |  authorization.py)               |   | - 256-bit unguessable keys       |
 |  - Evaluates active session      |   | - Path traversal containment     |
-|  - Evaluates document ownership  |   | - 10MB chunked stream validation |
-|  - Evaluates active grant status |   +----------------------------------+
-+----------------------------------+
+|  - Evaluates document ownership  |   | - Chunked stream validation      |
+|  - Evaluates active grant status |   | - Private staging + atomic rename|
++----------------------------------+   | - Startup reconciliation         |
+                                       +----------------------------------+
        |
        v
 +-------------------------------------------------------------------------+
@@ -90,6 +91,8 @@ Search, category, owner, and created-date filters are AND-combined and are appli
 |                      Managed PostgreSQL / psycopg 3                     |
 |  - users, sessions, documents, document_grants, audit_events            |
 |  - audit_chain_state (serialized append sequence and chain head)        |
+|  - login_rate_limit_buckets (shared, expiring login counters)           |
+|  - storage_quota_state (serialized upload admission)                    |
 |  - Versioned SHA-256 hash chain; actor identity locked by RESTRICT      |
 +-------------------------------------------------------------------------+
        |
@@ -101,6 +104,18 @@ Search, category, owner, and created-date filters are AND-combined and are appli
 |  - local_file = development only; production requires s3                |
 +-------------------------------------------------------------------------+
 ```
+
+### Storage and Request Boundaries
+
+Uploads are streamed to a private `.staging` directory on the same filesystem, validated against the extension/magic-byte policy, counted against `MAX_FILE_SIZE_BYTES`, fsynced, and atomically renamed to a 64-character lowercase hex storage key before the document row commits. If the transaction or finalization fails, both staged and final paths are removed. A crash between rename and commit can leave an unreferenced file.
+
+Startup reconciliation removes files belonging to soft-deleted documents immediately. It removes other unreferenced files and stale `.part` staging files only after `STORAGE_ORPHAN_GRACE_SECONDS`, so another worker's in-flight upload is not deleted. Active files are never removed, and missing active files are counted and logged rather than recreated. The filesystem and database do not share an atomic transaction; this is a recoverable-ordering design, not a distributed transaction.
+
+Upload admission updates the singleton `storage_quota_state` row at the start of the document transaction, then checks active per-user document count and bytes plus platform-wide bytes. PostgreSQL holds the row lock and SQLite holds its write lock until the caller commits or rolls back, so concurrent workers cannot both admit uploads against the same stale usage snapshot. Count-limit rejection returns `409`; byte-limit rejection returns `413`.
+
+A pure-ASGI middleware enforces request-body limits before multipart/JSON parsing. Declared `Content-Length` values above `MAX_FILE_SIZE_BYTES + MAX_MULTIPART_OVERHEAD_BYTES` for multipart requests, or above `MAX_JSON_BODY_BYTES` for other requests, are rejected immediately. Bodies without a trusted length are counted as they stream. Request IDs, user agents, client IPs, filenames, and MIME types are validated against their database column bounds before persistence; overlong values are rejected rather than truncated.
+
+The online audit hash chain is retained indefinitely because checkpoint and chain verification require it. `AUDIT_RETENTION_DAYS` is an objective for independently held archive copies, not an online-deletion schedule, and `AUDIT_RETENTION_AUTO_DELETE=true` is rejected at startup.
 
 ---
 

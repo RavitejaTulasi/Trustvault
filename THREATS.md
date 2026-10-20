@@ -35,6 +35,7 @@ Status Classifications:
 | **TV-20** | Upload/Delete Crash Windows and Orphaned Files | CWE-459 / CWE-362 | **Partially Mitigated** | Private staging, atomic rename, commit-before-unlink, startup reconciliation |
 | **TV-21** | Storage Exhaustion and Unbounded Request Bodies | CWE-400 / CWE-770 | **Mitigated** | Body limits, streamed-byte counting, serialized per-user/global quotas |
 | **TV-22** | Audit Denial Flooding | CWE-779 / CWE-400 | **Mitigated** | One aggregate denial event per IP window via atomic claim |
+| **TV-23** | Online Audit Retention Conflict | CWE-459 / CWE-693 | **Partially Mitigated** | Online chain never deleted; destructive auto-delete rejected at startup |
 
 ---
 
@@ -223,3 +224,12 @@ Status Classifications:
 - **Test Evidence**: `test_denial_audit_is_claimed_once_per_ip_window`, `test_rate_limit_denials_emit_one_aggregated_audit_event`, `test_denial_audit_claim_rolls_back_when_event_write_fails`, `test_concurrent_denial_audit_claims_record_one_event`, `test_denial_audit_claim_and_event_commit_atomically`.
 - **Residual Risk**: An attacker with many IP addresses can still generate one aggregate event per IP/window. Audit retention must be planned separately; online audit records are never auto-deleted.
 - **Status**: **Mitigated**
+
+### TV-23: Online Audit Retention Conflict
+
+- **Attack Scenario**: An operator enables automatic deletion of audit records to meet a retention target, invalidating checkpoint verification and destroying non-repudiation evidence.
+- **Impact**: Irrecoverable loss of audit integrity.
+- **Mitigation**: The application never deletes online audit rows. `AUDIT_RETENTION_DAYS` applies only to independently managed archive copies, and `AUDIT_RETENTION_AUTO_DELETE=true` is rejected at startup. Archive/export operations remain outside the application.
+- **Test Evidence**: `test_audit_retention_auto_delete_is_rejected`, `test_phase5_migration_upgrades_and_downgrades`.
+- **Residual Risk**: No archive/export job ships in this repository; operators must implement and verify independent archive retention.
+- **Status**: **Partially Mitigated**
