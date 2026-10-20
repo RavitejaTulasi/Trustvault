@@ -32,7 +32,8 @@ This document details the complete API contract for TrustVault, including authen
 
 ### `POST /api/v1/auth/login`
 - **Authentication**: None (Public)
-- **Rate Limit**: 5 attempts per 5 minutes per IP/email.
+- **Rate Limit**: 5 failed attempts per 5 minutes per IP and per IP+email. Counters are stored in the shared application database, reserved atomically before password verification, and expire automatically. A successful login clears the IP+email bucket and releases its own IP slot without clearing earlier IP-wide failures. A limiter storage failure returns `503` rather than falling back to process-local state. At most one `user.login_rate_limited` audit event is written per IP window; repeated denied requests, including attempts that rotate the email address, do not multiply audit rows. A failure to persist the aggregate event fails closed with `503`.
+- **Client IP**: The immediate peer address is used unless it matches `TRUSTED_PROXY_IPS`. Only then is `X-Forwarded-For` walked right-to-left, stopping at the first non-proxy address. Malformed, oversized, or excessive-hop headers fall back to the peer. `0.0.0.0/0` and `::/0` are rejected at startup.
 - **Request Body**:
   ```json
   {

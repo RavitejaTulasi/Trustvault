@@ -8,6 +8,7 @@ from backend.app.models.audit import AuditEvent, AuditOutcome
 from backend.app.models.base import TimestampMixin, generate_uuid, utc_now
 from backend.app.models.document import Document, DocumentVersion
 from backend.app.models.grant import DocumentGrant, PermissionLevel
+from backend.app.models.rate_limit import LoginRateLimitBucket
 from backend.app.models.session import SessionModel
 from backend.app.models.user import User, UserRole
 
@@ -18,6 +19,7 @@ __all__ = [
     "Document",
     "DocumentGrant",
     "DocumentVersion",
+    "LoginRateLimitBucket",
     "PermissionLevel",
     "SessionModel",
     "TimestampMixin",

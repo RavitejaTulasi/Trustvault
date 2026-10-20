@@ -68,9 +68,9 @@ Search, category, owner, and created-date filters are AND-combined and are appli
                                      v
 +-------------------------------------------------------------------------+
 |                             FastAPI Backend                             |
-|  - Request ID & Security Headers Middleware (nosniff, DENY, CSP)        |
+|  - Request ID, Metadata Validation & Security Headers (nosniff, DENY)   |
 |  - Session Authentication Middleware (Argon2, Server-side sessions)    |
-|  - Rate Limiter (Sliding window on login)                               |
+|  - Rate Limiter (Shared database-backed fixed window on login)          |
 +-------------------------------------------------------------------------+
        |                                          |
        v                                          v

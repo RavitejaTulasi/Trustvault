@@ -6,7 +6,7 @@ Security controls implemented:
 - Argon2id password hashing (OWASP-recommended)
 - Server-side session tokens (HTTP-only, SameSite=Lax cookies)
 - Double-submit CSRF cookie protection
-- Sliding-window login rate limiting per IP and email
+- Shared fixed-window login rate limiting per IP and IP+email
 - Constant-time login (always verify password, always hash-check session)
 - Audit logging for every auth event (success, failure, rate-limited)
 - No enumeration: registration/login errors use generic messages
@@ -15,6 +15,7 @@ Security controls implemented:
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
@@ -29,22 +30,25 @@ from backend.app.schemas.auth import (
 )
 from backend.app.security.auth import get_current_user
 from backend.app.security.csrf import generate_csrf_token
-from backend.app.security.passwords import hash_password, password_needs_rehash, verify_password
-from backend.app.security.rate_limiter import login_rate_limiter
-from backend.app.security.sessions import create_session, revoke_all_user_sessions, revoke_session
+from backend.app.security.passwords import (
+    hash_password,
+    password_needs_rehash,
+    verify_password,
+)
+from backend.app.security.rate_limiter import (
+    LoginRateLimitUnavailable,
+    login_rate_limiter,
+)
+from backend.app.security.sessions import (
+    create_session,
+    revoke_all_user_sessions,
+    revoke_session,
+)
 from backend.app.services.audit_service import AuditService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
-
-
-def _get_client_ip(request: Request) -> str | None:
-    """Extract real client IP, honouring X-Forwarded-For from trusted proxies."""
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    return request.client.host if request.client else None
 
 
 def _set_session_cookie(response: Response, raw_token: str) -> None:
@@ -102,9 +106,9 @@ def register(
     response: Response,
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     # Check email uniqueness before creating user
     existing = db.query(User).filter(User.email == body.email.lower()).first()
@@ -172,7 +176,7 @@ def register(
         "Verifies credentials and issues an HTTP-only session cookie. "
         "Always performs a full Argon2id verification regardless of whether the email exists "
         "to prevent user enumeration via timing. "
-        "Applies sliding window rate limiting on failed attempts."
+        "Applies shared fixed-window rate limiting on failed attempts."
     ),
 )
 def login(
@@ -181,27 +185,64 @@ def login(
     response: Response,
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
-    # Rate limiting check
-    is_limited, retry_after = login_rate_limiter.is_rate_limited(ip, body.email)
-    if is_limited:
-        AuditService.log_event(
-            db,
-            action="user.login_rate_limited",
-            outcome=AuditOutcome.DENIED,
-            ip_address=ip,
-            user_agent=user_agent,
-            request_id=request_id,
-            details={"email": body.email, "reason": "rate_limit_exceeded"},
-        )
-        db.commit()
+    # Reserve a shared attempt atomically before the expensive password check.
+    try:
+        decision = login_rate_limiter.reserve(db, ip, body.email)
+    except LoginRateLimitUnavailable:
+        logger.exception("Shared login rate limiter unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from None
+
+    if not decision.allowed:
+        try:
+            should_audit = login_rate_limiter.claim_denial_audit(
+                db,
+                ip,
+                body.email,
+            )
+            if should_audit:
+                AuditService.log_event(
+                    db,
+                    action="user.login_rate_limited",
+                    outcome=AuditOutcome.DENIED,
+                    ip_address=ip,
+                    user_agent=user_agent,
+                    request_id=request_id,
+                    details={
+                        "email": body.email,
+                        "reason": "rate_limit_exceeded",
+                        "aggregated": True,
+                    },
+                )
+                db.commit()
+        except (LoginRateLimitUnavailable, SQLAlchemyError):
+            db.rollback()
+            logger.exception("Failed to record rate-limit denial")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication temporarily unavailable",
+                headers={"Retry-After": "5"},
+            ) from None
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many failed login attempts. Please try again later.",
-            headers={"Retry-After": str(retry_after)},
+            headers={"Retry-After": str(decision.retry_after)},
+        )
+
+    reservation = decision.reservation
+    if reservation is None:
+        logger.error("Shared login rate limiter returned no reservation")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication temporarily unavailable",
+            headers={"Retry-After": "5"},
         )
 
     # Load user by email
@@ -215,8 +256,7 @@ def login(
 
     # Reject if user doesn't exist, password is wrong, or account is deactivated
     if not user or not password_ok or not user.is_active:
-        login_rate_limiter.record_failure(ip, body.email)
-
+        # The reservation made before verification remains counted as a failure.
         AuditService.log_event(
             db,
             action="user.login_failed",
@@ -233,8 +273,17 @@ def login(
             detail="Invalid email or password",
         )
 
-    # Credentials valid -> clear recorded failed attempts
-    login_rate_limiter.record_success(ip, body.email)
+    # Credentials valid -> clear this account's failures and release this
+    # request's IP slot without erasing earlier IP-wide failures.
+    try:
+        login_rate_limiter.record_success(db, reservation)
+    except LoginRateLimitUnavailable:
+        logger.exception("Shared login rate limiter unavailable during success")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from None
 
     # Rehash password if parameters are outdated (transparent upgrade)
     if password_needs_rehash(user.hashed_password):
@@ -278,9 +327,9 @@ def logout(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> None:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     raw_token: str | None = request.cookies.get(settings.SESSION_COOKIE_NAME)
     if raw_token:
@@ -325,9 +374,9 @@ def update_me(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    ip = _get_client_ip(request) or "127.0.0.1"
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     changed_fields = []
 

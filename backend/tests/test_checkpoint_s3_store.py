@@ -50,6 +50,9 @@ from backend.tests.test_audit_checkpoints import (
 
 S3_BUCKET = "trustvault-test-audit-bucket"
 S3_PREFIX = "anchors"
+PRODUCTION_DATABASE_URL = (
+    "postgresql+psycopg://trustvault_app:test-only-db-password@db:5432/trustvault"
+)
 CHECKPOINT_ENDPOINTS = (
     "/api/v1/admin/audit/checkpoints",
     "/api/v1/admin/audit/checkpoints/verify",
@@ -216,6 +219,8 @@ def test_s3_settings_require_bucket_region_and_hmac_key():
         Settings(
             _env_file=None,
             ENVIRONMENT="production",
+            SESSION_COOKIE_SECURE=True,
+            DATABASE_URL=PRODUCTION_DATABASE_URL,
             AUDIT_ANCHOR_MODE="s3",
             AUDIT_ANCHOR_HMAC_KEY="k" * 64,
             AUDIT_ANCHOR_S3_REGION="us-east-1",
@@ -225,6 +230,8 @@ def test_s3_settings_require_bucket_region_and_hmac_key():
         Settings(
             _env_file=None,
             ENVIRONMENT="production",
+            SESSION_COOKIE_SECURE=True,
+            DATABASE_URL=PRODUCTION_DATABASE_URL,
             AUDIT_ANCHOR_MODE="s3",
             AUDIT_ANCHOR_HMAC_KEY="k" * 64,
             AUDIT_ANCHOR_S3_BUCKET="audit-bucket",
@@ -234,6 +241,8 @@ def test_s3_settings_require_bucket_region_and_hmac_key():
         Settings(
             _env_file=None,
             ENVIRONMENT="production",
+            SESSION_COOKIE_SECURE=True,
+            DATABASE_URL=PRODUCTION_DATABASE_URL,
             AUDIT_ANCHOR_MODE="s3",
             AUDIT_ANCHOR_HMAC_KEY="short",
             AUDIT_ANCHOR_S3_BUCKET="audit-bucket",
@@ -246,6 +255,8 @@ def test_s3_settings_reject_plaintext_endpoint_in_production():
         Settings(
             _env_file=None,
             ENVIRONMENT="production",
+            SESSION_COOKIE_SECURE=True,
+            DATABASE_URL=PRODUCTION_DATABASE_URL,
             AUDIT_ANCHOR_MODE="s3",
             AUDIT_ANCHOR_HMAC_KEY="k" * 64,
             AUDIT_ANCHOR_S3_BUCKET="audit-bucket",
@@ -258,6 +269,8 @@ def test_s3_settings_accept_explicit_provider_configuration():
     configured = Settings(
         _env_file=None,
         ENVIRONMENT="production",
+        SESSION_COOKIE_SECURE=True,
+        DATABASE_URL=PRODUCTION_DATABASE_URL,
         AUDIT_ANCHOR_MODE="s3",
         AUDIT_ANCHOR_HMAC_KEY="k" * 64,
         AUDIT_ANCHOR_S3_BUCKET="audit-bucket",

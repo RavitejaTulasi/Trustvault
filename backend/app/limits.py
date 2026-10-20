@@ -1,0 +1,7 @@
+"""Shared persistence boundary limits for client-controlled metadata."""
+
+MAX_REQUEST_ID_LENGTH = 64
+MAX_IP_ADDRESS_LENGTH = 45
+MAX_USER_AGENT_LENGTH = 500
+MAX_ORIGINAL_FILENAME_LENGTH = 255
+MAX_MIME_TYPE_LENGTH = 100

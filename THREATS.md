@@ -88,9 +88,9 @@ Status Classifications:
 ### TV-07: Brute-Force Authentication
 - **Attack Scenario**: Automated dictionary attack against `POST /auth/login`.
 - **Impact**: Compromise of user credentials.
-- **Mitigation**: Argon2id password hashing with modern memory/time parameters. In-memory / Redis sliding-window rate limiting on login attempts (maximum 5 attempts per 5 minutes per IP/email). Failed attempts logged as audit events.
-- **Test Evidence**: `test_login_rate_limiting_exceeded`, `test_login_rate_limit_reset_on_success`.
-- **Residual Risk**: Distributed attacks across multiple IPs require edge/WAF rate limiting (Cloudflare/AWS WAF). In-memory rate limiter is process-local.
+- **Mitigation**: Argon2id password hashing with modern memory/time parameters. Shared database-backed fixed-window rate limiting on login attempts (maximum 5 attempts per 5 minutes per IP and per IP+email), reserved atomically before password verification. Successful logins clear the IP+email bucket but do not erase earlier IP-wide failures. Failed attempts logged as audit events. Client IPs are taken from the immediate peer unless it matches an explicit `TRUSTED_PROXY_IPS` allowlist; forwarded headers from other peers are ignored.
+- **Test Evidence**: `test_login_rate_limiting_exceeded`, `test_login_success_does_not_reset_ip_wide_failures`, `test_spoofed_forwarded_for_does_not_bypass_rate_limit`, `test_trusted_proxy_address_is_used_for_audit_and_limits`, `test_login_fails_closed_when_shared_limiter_is_unavailable`.
+- **Residual Risk**: Distributed attacks across multiple IPs require edge/WAF rate limiting (Cloudflare/AWS WAF). The shared limiter depends on database availability and intentionally fails closed with `503` when storage is unavailable or its bounded bucket table is full. Deployments behind a reverse proxy must configure the exact proxy CIDRs; otherwise rate limiting and audit attribution use the proxy's immediate address.
 - **Status**: **Mitigated**
 
 ### TV-08: SQL Injection and Cross-Site Scripting (XSS)

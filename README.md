@@ -31,7 +31,7 @@ TrustVault is a production-minded secure document sharing web application engine
 |                             FastAPI Backend                             |
 |  - Request ID & Security Headers Middleware (nosniff, DENY, CSP)        |
 |  - Session Authentication Middleware (Argon2, Server-side sessions)    |
-|  - Rate Limiter (Sliding window on login)                               |
+|  - Rate Limiter (Shared database-backed fixed window on login)          |
 +-------------------------------------------------------------------------+
        |                                          |
        v                                          v

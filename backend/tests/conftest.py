@@ -8,7 +8,7 @@ import os
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -41,6 +41,17 @@ test_engine = create_engine(
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
 )
+
+
+@event.listens_for(test_engine, "connect")
+def _enable_sqlite_constraints(dbapi_connection, _connection_record):
+    """Match production SQLite behavior for foreign keys and lock waits."""
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.close()
+
+
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
 
 
@@ -53,13 +64,13 @@ def setup_test_db():
 
 
 @pytest.fixture(autouse=True)
-def reset_rate_limiter_fixture():
+def reset_rate_limiter_fixture(db_session):
     """Resets rate limiter state before and after each test."""
-    login_rate_limiter.reset()
+    login_rate_limiter.reset(db_session)
     audit_verification_rate_limiter.reset()
     audit_checkpoint_rate_limiter.reset()
     yield
-    login_rate_limiter.reset()
+    login_rate_limiter.reset(db_session)
     audit_verification_rate_limiter.reset()
     audit_checkpoint_rate_limiter.reset()
 

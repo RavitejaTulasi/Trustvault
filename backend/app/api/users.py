@@ -17,21 +17,18 @@ from sqlalchemy.orm import Session
 from backend.app.database import get_db
 from backend.app.models.audit import AuditOutcome
 from backend.app.models.user import User, UserRole
-from backend.app.schemas.auth import AdminUserUpdateRequest, UserListResponse, UserResponse
-from backend.app.security.auth import get_current_user, require_admin
+from backend.app.schemas.auth import (
+    AdminUserUpdateRequest,
+    UserListResponse,
+    UserResponse,
+)
+from backend.app.security.auth import require_admin
 from backend.app.security.sessions import revoke_all_user_sessions
 from backend.app.services.audit_service import AuditService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/users", tags=["Admin – User Management"])
-
-
-def _get_client_ip(request: Request) -> str | None:
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    return request.client.host if request.client else None
 
 
 @router.get(
@@ -103,9 +100,9 @@ def update_user(
     current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    ip = _get_client_ip(request)
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     user: User | None = db.get(User, user_id)
     if user is None:
@@ -176,9 +173,9 @@ def revoke_user_sessions(
     current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
-    ip = _get_client_ip(request)
-    user_agent = request.headers.get("User-Agent")
-    request_id = getattr(request.state, "request_id", None)
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
 
     user: User | None = db.get(User, user_id)
     if user is None:
