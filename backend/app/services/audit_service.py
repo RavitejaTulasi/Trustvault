@@ -5,7 +5,9 @@ Implements an append-only, tamper-evident audit log for compliance and forensics
 Integrity Mechanism:
 Each record includes `previous_hash` (pointing to the prior record's `record_hash`)
 and `record_hash` (computed across sequence, timestamp, actor, action, resource,
-outcome, request_id, details, and previous_hash).
+outcome, request_id, details, and previous_hash). Version 2 additionally binds
+the stable event ID, recorded client IP address, and user agent. Existing version
+1 records remain verifiable with their original canonical payload.
 
 Honest Security Limitation Notice:
 Hash chaining ensures that any mid-chain alteration or omission is immediately detectable.
@@ -23,15 +25,22 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
-from backend.app.models.audit import AuditEvent
+from backend.app.models.audit import (
+    AUDIT_HASH_VERSION_CURRENT,
+    AUDIT_HASH_VERSION_LEGACY,
+    SUPPORTED_AUDIT_HASH_VERSIONS,
+    AuditChainState,
+    AuditEvent,
+)
+from backend.app.models.base import generate_uuid
 
 GENESIS_HASH = "0" * 64
 
-VerificationStatus = Literal["VALID", "INVALID", "INCOMPLETE"]
+VerificationStatus = Literal["VALID", "INVALID", "INCOMPLETE", "UNAVAILABLE"]
 
 
 @dataclass(frozen=True)
@@ -71,25 +80,122 @@ class AuditService:
         request_id: str | None,
         details_str: str | None,
         previous_hash: str,
+        *,
+        event_id: str | None = None,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+        hash_version: int = AUDIT_HASH_VERSION_LEGACY,
     ) -> str:
         """
-        Computes deterministic SHA-256 hash for an audit record.
-        Fields are canonically ordered to ensure reproducibility.
+        Compute a deterministic SHA-256 hash for an audit record.
+
+        Version 1 preserves the historical delimiter payload byte-for-byte so
+        existing chains and checkpoints remain verifiable. Version 2 uses a
+        canonical JSON payload that additionally binds the event ID, IP address,
+        and user agent.
         """
         timestamp_str = cls.format_timestamp(timestamp)
-        payload = (
-            f"seq:{sequence_number}|"
-            f"ts:{timestamp_str}|"
-            f"actor:{actor_id or ''}|"
-            f"action:{action}|"
-            f"res_type:{resource_type or ''}|"
-            f"res_id:{resource_id or ''}|"
-            f"outcome:{outcome}|"
-            f"req_id:{request_id or ''}|"
-            f"details:{details_str or ''}|"
-            f"prev:{previous_hash}"
+
+        if hash_version == AUDIT_HASH_VERSION_LEGACY:
+            payload = (
+                f"seq:{sequence_number}|"
+                f"ts:{timestamp_str}|"
+                f"actor:{actor_id or ''}|"
+                f"action:{action}|"
+                f"res_type:{resource_type or ''}|"
+                f"res_id:{resource_id or ''}|"
+                f"outcome:{outcome}|"
+                f"req_id:{request_id or ''}|"
+                f"details:{details_str or ''}|"
+                f"prev:{previous_hash}"
+            )
+            return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+        if hash_version != AUDIT_HASH_VERSION_CURRENT:
+            raise ValueError(f"Unsupported audit hash version: {hash_version}")
+        if event_id is None:
+            raise ValueError("event_id is required for audit hash version 2")
+
+        payload = json.dumps(
+            {
+                "action": action,
+                "actor_id": actor_id,
+                "details": details_str,
+                "hash_version": hash_version,
+                "id": event_id,
+                "ip_address": ip_address,
+                "outcome": outcome,
+                "previous_hash": previous_hash,
+                "request_id": request_id,
+                "resource_id": resource_id,
+                "resource_type": resource_type,
+                "sequence_number": sequence_number,
+                "timestamp": timestamp_str,
+                "user_agent": user_agent,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _ensure_chain_state(cls, db: Session) -> None:
+        """Create the singleton chain head from the existing chain if absent."""
+        db.execute(
+            text(
+                "INSERT INTO audit_chain_state "
+                "(id, last_sequence, last_hash, updated_at) "
+                "SELECT 1, "
+                "COALESCE((SELECT MAX(sequence_number) FROM audit_events), 0), "
+                "COALESCE(("
+                "SELECT record_hash FROM audit_events "
+                "ORDER BY sequence_number DESC LIMIT 1"
+                "), :genesis_hash), "
+                "CURRENT_TIMESTAMP "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {"genesis_hash": GENESIS_HASH},
+        )
+
+    @classmethod
+    def _reserve_append_slot(cls, db: Session) -> tuple[int, str]:
+        """
+        Reserve the next sequence number while holding the chain-head row lock.
+
+        The atomic increment serializes concurrent appends on PostgreSQL and
+        SQLite. The lock is held until the caller commits or rolls back, so the
+        inserted event and chain-head update remain in the same transaction.
+        """
+        cls._ensure_chain_state(db)
+        result = db.execute(
+            update(AuditChainState)
+            .where(AuditChainState.id == 1)
+            .values(last_sequence=AuditChainState.last_sequence + 1)
+        )
+        if result.rowcount != 1:
+            raise RuntimeError("Audit chain state row is missing")
+
+        state = db.execute(
+            select(
+                AuditChainState.last_sequence,
+                AuditChainState.last_hash,
+            ).where(AuditChainState.id == 1)
+        ).one()
+        return state.last_sequence, state.last_hash
+
+    @classmethod
+    def _commit_chain_head(
+        cls, db: Session, sequence_number: int, record_hash: str
+    ) -> None:
+        db.execute(
+            update(AuditChainState)
+            .where(AuditChainState.id == 1)
+            .values(
+                last_sequence=sequence_number,
+                last_hash=record_hash,
+            )
+        )
 
     @classmethod
     def log_event(
@@ -106,20 +212,15 @@ class AuditService:
         details: dict[str, Any] | None = None,
     ) -> AuditEvent:
         """
-        Appends an immutable audit event to the tamper-evident chain within the current transaction.
-        """
-        # Fetch the most recent event to determine sequence and previous hash
-        stmt = select(AuditEvent).order_by(AuditEvent.sequence_number.desc()).limit(1)
-        last_event = db.execute(stmt).scalars().first()
+        Append an immutable audit event to the tamper-evident chain.
 
-        if last_event is None:
-            sequence_number = 1
-            previous_hash = GENESIS_HASH
-        else:
-            sequence_number = last_event.sequence_number + 1
-            previous_hash = last_event.record_hash
+        Sequence allocation and the previous-hash head are read under a
+        serializing chain-state lock and remain part of the caller's transaction.
+        """
+        sequence_number, previous_hash = cls._reserve_append_slot(db)
 
         event_time = datetime.now(UTC)
+        event_id = generate_uuid()
         details_str = json.dumps(details, sort_keys=True) if details else None
 
         record_hash = cls.calculate_hash(
@@ -133,9 +234,14 @@ class AuditService:
             request_id=request_id,
             details_str=details_str,
             previous_hash=previous_hash,
+            event_id=event_id,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            hash_version=AUDIT_HASH_VERSION_CURRENT,
         )
 
         event = AuditEvent(
+            id=event_id,
             sequence_number=sequence_number,
             timestamp=event_time,
             actor_id=actor_id,
@@ -147,11 +253,13 @@ class AuditService:
             ip_address=ip_address,
             user_agent=user_agent,
             details=details_str,
+            hash_version=AUDIT_HASH_VERSION_CURRENT,
             previous_hash=previous_hash,
             record_hash=record_hash,
         )
         db.add(event)
         db.flush()
+        cls._commit_chain_head(db, sequence_number, record_hash)
         return event
 
     @classmethod
@@ -170,6 +278,7 @@ class AuditService:
         """
         stmt = (
             select(
+                AuditEvent.id,
                 AuditEvent.sequence_number,
                 AuditEvent.timestamp,
                 AuditEvent.actor_id,
@@ -178,7 +287,10 @@ class AuditService:
                 AuditEvent.resource_id,
                 AuditEvent.outcome,
                 AuditEvent.request_id,
+                AuditEvent.ip_address,
+                AuditEvent.user_agent,
                 AuditEvent.details,
+                AuditEvent.hash_version,
                 AuditEvent.previous_hash,
                 AuditEvent.record_hash,
             )
@@ -289,6 +401,17 @@ class AuditService:
                         ),
                     )
 
+                hash_version = row["hash_version"]
+                if hash_version not in SUPPORTED_AUDIT_HASH_VERSIONS:
+                    return AuditVerificationResult(
+                        "INVALID",
+                        expected_sequence - 1,
+                        (
+                            "Unsupported audit hash version "
+                            f"{hash_version} at sequence {sequence_number}"
+                        ),
+                    )
+
                 computed_hash = cls.calculate_hash(
                     sequence_number=sequence_number,
                     timestamp=row["timestamp"],
@@ -300,6 +423,10 @@ class AuditService:
                     request_id=row["request_id"],
                     details_str=row["details"],
                     previous_hash=previous_hash,
+                    event_id=row["id"],
+                    ip_address=row["ip_address"],
+                    user_agent=row["user_agent"],
+                    hash_version=hash_version,
                 )
 
                 if row["record_hash"] != computed_hash:

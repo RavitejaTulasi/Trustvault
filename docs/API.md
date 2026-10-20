@@ -28,6 +28,17 @@ This document details the complete API contract for TrustVault, including authen
 
 ---
 
+## 0. Health & Readiness
+
+### `GET /health`
+- **Authentication**: None (Public)
+- **Action**: Checks database connectivity and private-storage writability, and reports the checkpoint scheduler's last attempt, last success, last failure, latest checkpoint sequence/age, and overdue state. It does not contact the external checkpoint provider on every request.
+- **Response `200 OK`**: `status` is `healthy` when core services and anchoring are healthy, or `degraded` when core services are healthy but `components.audit_anchor` is not. The audit-anchor `status` is one of `not_configured`, `local_development_only`, `scheduler_stopped`, `starting`, `overdue`, `ok`, `invalid`, `incomplete`, `unavailable`, or `error`.
+- **Response `503 Service Unavailable`**: Database or private storage is unavailable; `status` is `unhealthy`.
+- **Operational Note**: Alert on top-level `degraded` and on anchor failures/overdue conditions. A `local_development_only` anchor is non-independent and is never accepted in production.
+
+---
+
 ## 1. Authentication Endpoints
 
 ### `POST /api/v1/auth/login`
@@ -233,6 +244,7 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 - **Response `200 OK`**: Updated user profile.
 - **Errors**: `400 Bad Request` when an administrator attempts to remove their own admin role; `404 Not Found` for an unknown user.
 - **Audit Events**: `user.role_change`, `user.deactivate`, or `user.reactivate`
+- **Identity Lifecycle**: There is no user hard-delete endpoint. Referenced audit actors are protected by `ON DELETE RESTRICT`/`ON UPDATE RESTRICT`; deactivation is the supported lifecycle operation and preserves the actor identity covered by the audit hash.
 
 ### `POST /api/v1/admin/users/{user_id}/revoke-sessions`
 - **Authentication**: Required
@@ -289,6 +301,7 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 - **Authentication**: Required
 - **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
 - **Action**: Performs a bounded, read-only validation of audit sequence continuity, previous-hash links, and recomputed SHA-256 record hashes. It does not modify, repair, append, or truncate audit records.
+- **Hash Coverage**: Each record is recomputed with its stored `hash_version`. Version 2 hashes bind the event `id`, `ip_address`, and `user_agent` in addition to sequence, timestamp, actor, action, resource, outcome, request ID, details, and previous hash; these fields are therefore tamper-evident through the verification API. Version 1 preserves the original payload for historical records and checkpoints. An unrecognized hash version is `INVALID`.
 - **Consistency Boundary**: The endpoint first reads the current maximum `sequence_number` as a high-water mark, then verifies records in ascending keyset batches with `sequence_number <= high_water_mark`. Records committed after the high-water mark are outside that verification pass. VALID is returned only when every sequence from 1 through the high-water mark was examined without an integrity failure.
 - **Resource Limits** (configurable through environment variables):
 
@@ -311,7 +324,7 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
   ```
 - **Status Semantics**:
   - `VALID`: every record from sequence 1 through the high-water mark was examined and passed. `is_valid` is `true`.
-  - `INVALID`: an altered record, altered record hash, broken previous-hash link, or sequence gap was detected. `is_valid` is `false`, and `records_verified` is the number of records successfully verified before the failure.
+  - `INVALID`: an altered record, altered record hash, v2 event identity or request-metadata tampering, unknown hash version, broken previous-hash link, or sequence gap was detected. `is_valid` is `false`, and `records_verified` is the number of records successfully verified before the failure.
   - `INCOMPLETE`: complete verification could not be performed because the chain exceeded the configured record limit or the time budget expired. `is_valid` is `false`, `records_verified` reports only records actually verified, and `failure_reason` explicitly states that verification was incomplete. An `INCOMPLETE` response never represents full-chain success.
 - **Failure Response**: Integrity failures and incomplete passes both return `200 OK` with the status fields above. Full 64-character hash values in the underlying diagnostic are redacted as `[redacted]`; sequence numbers and failure type remain available.
 - **Rate Limit Response**: Exceeding the per-administrator verification limit returns `429 Too Many Requests` with a `Retry-After` header in seconds and a generic error detail. Rate-limit responses also set `Cache-Control: no-store` and `Pragma: no-cache`. Query parameters cannot bypass the limit because the endpoint accepts none and every admitted or rejected request is evaluated against the same administrator identity.
@@ -322,9 +335,11 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 ### Checkpoint Anchoring Configuration
 Checkpoint endpoints use the adapter selected by `AUDIT_ANCHOR_MODE`:
 
-- `disabled` (default): no anchoring; creation returns `503` and verification returns `INCOMPLETE`.
+- `disabled` (default outside production): no anchoring; creation returns `503` and verification returns `UNAVAILABLE`. Production startup rejects this mode.
 - `local_file`: development-only local directory (`AUDIT_ANCHOR_DIR`); rejected at startup in `ENVIRONMENT=production`.
 - `s3`: external Amazon S3 or S3-compatible bucket (`AUDIT_ANCHOR_S3_*`), using the AWS default credential chain. Checkpoint documents use the same HMAC-protected format and conditional writes as the local adapter. The adapter ships in code but no provider configuration or credentials exist in this repository.
+
+When anchoring is enabled, an in-process scheduler attempts a checkpoint every `AUDIT_CHECKPOINT_INTERVAL_SECONDS` and records the last attempt, success, failure reason, and checkpoint metadata in `GET /health` under `components.audit_anchor`. A successful attempt also appends `audit.checkpoint_scheduled` to the audit trail. Alert on `components.audit_anchor.status` other than `ok`/`local_development_only` and on top-level `status=degraded`. `AUDIT_CHECKPOINT_MAX_AGE_SECONDS` controls when the last successful checkpoint is reported as overdue and must be at least the interval.
 
 ### `POST /api/v1/admin/audit/checkpoints`
 - **Authentication**: Required
@@ -374,9 +389,10 @@ Checkpoint endpoints use the adapter selected by `AUDIT_ANCHOR_MODE`:
 - **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
 - **Action**: Runs the same bounded chain verification as `GET /api/v1/admin/audit/verify`, then compares the verified chain against the latest stored checkpoint. The chain is verified first, so integrity failures take precedence over anchor state.
 - **Status Semantics**:
-  - `VALID`: the bounded chain verification passed and the record hash at the checkpointed sequence equals the checkpoint's stored hash. The chain may legitimately extend beyond the checkpoint; `chain_head_sequence` reports the verified head. `is_valid` is `true`. `VALID` describes the chain and the latest checkpoint object the provider returned; it does not prove that the provider retained newer checkpoints or resisted deletion/rollback. Those guarantees depend on provider versioning, Object Lock, and permissions (see `docs/ARCHITECTURE.md`).
+  - `VALID`: the bounded chain verification passed, a checkpoint exists at a non-genesis sequence, and the record hash at the checkpointed sequence equals the checkpoint's stored hash. The chain may legitimately extend beyond the checkpoint; `chain_head_sequence` reports the verified head. `is_valid` is `true`. `VALID` describes the chain and the latest checkpoint object the provider returned; it does not prove that the provider retained newer checkpoints or resisted deletion/rollback. Those guarantees depend on provider versioning, Object Lock, and permissions (see `docs/ARCHITECTURE.md`).
   - `INVALID`: the chain failed verification, the checkpointed sequence no longer exists (tail truncation), the chain's hash at that sequence no longer matches the checkpoint (history rewrite), or the stored checkpoint fails its HMAC integrity check. `is_valid` is `false`.
-  - `INCOMPLETE`: the chain passed verification but no anchor is configured or available, provider access was denied, no checkpoint has been stored yet, or the bounded pass hit the record limit or time budget. `is_valid` is `false` and `failure_reason` states why a complete comparison could not be made. `INCOMPLETE` is never reported as `VALID`.
+  - `INCOMPLETE`: the chain passed verification but no checkpoint has been stored yet, the bounded pass hit the record limit or time budget, or the latest checkpoint is genesis-only (`sequence_number=0`). A genesis-only checkpoint cannot distinguish a legitimately empty chain from truncation to zero, so it is never reported as `VALID`. `is_valid` is `false` and `failure_reason` states why a complete comparison could not be made.
+  - `UNAVAILABLE`: the anchor is not configured (`AUDIT_ANCHOR_MODE=disabled`) or the configured provider is unreachable or denies access. `is_valid` is `false` and `checkpoint_sequence` is `null`. This is an operational availability state, not evidence that the audit chain is valid.
 - **Response `200 OK`**:
   ```json
   {
@@ -391,7 +407,7 @@ Checkpoint endpoints use the adapter selected by `AUDIT_ANCHOR_MODE`:
   ```
 - **Resource Limits**: Uses the same `AUDIT_VERIFY_*` settings as `GET /api/v1/admin/audit/verify`. Full 64-character hash values in the underlying diagnostic are redacted as `[redacted]`.
 - **Rate Limit Response**: Exceeding `AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS` per `AUDIT_CHECKPOINT_RATE_LIMIT_WINDOW_SECONDS` returns `429` with `Retry-After`. This limiter is separate from the hash-chain verification limiter.
-- **Audit Event**: `audit.checkpoint_verify` (with allowlisted `details.verification_status` recording `VALID`, `INVALID`, or `INCOMPLETE`). The event commits before the response is sent; if it cannot be persisted, the endpoint returns `503` with detail `Audit trail unavailable`.
+- **Audit Event**: `audit.checkpoint_verify` (with allowlisted `details.verification_status` recording `VALID`, `INVALID`, `INCOMPLETE`, or `UNAVAILABLE`). The event commits before the response is sent; if it cannot be persisted, the endpoint returns `503` with detail `Audit trail unavailable`.
 - **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
 
 ### `GET /api/v1/admin/documents/activity`

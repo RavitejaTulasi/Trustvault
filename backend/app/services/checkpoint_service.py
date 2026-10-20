@@ -174,10 +174,12 @@ class CheckpointService:
         """
         Verify the live chain against the independently stored checkpoint.
 
-        An unavailable anchor, a missing checkpoint, or an unsupported format is
+        Provider outages and access denials are reported as UNAVAILABLE. A
+        missing checkpoint, bounded verification, or unsupported format is
         reported as INCOMPLETE. A confirmed chain or checkpoint mismatch is
-        reported as INVALID. VALID is returned only when both the chain and the
-        checkpoint match.
+        reported as INVALID. A genesis-only checkpoint is INCOMPLETE because it
+        cannot distinguish a legitimately empty chain from truncation to zero.
+        VALID is returned only when a non-genesis checkpoint and the chain match.
         """
         chain = AuditService.verify_chain_integrity_bounded(
             db,
@@ -198,7 +200,7 @@ class CheckpointService:
             checkpoint = store.read_latest()
         except CheckpointStoreAccessDeniedError:
             return CheckpointVerificationResult(
-                "INCOMPLETE",
+                "UNAVAILABLE",
                 chain.records_verified,
                 None,
                 None,
@@ -206,7 +208,7 @@ class CheckpointService:
             )
         except CheckpointStoreUnavailableError:
             return CheckpointVerificationResult(
-                "INCOMPLETE",
+                "UNAVAILABLE",
                 chain.records_verified,
                 None,
                 None,
@@ -253,6 +255,18 @@ class CheckpointService:
                 checkpoint.sequence_number,
                 None,
                 chain.failure_reason or "Audit chain verification was incomplete",
+            )
+
+        if checkpoint.sequence_number == 0:
+            return CheckpointVerificationResult(
+                "INCOMPLETE",
+                chain.records_verified,
+                checkpoint.sequence_number,
+                chain.records_verified,
+                (
+                    "Only a genesis checkpoint is available; an empty or truncated "
+                    "audit history cannot be reported as fully anchored"
+                ),
             )
 
         chain_head = chain.records_verified

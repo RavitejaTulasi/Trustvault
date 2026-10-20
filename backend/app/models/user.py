@@ -50,7 +50,10 @@ class User(Base, TimestampMixin):
         "DocumentGrant", back_populates="granted_by", foreign_keys="DocumentGrant.granted_by_id"
     )
     audit_events: Mapped[list["AuditEvent"]] = relationship(
-        "AuditEvent", back_populates="actor", foreign_keys="AuditEvent.actor_id"
+        "AuditEvent",
+        back_populates="actor",
+        foreign_keys="AuditEvent.actor_id",
+        passive_deletes=True,
     )
 
     def __repr__(self) -> str:

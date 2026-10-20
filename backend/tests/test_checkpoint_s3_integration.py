@@ -494,7 +494,7 @@ async def test_api_reports_unreachable_provider_as_unavailable(
 
     verify = await async_client.get("/api/v1/admin/audit/checkpoints/verify")
     assert verify.status_code == 200, verify.text
-    assert verify.json()["status"] == "INCOMPLETE"
+    assert verify.json()["status"] == "UNAVAILABLE"
     assert verify.json()["is_valid"] is False
 
 

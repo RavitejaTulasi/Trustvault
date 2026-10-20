@@ -120,7 +120,7 @@ class CheckpointInfoResponse(BaseModel):
 class CheckpointVerificationResponse(BaseModel):
     """Result of comparing the live audit chain with a stored checkpoint."""
 
-    status: Literal["VALID", "INVALID", "INCOMPLETE"]
+    status: Literal["VALID", "INVALID", "INCOMPLETE", "UNAVAILABLE"]
     is_valid: bool
     records_verified: int
     checkpoint_sequence: int | None = None

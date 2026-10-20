@@ -23,6 +23,7 @@ from backend.app.security.rate_limiter import (
     audit_verification_rate_limiter,
     login_rate_limiter,
 )
+from backend.app.services.checkpoint_runtime import checkpoint_scheduler
 
 
 def pytest_configure(config):
@@ -30,6 +31,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "aws_integration: opt-in tests that use real AWS S3 and an explicitly approved bucket",
+    )
+    config.addinivalue_line(
+        "markers",
+        "postgres_integration: opt-in tests that use an explicitly approved PostgreSQL test database",
     )
 
 
@@ -69,10 +74,12 @@ def reset_rate_limiter_fixture(db_session):
     login_rate_limiter.reset(db_session)
     audit_verification_rate_limiter.reset()
     audit_checkpoint_rate_limiter.reset()
+    checkpoint_scheduler.reset_state()
     yield
     login_rate_limiter.reset(db_session)
     audit_verification_rate_limiter.reset()
     audit_checkpoint_rate_limiter.reset()
+    checkpoint_scheduler.reset_state()
 
 
 @pytest.fixture

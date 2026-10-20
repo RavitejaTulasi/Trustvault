@@ -24,6 +24,7 @@ from backend.app.security.request_validation import (
     validate_request_id,
     validate_user_agent,
 )
+from backend.app.services.checkpoint_runtime import checkpoint_scheduler
 
 
 @asynccontextmanager
@@ -31,8 +32,11 @@ async def lifespan(app: FastAPI):
     # Ensure private storage directory exists on startup
     storage_path = settings.resolved_storage_path
     storage_path.mkdir(parents=True, exist_ok=True)
-    yield
-    # Shutdown cleanup if necessary
+    checkpoint_scheduler.start()
+    try:
+        yield
+    finally:
+        await checkpoint_scheduler.stop()
 
 
 app = FastAPI(

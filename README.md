@@ -13,7 +13,7 @@ TrustVault is a production-minded secure document sharing web application engine
   - **Viewer**: Read-only or read/edit access strictly constrained by active, unrevoked grants.
 - **Private Persistent Storage**: Document byte streams reside outside the web server root under 256-bit cryptographically random hex keys. Path traversal is strictly defended via filesystem containment checks.
 - **Immediate Revocation**: Revoking a grant takes effect on the very next request. No authorization caches or long-lived presigned URLs are used.
-- **Tamper-Evident Audit Trail**: All authentication, access, mutation, grant modifications, and access denials are recorded in an append-only cryptographic hash chain using SHA-256.
+- **Tamper-Evident Audit Trail**: All authentication, access, mutation, grant modifications, and access denials are recorded in an append-only cryptographic hash chain using SHA-256. Version 2 records bind the event ID, client IP, and user agent in addition to the chain fields, while version 1 records continue to verify unchanged.
 
 ---
 
@@ -49,7 +49,8 @@ TrustVault is a production-minded secure document sharing web application engine
 |                  Database Layer (SQLAlchemy 2.0 + Alembic)              |
 |                      Managed PostgreSQL / psycopg 3                     |
 |  - users, sessions, documents, document_grants, audit_events            |
-|  - Cryptographic Hash Chaining on audit_events                          |
+|  - audit_chain_state (serialized append sequence and chain head)        |
+|  - Versioned SHA-256 hash chain; actor identity locked by RESTRICT      |
 +-------------------------------------------------------------------------+
 ```
 
@@ -114,9 +115,19 @@ Run the full integration test suite with Pytest:
 pytest backend/tests/ -v
 ```
 
-All tests execute against an isolated in-memory database and evaluate live endpoints via HTTPX.
+All default tests are offline. Most use isolated in-memory SQLite; append-serialization tests use temporary file-backed SQLite so independent sessions contend for a real write lock. That is a portability check, not PostgreSQL verification.
 
-The default suite is fully offline. Real AWS S3 checkpoint integration tests are opt-in, skipped unless explicitly enabled, and require an independently approved test bucket; see [`docs/AWS_INTEGRATION_TESTING.md`](docs/AWS_INTEGRATION_TESTING.md). They have not been run against live AWS in this build.
+PostgreSQL append-concurrency verification is opt-in and creates an isolated temporary schema with eight concurrent writers:
+
+```powershell
+$env:TRUSTVAULT_POSTGRES_INTEGRATION = "1"
+$env:TRUSTVAULT_TEST_POSTGRES_URL = "postgresql+psycopg://user:password@host:5432/database"
+python -m pytest backend/tests/test_audit_concurrency_postgres.py -v
+```
+
+The PostgreSQL test is skipped by default and has not been run against a live database in this build. It verifies unique, contiguous sequence allocation and a consistent chain head; it does not exercise provider-side checkpoint anchoring.
+
+Real AWS S3 checkpoint integration tests are separately opt-in, skipped unless explicitly enabled, and require an independently approved test bucket; see [`docs/AWS_INTEGRATION_TESTING.md`](docs/AWS_INTEGRATION_TESTING.md). They have not been run against live AWS in this build.
 
 ---
 
@@ -149,7 +160,7 @@ The default suite is fully offline. Real AWS S3 checkpoint integration tests are
 1. **Hash Chaining vs. Superuser DB Rewrite**:
    - Hash chaining guarantees detection of record modification, sequence deletion, or mid-chain alteration.
    - However, an attacker with full SQL superuser access who rewrites the entire chain from an arbitrary sequence number forward cannot be detected by database-internal hashing alone.
-   - *Production Recommendation*: Stream audit records to write-once-read-many (WORM) storage (e.g. AWS S3 Object Lock) or publish periodic root hashes to an external timestamping authority.
+   - *Implemented Mitigation*: The application writes HMAC-protected checkpoints to an external `s3` adapter and schedules them at `AUDIT_CHECKPOINT_INTERVAL_SECONDS`. Production startup requires that adapter, but no live bucket has been verified in this build; configure provider-side versioning/Object Lock and verify checkpoint creation before relying on it.
 2. **Post-Download Revocation**:
    - Immediate revocation terminates access for the very next platform request.
    - Revocation cannot wipe a file that a recipient already downloaded to their physical workstation prior to revocation.

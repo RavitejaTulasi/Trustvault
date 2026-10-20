@@ -25,7 +25,7 @@ These tests use real boto3 clients, real AWS S3 requests, and a real bucket:
   `GET /api/v1/admin/audit/checkpoints/verify`) with a store built from
   application settings, including `available` semantics, `VALID`/`INVALID`
   outcomes after a chain rewrite, admin-only authorization, and a generic
-  `503`/`INCOMPLETE` fail-closed result for an unreachable provider.
+  `503`/`UNAVAILABLE` fail-closed result for an unreachable provider.
 - Fail-closed classification of access denial (using public AWS example
   credentials that can access nothing) and of missing credentials (in a
   sanitized subprocess with metadata disabled and no shared credentials).
@@ -41,10 +41,13 @@ They do **not** prove or validate:
   [ARCHITECTURE.md](ARCHITECTURE.md)).
 - Provider durability. The adapter trusts a successful `PutObject`
   acknowledgement; verification later requires a retrievable, HMAC-valid
-  checkpoint and otherwise reports `INCOMPLETE`.
+  checkpoint and otherwise reports a non-`VALID` status.
 - That an S3-compatible service honors conditional writes and read-after-write
   consistency. These tests target AWS S3. For other services, perform the
   concurrent-write preflight described in ARCHITECTURE.md.
+- Scheduled checkpoint creation, scheduler shutdown, or production startup
+  enforcement. Those paths are covered by offline unit tests; a live run does
+  not prove the scheduler created a checkpoint or that `/health` remains fresh.
 
 ## Prerequisites
 
@@ -175,7 +178,7 @@ skipped tests and the rest of the suite is unaffected.
 | `test_real_store_detects_tampered_object` | An overwritten object with an invalid HMAC raises `CheckpointIntegrityError`. |
 | test_api_checkpoint_lifecycle_against_real_bucket | Empty `available: false`, real `201 CREATED`, `available: true`, `VALID`, and post-rewrite `INVALID` through the API, with no bucket/prefix/hash/hmac leakage in responses. |
 | test_api_checkpoint_endpoints_require_admin_against_real_bucket | Anonymous `401`, viewer `403`, no anchor objects written, and no checkpoint audit events for denied calls. |
-| `test_api_reports_unreachable_provider_as_unavailable` | A real client pointed at an unreachable HTTPS endpoint yields `503` creation, `503` inspection, and `INCOMPLETE` verification (never `VALID`). |
+| `test_api_reports_unreachable_provider_as_unavailable` | A real client pointed at an unreachable HTTPS endpoint yields `503` creation, `503` inspection, and `UNAVAILABLE` verification (never `VALID`). |
 | `test_access_denied_is_classified_against_aws` | Public AWS example credentials produce `CheckpointStoreAccessDeniedError`, not a crash or a false success. Skips if AWS is unreachable from the environment. |
 | `test_missing_credentials_fail_closed_in_clean_subprocess` | In a subprocess with all `AWS_*` variables removed, metadata disabled, and no shared credentials file, `read_latest()` raises `CheckpointStoreUnavailableError`. |
 

@@ -10,6 +10,7 @@ from fastapi import APIRouter, Response, status
 from backend.app.config import settings
 from backend.app.database import check_db_connection
 from backend.app.schemas.health import HealthResponse
+from backend.app.services.checkpoint_runtime import build_audit_anchor_health
 
 router = APIRouter(tags=["Health & Status"])
 
@@ -18,7 +19,10 @@ router = APIRouter(tags=["Health & Status"])
     "/health",
     response_model=HealthResponse,
     summary="System Health & Readiness Check",
-    description="Validates database connectivity, private storage availability, and core service status.",
+    description=(
+        "Validates database connectivity, private storage availability, and "
+        "audit checkpoint scheduler status."
+    ),
 )
 def get_health(response: Response) -> HealthResponse:
     db_ok = check_db_connection()
@@ -37,21 +41,20 @@ def get_health(response: Response) -> HealthResponse:
     except OSError:
         storage_ok = False
 
-    is_healthy = db_ok and storage_ok
-    if not is_healthy:
+    core_healthy = db_ok and storage_ok
+    if not core_healthy:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
-    anchor_mode = settings.AUDIT_ANCHOR_MODE
-    # This reports configuration only; it does not probe the provider. A
-    # configured external adapter is not proof that anchoring is live.
-    anchor_status = {
-        "disabled": "not_configured",
-        "local_file": "local_development_only",
-        "s3": "external_provider_configured",
-    }.get(anchor_mode, "not_configured")
+    anchor = build_audit_anchor_health(settings)
+    if not core_healthy:
+        overall_status = "unhealthy"
+    elif not anchor.healthy:
+        overall_status = "degraded"
+    else:
+        overall_status = "healthy"
 
     return HealthResponse(
-        status="healthy" if is_healthy else "unhealthy",
+        status=overall_status,
         app=settings.APP_NAME,
         environment=settings.ENVIRONMENT,
         version="0.1.0",
@@ -64,10 +67,6 @@ def get_health(response: Response) -> HealthResponse:
                 "status": "ok" if storage_ok else "down",
                 "path": str(storage_path),
             },
-            "audit_anchor": {
-                "status": anchor_status,
-                "mode": anchor_mode,
-                "independent": anchor_mode == "s3",
-            },
+            "audit_anchor": anchor.details,
         },
     )

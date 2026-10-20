@@ -3,7 +3,7 @@ Day 7 Tests for Independently Stored Audit-Chain Checkpoints
 
 Covers checkpoint creation over verified prefixes, refusal on invalid or
 incomplete chains, checkpoint/chain comparison, rewrite and truncation
-detection, monotonicity and conflict handling, unavailable anchors, retries,
+detection, monotonicity and conflict handling, unavailable anchors and entities, retries,
 administrative authorization, no-cache/no-hash responses, preserved Day 6.1
 bounds and rate limiting, configuration validation, and historical-record
 immutability.
@@ -148,6 +148,10 @@ def _rewrite_chain(db: Session, *, start_sequence: int, action: str) -> None:
             request_id=event.request_id,
             details_str=event.details,
             previous_hash=previous_hash,
+            event_id=event.id,
+            ip_address=event.ip_address,
+            user_agent=event.user_agent,
+            hash_version=event.hash_version,
         )
         previous_hash = event.record_hash
     db.commit()
@@ -240,7 +244,19 @@ def test_create_checkpoint_retry_is_idempotent(
     assert len(list((tmp_path / "audit_checkpoints").glob("checkpoint-*.json"))) == 1
 
 
-def test_create_checkpoint_allows_empty_chain(
+def test_empty_chain_without_checkpoint_is_incomplete(
+    db_session: Session, checkpoint_store: LocalFileCheckpointStore
+):
+    verification = _verify_checkpoint(db_session, checkpoint_store)
+
+    assert verification.status == "INCOMPLETE"
+    assert verification.records_verified == 0
+    assert verification.checkpoint_sequence is None
+    assert verification.chain_head_sequence is None
+    assert "no checkpoint" in (verification.failure_reason or "").lower()
+
+
+def test_genesis_checkpoint_does_not_make_empty_or_extended_chain_valid(
     db_session: Session, checkpoint_store: LocalFileCheckpointStore
 ):
     result = _create_checkpoint(db_session, checkpoint_store)
@@ -248,16 +264,24 @@ def test_create_checkpoint_allows_empty_chain(
     assert result.checkpoint.record_hash == GENESIS_HASH
 
     verification = _verify_checkpoint(db_session, checkpoint_store)
-    assert verification.status == "VALID"
+    assert verification.status == "INCOMPLETE"
     assert verification.records_verified == 0
     assert verification.checkpoint_sequence == 0
     assert verification.chain_head_sequence == 0
+    assert "genesis checkpoint" in (verification.failure_reason or "").lower()
 
     _add_event(db_session, action="test.checkpoint.empty.extended")
     extended = _verify_checkpoint(db_session, checkpoint_store)
-    assert extended.status == "VALID"
+    assert extended.status == "INCOMPLETE"
     assert extended.checkpoint_sequence == 0
     assert extended.chain_head_sequence == 1
+
+    anchored = _create_checkpoint(db_session, checkpoint_store)
+    assert anchored.checkpoint.sequence_number == 1
+    non_genesis = _verify_checkpoint(db_session, checkpoint_store)
+    assert non_genesis.status == "VALID"
+    assert non_genesis.checkpoint_sequence == 1
+    assert non_genesis.chain_head_sequence == 1
 
 
 def test_create_checkpoint_detects_anchor_ahead_of_chain(
@@ -408,14 +432,14 @@ def test_verify_detects_missing_checkpointed_sequence(
     assert "no longer exists" in (result.failure_reason or "")
 
 
-def test_verify_returns_incomplete_when_anchor_unavailable(
+def test_verify_returns_unavailable_when_anchor_unavailable(
     db_session: Session,
 ):
     _add_event(db_session, action="test.checkpoint.unavailable")
 
     result = _verify_checkpoint(db_session, UnavailableCheckpointStore())
 
-    assert result.status == "INCOMPLETE"
+    assert result.status == "UNAVAILABLE"
     assert result.records_verified == 1
     assert result.checkpoint_sequence is None
     assert "unavailable" in (result.failure_reason or "").lower()
@@ -459,6 +483,11 @@ def test_local_anchor_is_rejected_in_production():
         Settings(
             _env_file=None,
             ENVIRONMENT="production",
+            SESSION_COOKIE_SECURE=True,
+            DATABASE_URL=(
+                "postgresql+psycopg://trustvault_app:test-only-db-password"
+                "@db:5432/trustvault"
+            ),
             AUDIT_ANCHOR_MODE="local_file",
             AUDIT_ANCHOR_HMAC_KEY="k" * 64,
         )
@@ -634,7 +663,7 @@ async def test_checkpoint_api_fails_closed_when_anchor_unavailable(
     verify = await async_client.get("/api/v1/admin/audit/checkpoints/verify")
     assert verify.status_code == 200, verify.text
     data = verify.json()
-    assert data["status"] == "INCOMPLETE"
+    assert data["status"] == "UNAVAILABLE"
     assert data["is_valid"] is False
     assert data["anchor_mode"] == "disabled"
     assert "unavailable" in (data["failure_reason"] or "").lower()
@@ -705,7 +734,7 @@ async def test_checkpoint_verify_is_rate_limited_and_separate(
     for _ in range(limit):
         response = await async_client.get("/api/v1/admin/audit/checkpoints/verify")
         assert response.status_code == 200, response.text
-        assert response.json()["status"] == "INCOMPLETE"
+        assert response.json()["status"] == "UNAVAILABLE"
 
     blocked = await async_client.get("/api/v1/admin/audit/checkpoints/verify")
     assert blocked.status_code == 429
@@ -802,11 +831,12 @@ async def test_health_reports_anchor_mode(
     response = await async_client.get("/health")
     assert response.status_code == 200
     anchor = response.json()["components"]["audit_anchor"]
-    assert anchor == {
-        "status": "not_configured",
-        "mode": "disabled",
-        "independent": False,
-    }
+    assert anchor["status"] == "not_configured"
+    assert anchor["mode"] == "disabled"
+    assert anchor["independent"] is False
+    assert anchor["available"] is False
+    assert anchor["overdue"] is False
+    assert anchor["scheduler"]["running"] is False
 
     monkeypatch.setattr(settings, "AUDIT_ANCHOR_MODE", "local_file")
     local_response = await async_client.get("/health")

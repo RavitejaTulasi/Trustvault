@@ -49,11 +49,9 @@ from backend.app.services.checkpoint_store import (
     CheckpointIntegrityError,
     CheckpointStore,
     CheckpointStoreUnavailableError,
-    LocalFileCheckpointStore,
-    S3CheckpointStore,
-    UnavailableCheckpointStore,
     create_s3_client,
 )
+from backend.app.services.checkpoint_store_factory import create_checkpoint_store
 
 router = APIRouter(prefix="/admin", tags=["Admin – Audit Trail"])
 logger = logging.getLogger(__name__)
@@ -158,41 +156,7 @@ def get_checkpoint_store() -> CheckpointStore:
     external anchor exists. Provider credentials are never read here; the S3
     client uses the AWS default credential chain.
     """
-    if settings.AUDIT_ANCHOR_MODE == "local_file":
-        try:
-            return LocalFileCheckpointStore(
-                settings.resolved_audit_anchor_path,
-                settings.AUDIT_ANCHOR_HMAC_KEY.encode("utf-8"),
-            )
-        except (OSError, ValueError):
-            logger.error("Audit checkpoint store initialization failed")
-    elif settings.AUDIT_ANCHOR_MODE == "s3":
-        try:
-            client = create_s3_client(
-                region=settings.AUDIT_ANCHOR_S3_REGION,
-                endpoint_url=settings.AUDIT_ANCHOR_S3_ENDPOINT_URL or None,
-                connect_timeout_seconds=settings.AUDIT_ANCHOR_S3_CONNECT_TIMEOUT_SECONDS,
-                read_timeout_seconds=settings.AUDIT_ANCHOR_S3_READ_TIMEOUT_SECONDS,
-                max_attempts=settings.AUDIT_ANCHOR_S3_MAX_ATTEMPTS,
-            )
-            if client is None:
-                logger.error(
-                    "Audit checkpoint S3 adapter is unavailable because boto3 "
-                    "is not installed"
-                )
-                return UnavailableCheckpointStore()
-            return S3CheckpointStore(
-                settings.AUDIT_ANCHOR_S3_BUCKET,
-                hmac_key=settings.AUDIT_ANCHOR_HMAC_KEY.encode("utf-8"),
-                client=client,
-                prefix=settings.AUDIT_ANCHOR_S3_PREFIX,
-                object_lock_mode=settings.AUDIT_ANCHOR_S3_OBJECT_LOCK_MODE or None,
-                object_lock_retain_days=settings.AUDIT_ANCHOR_S3_OBJECT_LOCK_DAYS,
-                kms_key_id=settings.AUDIT_ANCHOR_S3_KMS_KEY_ID or None,
-            )
-        except Exception:  # noqa: BLE001 - fail closed on client/config errors
-            logger.error("Audit checkpoint store initialization failed")
-    return UnavailableCheckpointStore()
+    return create_checkpoint_store(settings, s3_client_factory=create_s3_client)
 
 
 def _enforce_checkpoint_rate_limit(actor_id: str) -> None:
@@ -225,23 +189,15 @@ def _record_checkpoint_failure(
             outcome=AuditOutcome.FAILURE,
             actor_id=actor_id,
             resource_type="audit",
-            ip_address=_get_client_ip(request) or "127.0.0.1",
-            user_agent=request.headers.get("User-Agent"),
-            request_id=getattr(request.state, "request_id", None),
+            ip_address=request.state.client_ip,
+            user_agent=request.state.user_agent,
+            request_id=request.state.request_id,
             details={"reason": reason},
         )
         db.commit()
     except SQLAlchemyError:
         db.rollback()
         logger.warning("Failed to persist audit checkpoint failure event")
-
-
-def _get_client_ip(request: Request) -> str | None:
-    """Extract the best-effort client IP, honoring a forwarding proxy header."""
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    return request.client.host if request.client else None
 
 
 def _record_admin_audit_read(
@@ -266,9 +222,9 @@ def _record_admin_audit_read(
             outcome=AuditOutcome.SUCCESS,
             actor_id=actor_id,
             resource_type="audit",
-            ip_address=_get_client_ip(request) or "127.0.0.1",
-            user_agent=request.headers.get("User-Agent"),
-            request_id=getattr(request.state, "request_id", None),
+            ip_address=request.state.client_ip,
+            user_agent=request.state.user_agent,
+            request_id=request.state.request_id,
             details=details,
         )
         db.commit()
@@ -534,8 +490,9 @@ def get_audit_checkpoint(
     description=(
         "Admin only. Performs a bounded verification of the live audit chain and "
         "compares the checkpointed sequence and hash with the independently stored "
-        "checkpoint. An unavailable anchor, a missing checkpoint, or a bounded "
-        "verification limit produces INCOMPLETE rather than VALID. Raw hashes are "
+        "checkpoint. An unavailable or access-denied provider produces UNAVAILABLE; "
+        "a missing checkpoint, a genesis-only checkpoint, or a bounded verification "
+        "limit produces INCOMPLETE; neither is reported as VALID. Raw hashes are "
         "never returned."
     ),
 )

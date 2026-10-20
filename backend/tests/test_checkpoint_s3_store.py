@@ -710,7 +710,7 @@ def test_s3_service_access_denied_never_returns_valid(
     fake_s3_client.fail_list = FakeS3Error("AccessDenied")
 
     result = _verify_checkpoint(db_session, s3_store)
-    assert result.status == "INCOMPLETE"
+    assert result.status == "UNAVAILABLE"
     assert result.status != "VALID"
     assert "denied" in (result.failure_reason or "").lower()
 
@@ -719,14 +719,14 @@ def test_s3_service_access_denied_never_returns_valid(
     assert exc.value.reason == "anchor_access_denied"
 
 
-def test_s3_service_unavailable_reports_incomplete(
+def test_s3_service_unavailable_reports_unavailable(
     db_session: Session, s3_store: S3CheckpointStore, fake_s3_client: FakeS3Client
 ):
     _add_event(db_session, action="test.s3.unavailable")
     fake_s3_client.fail_list = EndpointConnectionError("connection failed")
 
     result = _verify_checkpoint(db_session, s3_store)
-    assert result.status == "INCOMPLETE"
+    assert result.status == "UNAVAILABLE"
     assert result.status != "VALID"
 
     with pytest.raises(CheckpointCreationError) as exc:
@@ -823,7 +823,7 @@ async def test_s3_api_access_denied_fails_closed_without_leaking_provider_detail
     verify = await async_client.get("/api/v1/admin/audit/checkpoints/verify")
     assert verify.status_code == 200, verify.text
     verify_data = verify.json()
-    assert verify_data["status"] == "INCOMPLETE"
+    assert verify_data["status"] == "UNAVAILABLE"
     assert verify_data["is_valid"] is False
     assert "denied" in (verify_data["failure_reason"] or "").lower()
 
@@ -851,23 +851,25 @@ async def test_s3_api_unavailable_returns_generic_503(
 
     verify = await async_client.get("/api/v1/admin/audit/checkpoints/verify")
     assert verify.status_code == 200
-    assert verify.json()["status"] == "INCOMPLETE"
+    assert verify.json()["status"] == "UNAVAILABLE"
 
 
 @pytest.mark.asyncio
-async def test_health_reports_external_provider_configuration_only(
+async def test_health_reports_unstarted_external_anchor_as_degraded(
     async_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setattr(settings, "AUDIT_ANCHOR_MODE", "s3")
 
     response = await async_client.get("/health")
     assert response.status_code == 200
-    anchor = response.json()["components"]["audit_anchor"]
-    assert anchor == {
-        "status": "external_provider_configured",
-        "mode": "s3",
-        "independent": True,
-    }
+    data = response.json()
+    assert data["status"] == "degraded"
+    anchor = data["components"]["audit_anchor"]
+    assert anchor["status"] == "scheduler_stopped"
+    assert anchor["mode"] == "s3"
+    assert anchor["independent"] is True
+    assert anchor["available"] is False
+    assert anchor["scheduler"]["running"] is False
 
 
 @pytest.mark.asyncio
