@@ -128,8 +128,8 @@ No seed script ships in this repository, so these accounts are not created autom
 
 | Role | Email | Password | Permissions Scope |
 |---|---|---|---|
-| **Administrator** | `local-owner@example.com` | `Localowner@123` | User management, audit trail inspection |
-| **Document Owner** | `you@example.com` | `Youexample@1` | Upload, download, edit, delete own docs, grant/revoke sharing |
+| **Administrator** |`you@example.com` | `Youexample@1`  | User management, audit trail inspection |
+| **Document Owner** | `local-owner@example.com` | `Localowner@123` | Upload, download, edit, delete own docs, grant/revoke sharing |
 | **Viewer** | `local-reader@example.com` | `Localviewer@123` | Read & download explicitly granted documents |
 
 ---
