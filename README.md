@@ -11,68 +11,16 @@ TrustVault is a production-minded secure document sharing web application engine
   - **Administrator**: Governance, user lifecycle, and audit investigations. *Administrators cannot read or download document contents without explicit owner grants.*
   - **Document Owner**: Exclusive lifecycle control over their own documents (upload, read, download, edit, delete, grant permissions, revoke permissions).
   - **Viewer**: Read-only or read/edit access strictly constrained by active, unrevoked grants.
-- **Private Persistent Storage**: Document byte streams reside outside the web server root under 256-bit cryptographically random hex keys. Uploads are written to private staging, fsynced, and atomically published before the database commit; startup reconciliation cleans crash debris. Path traversal is strictly defended via filesystem containment checks.
-- **Immediate Revocation**: Revoking a grant takes effect on the very next request. No authorization caches or long-lived presigned URLs are used.
-- **Tamper-Evident Audit Trail**: All authentication, access, mutation, grant modifications, and access denials are recorded in an append-only cryptographic hash chain using SHA-256. Version 2 records bind the event ID, client IP, and user agent in addition to the chain fields, while version 1 records continue to verify unchanged.
+- **Private Persistent Storage**: Document byte streams reside outside the web root under 256-bit cryptographically random hex keys.
+- **Immediate Revocation**: Revoking a grant takes effect on the next request.
+- **Tamper-Evident Audit Trail**: Versioned SHA-256 hash chaining with actor identity binding and HMAC-protected, externally anchorable checkpoints.
+- **Premium Interaction Layer**: Website-wide pointer-responsive spotlight, speed-sensitive 3D cinematic vault, and consistent, high-visibility card hover interactions (lift, border, glow).
 
 ---
 
 ## Architecture Overview
 
-```
-+-------------------------------------------------------------------------+
-|                              Client Browser                             |
-|        (React 18 + Vite SPA, Vanilla CSS Design System, CSRF Headers)   |
-+-------------------------------------------------------------------------+
-                                     |
-                                     | HTTPS / HTTP-Only Cookies / CSRF Tokens
-                                     v
-+-------------------------------------------------------------------------+
-|                             FastAPI Backend                             |
-|  - Request ID & Security Headers Middleware (nosniff, DENY, CSP)        |
-|  - Session Authentication Middleware (Argon2, Server-side sessions)    |
-|  - Rate Limiter (Shared database-backed fixed window on login)          |
-+-------------------------------------------------------------------------+
-       |                                          |
-       v                                          v
-+----------------------------------+   +----------------------------------+
-| Central Authorization Service    |   | Private Persistent Storage       |
-| (backend/app/services/           |   | (Outside Web Root)               |
-|  authorization.py)               |   | - 256-bit unguessable keys       |
-|  - Evaluates active session      |   | - Path traversal containment     |
-|  - Evaluates document ownership  |   | - 10MB chunked stream validation |
-|  - Evaluates active grant status |   +----------------------------------+
-+----------------------------------+
-       |
-       v
-+-------------------------------------------------------------------------+
-|                  Database Layer (SQLAlchemy 2.0 + Alembic)              |
-|                      Managed PostgreSQL / psycopg 3                     |
-|  - users, sessions, documents, document_grants, audit_events            |
-|  - audit_chain_state (serialized append sequence and chain head)        |
-|  - login_rate_limit_buckets (shared, expiring login counters)           |
-|  - Versioned SHA-256 hash chain; actor identity locked by RESTRICT      |
-+-------------------------------------------------------------------------+
-```
-
----
-
-## 7-Day Implementation Plan & Current Status
-
-- [x] **Day 1: Project Foundation, Health Check & Threat Modeling**
-  - Project scaffolding, Git setup, and clean environment configuration.
-  - Core database schema (Users, Sessions, Documents, Grants, Audit Events, Versions) & Alembic migration.
-  - FastAPI application with security middleware (Request ID, nosniff, DENY, CSP).
-  - Liveness & readiness health check endpoint (`GET /health` & `GET /api/v1/health`).
-  - Cryptographic audit trail service with SHA-256 hash chaining and tamper detection.
-  - Automated integration tests (Pytest + HTTPX).
-  - Comprehensive threat model (`THREATS.md`), AI prompt logs (`PROMPTS.md`), and architecture documentation (`docs/ARCHITECTURE.md`).
-- [ ] **Day 2: Authentication, Sessions, Roles & Centralized Authorization Policy**
-- [ ] **Day 3: Private Storage, File Uploads, Validation, Downloads & Versioning**
-- [ ] **Day 4: Granular Permissions, Immediate Revocation & Audit Verification APIs**
-- [ ] **Day 5: React + Vite Frontend, Search & Administrator Forensics Dashboard**
-- [ ] **Day 6: Attack-Oriented Security Testing Suite & Defect Remediation**
-- [ ] **Day 7: Live Cloud Deployment, Authorization-Removal Experiment & Demo Video**
+(See `docs/ARCHITECTURE.md` for details)
 
 ---
 
@@ -117,7 +65,7 @@ Visit:
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`, and `SECRET_KEY` must be set in `.env`. Compose refuses to start when any are missing.
 - The backend runs with `ENVIRONMENT=production` and `SESSION_COOKIE_SECURE=true`.
 - Startup rejects SQLite, missing database credentials, known default database passwords, insecure session cookies, and environment values that are not exactly `development`, `production`, or `testing`.
-- Production also rejects `AUDIT_ANCHOR_MODE=disabled` and `local_file`; an external `s3` checkpoint anchor with `AUDIT_ANCHOR_S3_BUCKET`, `AUDIT_ANCHOR_S3_REGION`, and a strong `AUDIT_ANCHOR_HMAC_KEY` is required. The scheduled checkpoint worker starts with the application.
+- Production rejects `AUDIT_ANCHOR_MODE=disabled`. The deployment templates use HMAC-protected `local_file` checkpoints on persistent storage; these are not independent of the application host and do not protect against host compromise. External checkpoint adapters are not included in this build. The scheduled checkpoint worker starts with the application.
 - Login rate limits are stored in the shared database and survive restarts and multiple workers. Run `alembic upgrade head` before starting a new deployment.
 - `TRUSTED_PROXY_IPS` is empty by default because the Compose backend port is published directly. Set it only to the specific CIDR(s) of a reverse proxy you control. `X-Forwarded-For` is ignored from every other peer.
 
@@ -129,15 +77,13 @@ POSTGRES_PASSWORD=<strong-unique-password>
 POSTGRES_DB=trustvault
 DATABASE_URL=postgresql+psycopg://trustvault_app:<url-encoded-strong-password>@db:5432/trustvault
 SECRET_KEY=<at-least-32-random-bytes>
-AUDIT_ANCHOR_MODE=s3
-AUDIT_ANCHOR_S3_BUCKET=<independently-controlled-bucket>
-AUDIT_ANCHOR_S3_REGION=<aws-region>
+AUDIT_ANCHOR_MODE=local_file
 AUDIT_ANCHOR_HMAC_KEY=<at-least-32-random-bytes>
 ```
 
-`POSTGRES_PASSWORD` is consumed by PostgreSQL directly. `DATABASE_URL` must contain the URL-encoded form of the same password. Generate values with `openssl rand -hex 32` and percent-encode URL-reserved characters in the URL. AWS credentials are supplied through the SDK's default credential chain, not this file. See `docs/ARCHITECTURE.md` for the provider setup and least-privilege policy.
+`POSTGRES_PASSWORD` is consumed by PostgreSQL directly. `DATABASE_URL` must contain the URL-encoded form of the same password. Generate values with `openssl rand -hex 32` and percent-encode URL-reserved characters in the URL.
 
-`GET /health` exposes `components.audit_anchor` with the scheduler's last attempt/success/failure and an `overdue` flag. Top-level status becomes `degraded` when anchoring is unavailable or overdue; alert on any status other than `healthy`. The S3 adapter has not been exercised against a live bucket in this build, so production anchoring remains an operator-verified deployment step.
+`GET /health` exposes `components.audit_anchor` with the scheduler's last attempt/success/failure and an `overdue` flag. Local-file anchoring is reported as `local_only` unless the checkpoint is overdue, and keeps overall health degraded in production because it is not independent of the app host. Top-level status also becomes `degraded` when anchoring is unavailable or overdue; alert on any status other than `healthy`. External checkpoint adapters are not included in this build.
 
 Validate the resolved Compose configuration, apply migrations, then start:
 
@@ -149,7 +95,9 @@ docker compose up --build -d
 
 The local SQLite configuration in `.env.example` is for development only and is rejected when `ENVIRONMENT=production`.
 
-For Render, `render.yaml` leaves `TRUSTED_PROXY_IPS` as a dashboard-supplied value (`sync: false`). Verify the actual deployment's proxy addresses with the provider or your network tooling, then configure `TRUSTED_PROXY_IPS` with the exact CIDR(s) for your service before relying on forwarded client IPs for rate limiting or audit attribution. Until it is configured, the application safely ignores `X-Forwarded-For` and uses the immediate peer address; if that peer is a shared proxy, clients may share the same login limit.
+The Render blueprint deploys the API, PostgreSQL, and frontend together in one Docker web service. The API serves the built frontend at `/` and serves API routes on the same origin, preserving the existing `SameSite=Lax` session and CSRF cookie behavior. This avoids split-origin authentication problems with Render's shared `onrender.com` domains. If you rename the web service or attach a custom domain, update `CORS_ORIGINS` to that exact origin.
+
+`TRUSTED_PROXY_IPS` is empty by default. Until you configure exact trusted proxy CIDRs, the app safely ignores `X-Forwarded-For` and uses the immediate peer address; if that peer is a shared proxy, clients may share the same login limit.
 
 ---
 
@@ -170,9 +118,7 @@ $env:TRUSTVAULT_TEST_POSTGRES_URL = "postgresql+psycopg://user:password@host:543
 python -m pytest backend/tests/test_audit_concurrency_postgres.py backend/tests/test_postgres_audit_transactions.py backend/tests/test_postgres_grant_concurrency.py backend/tests/test_postgres_login_rate_limit.py backend/tests/test_postgres_storage_quota.py backend/tests/test_postgres_checkpoint_concurrency.py -v
 ```
 
-The suite is skipped by default. In this build it was executed against a local PostgreSQL 16 instance: 287 tests passed with the PostgreSQL modules enabled and 8 opt-in AWS tests skipped. That run verifies database-level serialization, the revoke-wins grant path, and the Alembic upgrade/downgrade path for the new grant column. It is not a production-scale load test, and it does not exercise provider-side checkpoint anchoring.
-
-Real AWS S3 checkpoint integration tests are separately opt-in, skipped unless explicitly enabled, and require an independently approved test bucket; see [`docs/AWS_INTEGRATION_TESTING.md`](docs/AWS_INTEGRATION_TESTING.md). They have not been run against live AWS in this build.
+The suite is skipped by default. In this build it was executed against a local PostgreSQL 16 instance: 287 tests passed with the PostgreSQL modules enabled. That run verifies database-level serialization, the revoke-wins grant path, and the Alembic upgrade/downgrade path for the new grant column. It is not a production-scale load test.
 
 ---
 
@@ -182,9 +128,9 @@ No seed script ships in this repository, so these accounts are not created autom
 
 | Role | Email | Password | Permissions Scope |
 |---|---|---|---|
-| **Administrator** | `admin@trustvault.local` | `AdminSecurePass123!` | User management, audit trail inspection |
-| **Document Owner** | `owner@trustvault.local` | `OwnerSecurePass123!` | Upload, download, edit, delete own docs, grant/revoke sharing |
-| **Viewer** | `viewer@trustvault.local` | `ViewerSecurePass123!` | Read & download explicitly granted documents |
+| **Administrator** |`you@example.com` | `Youexample@1`  | User management, audit trail inspection |
+| **Document Owner** | `local-owner@example.com` | `Localowner@123` | Upload, download, edit, delete own docs, grant/revoke sharing |
+| **Viewer** | `local-reader@example.com` | `Localviewer@123` | Read & download explicitly granted documents |
 
 ---
 
@@ -201,13 +147,8 @@ No seed script ships in this repository, so these accounts are not created autom
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | Fixed window duration for shared login rate limiting. | `300` |
 | `LOGIN_RATE_LIMIT_MAX_BUCKETS` | Maximum retained shared limiter buckets; new attempts fail closed when full. | `50000` |
 | `TRUSTED_PROXY_IPS` | Comma-separated proxy CIDRs allowed to supply `X-Forwarded-For`. Empty disables forwarding-header trust. Wildcards are rejected. | Empty |
-| `AUDIT_ANCHOR_MODE` | Checkpoint adapter: `disabled`, development-only `local_file`, or external `s3`. Production requires `s3` and fails startup otherwise. | `disabled` |
-| `AUDIT_ANCHOR_HMAC_KEY` | HMAC key (at least 32 characters) protecting checkpoint documents; required for `local_file` and `s3`. | Empty |
-| `AUDIT_ANCHOR_S3_BUCKET` / `AUDIT_ANCHOR_S3_REGION` | Externally controlled bucket and region; required for `s3`. Credentials come from the AWS default credential chain. | Empty |
-| `AUDIT_ANCHOR_S3_PREFIX` | Object key prefix for checkpoint documents. | `trustvault-audit-checkpoints` |
-| `AUDIT_ANCHOR_S3_ENDPOINT_URL` | Optional custom S3-compatible endpoint; must use HTTPS in production. | Empty |
-| `AUDIT_ANCHOR_S3_KMS_KEY_ID` | Optional KMS key for server-side checkpoint encryption. | Empty |
-| `AUDIT_ANCHOR_S3_OBJECT_LOCK_MODE` / `AUDIT_ANCHOR_S3_OBJECT_LOCK_DAYS` | Optional provider-side retention request (`GOVERNANCE` or `COMPLIANCE`). | Empty / `30` |
+| `AUDIT_ANCHOR_MODE` | Checkpoint storage: `disabled` or same-host `local_file`. Production rejects `disabled`; `local_file` keeps health degraded because it is not independent. | `disabled` |
+| `AUDIT_ANCHOR_HMAC_KEY` | HMAC key (at least 32 characters) protecting checkpoint documents; required for `local_file`. | Empty |
 | `AUDIT_CHECKPOINT_INTERVAL_SECONDS` | Interval between scheduled checkpoint attempts when anchoring is enabled. | `3600` |
 | `AUDIT_CHECKPOINT_MAX_AGE_SECONDS` | Age after which health marks the anchor overdue; must be at least the interval. | `7200` |
 | `AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS` / `AUDIT_CHECKPOINT_RATE_LIMIT_WINDOW_SECONDS` | Per-administrator checkpoint API limiter. | `5` / `60` |
@@ -229,7 +170,7 @@ No seed script ships in this repository, so these accounts are not created autom
 1. **Hash Chaining vs. Superuser DB Rewrite**:
    - Hash chaining guarantees detection of record modification, sequence deletion, or mid-chain alteration.
    - However, an attacker with full SQL superuser access who rewrites the entire chain from an arbitrary sequence number forward cannot be detected by database-internal hashing alone.
-   - *Implemented Mitigation*: The application writes HMAC-protected checkpoints to an external `s3` adapter and schedules them at `AUDIT_CHECKPOINT_INTERVAL_SECONDS`. Production startup requires that adapter, but no live bucket has been verified in this build; configure provider-side versioning/Object Lock and verify checkpoint creation before relying on it.
+   - *Implemented Mitigation*: The application writes HMAC-protected checkpoints and schedules them at `AUDIT_CHECKPOINT_INTERVAL_SECONDS`. Deployment templates currently use `local_file` on persistent storage; it shares the application host and is not independent protection. External checkpoint adapters are not included in this build, so this risk remains partially mitigated.
 2. **Post-Download Revocation**:
    - Immediate revocation terminates access for the very next platform request.
    - Revocation cannot wipe a file that a recipient already downloaded to their physical workstation prior to revocation.

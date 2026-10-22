@@ -1,0 +1,124 @@
+@layer reset, tokens, base, primitives, components, pages, utilities;
+
+@layer tokens {
+  :root {
+    --font-sans: 'Instrument Sans Variable', 'Instrument Sans', 'Segoe UI', sans-serif;
+    --font-display: 'Instrument Sans Variable', 'Instrument Sans', 'Segoe UI', sans-serif;
+    --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, Consolas, monospace;
+
+    --color-obsidian-950: #040705;
+    --color-obsidian-900: #060b08;
+    --color-charcoal-900: #08100c;
+    --color-charcoal-850: #0b1511;
+    --color-charcoal-800: #0f1c17;
+    --color-charcoal-750: #14241d;
+    --color-charcoal-700: #1a2e25;
+    --color-charcoal-600: #234034;
+
+    --color-mint-200: #dcffef;
+    --color-mint-300: #b5ffe0;
+    --color-mint-400: #8df5c8;
+    --color-mint-500: #62e3b2;
+    --color-mint-600: #33bb8d;
+    --color-mint-700: #1c8263;
+    --color-violet-300: #d3dbff;
+    --color-violet-400: #aab6ff;
+    --color-violet-500: #8794f2;
+    --color-bone: #eef5ef;
+    --color-bone-strong: #ffffff;
+    --color-muted: #93a79e;
+    --color-muted-strong: #b4c5bc;
+    --color-subtle: #6b7f75;
+    --color-success: #6af0bd;
+    --color-warning: #f0c987;
+    --color-danger: #ff9d8f;
+    --color-info: #a9c6ff;
+
+    --bg-canvas: var(--color-obsidian-950);
+    --bg-surface: var(--color-charcoal-900);
+    --bg-raised: var(--color-charcoal-850);
+    --bg-elevated: var(--color-charcoal-800);
+    --bg-inset: rgba(3, 7, 5, 0.62);
+    --bg-hover: rgba(141, 245, 200, 0.055);
+    --bg-active: rgba(141, 245, 200, 0.1);
+
+    --text-primary: var(--color-bone);
+    --text-secondary: var(--color-muted);
+    --text-tertiary: var(--color-subtle);
+    --text-inverse: #04120c;
+
+    --border-subtle: rgba(171, 214, 196, 0.085);
+    --border-default: rgba(171, 220, 200, 0.145);
+    --border-strong: rgba(174, 233, 209, 0.26);
+
+    --accent: var(--color-mint-400);
+    --accent-strong: var(--color-mint-300);
+    --accent-muted: var(--color-mint-600);
+    --accent-soft: rgba(98, 227, 178, 0.1);
+    --accent-line: rgba(141, 245, 200, 0.34);
+    --violet: var(--color-violet-400);
+    --violet-soft: rgba(170, 182, 255, 0.1);
+
+    --focus-ring: 0 0 0 2px var(--bg-canvas), 0 0 0 4px rgba(141, 245, 200, 0.72);
+    --focus-outline-color: var(--color-mint-300);
+
+    --radius-xs: 2px;
+    --radius-sm: 4px;
+    --radius-md: 7px;
+    --radius-lg: 10px;
+    --radius-xl: 14px;
+    --radius-2xl: 18px;
+    --radius-pill: 999px;
+
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 20px;
+    --space-6: 24px;
+    --space-7: 28px;
+    --space-8: 32px;
+    --space-10: 40px;
+    --space-12: 48px;
+    --space-16: 64px;
+
+    --shadow-sm: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 1px 0 rgba(255, 255, 255, 0.025) inset, 0 18px 44px -28px rgba(0, 0, 0, 0.9);
+    --shadow-lg: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 38px 100px -44px rgba(0, 0, 0, 0.95);
+    --shadow-accent: 0 24px 70px -34px rgba(98, 227, 178, 0.5);
+
+    --duration-fast: 160ms;
+    --duration-base: 240ms;
+    --duration-slow: 480ms;
+    --duration-slower: 760ms;
+    --motion-lift: -2px;
+    --motion-scale: 1.012;
+    --ease-standard: cubic-bezier(0.2, 0.7, 0.2, 1);
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
+    --sidebar-width: 248px;
+    --topbar-height: 64px;
+    --content-width: 1280px;
+
+    --gradient-mint: linear-gradient(135deg, #e6fff5 0%, #8df5c8 46%, #35b489 100%);
+    --gradient-violet: linear-gradient(135deg, #dbe1ff, #8794f2);
+    --gradient-panel: linear-gradient(158deg, rgba(23, 39, 32, 0.68), rgba(7, 13, 10, 0.94));
+    --gradient-shell: radial-gradient(980px 640px at 12% -12%, rgba(98, 227, 178, 0.08), transparent 60%),
+      radial-gradient(760px 560px at 96% 8%, rgba(135, 148, 242, 0.055), transparent 58%),
+      linear-gradient(180deg, #060b08 0%, #040705 100%);
+    --gradient-hairline: linear-gradient(90deg, transparent, rgba(141, 245, 200, 0.35), transparent);
+    --grid-line: rgba(175, 219, 199, 0.045);
+    --panel-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent 34%);
+
+    --tracking-caps: 0.14em;
+
+    --text: var(--text-secondary);
+    --text-h: var(--text-primary);
+    --bg: var(--bg-canvas);
+    --border: var(--border-default);
+    --mono: var(--font-mono);
+    --sans: var(--font-sans);
+    --heading: var(--font-display);
+  }
+}

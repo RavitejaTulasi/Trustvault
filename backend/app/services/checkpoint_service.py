@@ -2,8 +2,8 @@
 Audit-Chain Checkpoint Creation and Verification
 
 Creation only checkpoints a verified, committed prefix. Verification compares
-the live audit chain against the independently stored checkpoint and fails
-closed: an unavailable anchor never produces a VALID result.
+the live audit chain against the stored checkpoint and fails closed: an
+unavailable store never produces a VALID result.
 """
 
 import hmac
@@ -28,7 +28,6 @@ from backend.app.services.checkpoint_store import (
     CheckpointIntegrityError,
     CheckpointRollbackError,
     CheckpointStore,
-    CheckpointStoreAccessDeniedError,
     CheckpointStoreUnavailableError,
 )
 
@@ -109,8 +108,6 @@ class CheckpointService:
 
         try:
             existing = store.read_latest()
-        except CheckpointStoreAccessDeniedError:
-            raise CheckpointCreationError("anchor_access_denied") from None
         except CheckpointStoreUnavailableError:
             raise CheckpointCreationError("anchor_unavailable") from None
         except CheckpointIntegrityError:
@@ -154,8 +151,6 @@ class CheckpointService:
             raise CheckpointCreationError("anchor_conflict") from None
         except CheckpointIntegrityError:
             raise CheckpointCreationError("anchor_integrity_failure") from None
-        except CheckpointStoreAccessDeniedError:
-            raise CheckpointCreationError("anchor_access_denied") from None
         except CheckpointStoreUnavailableError:
             raise CheckpointCreationError("anchor_unavailable") from None
 
@@ -172,10 +167,10 @@ class CheckpointService:
         timeout_seconds: float,
     ) -> CheckpointVerificationResult:
         """
-        Verify the live chain against the independently stored checkpoint.
+        Verify the live chain against the stored checkpoint.
 
-        Provider outages and access denials are reported as UNAVAILABLE. A
-        missing checkpoint, bounded verification, or unsupported format is
+        Store outages are reported as UNAVAILABLE. A missing checkpoint,
+        bounded verification, or unsupported format is
         reported as INCOMPLETE. A confirmed chain or checkpoint mismatch is
         reported as INVALID. A genesis-only checkpoint is INCOMPLETE because it
         cannot distinguish a legitimately empty chain from truncation to zero.
@@ -198,14 +193,6 @@ class CheckpointService:
 
         try:
             checkpoint = store.read_latest()
-        except CheckpointStoreAccessDeniedError:
-            return CheckpointVerificationResult(
-                "UNAVAILABLE",
-                chain.records_verified,
-                None,
-                None,
-                "Checkpoint store access was denied",
-            )
         except CheckpointStoreUnavailableError:
             return CheckpointVerificationResult(
                 "UNAVAILABLE",

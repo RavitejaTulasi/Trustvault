@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
@@ -6,55 +6,57 @@ import {
   deleteDocument,
   downloadDocument,
   getDocument,
-  getMe,
   listGrants,
   revokeGrant,
   updateDocument,
 } from '../auth';
-import { ApiError, NetworkError } from '../api';
-import type { DocumentResponse, GrantResponse, UserResponse } from '../types';
+import { ApiError, listDocumentActivity } from '../api';
+import type { AuditEventResponse, DocumentResponse, GrantResponse } from '../types';
+import AppShell from '../components/AppShell';
+import PageHeader from '../components/PageHeader';
+import Tabs from '../components/Tabs';
+import { OutcomeBadge, PermissionBadge, StatusBadge } from '../components/Badges';
+import Skeleton from '../components/Skeleton';
+import { useToast } from '../components/useToast';
+import {
+  ChevronLeftIcon,
+  DownloadIcon,
+  FileIcon,
+  KeyIcon,
+  RefreshIcon,
+  ShareIcon,
+  ShieldIcon,
+  TrashIcon,
+} from '../components/Icons';
+import { useSession } from '../hooks/useSession';
+import {
+  describeError,
+  formatBytes,
+  formatDateTime,
+  shortId,
+} from '../lib/format';
 
-function describeError(err: unknown, fallback: string): string {
-  if (err instanceof ApiError) {
-    return err.detail;
-  }
-  if (err instanceof NetworkError) {
-    return err.message;
-  }
-  return fallback;
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  const units = ['KB', 'MB', 'GB'];
-  let value = bytes;
-  let unitIndex = -1;
-  do {
-    value /= 1024;
-    unitIndex += 1;
-  } while (value >= 1024 && unitIndex < units.length - 1);
-  return `${value.toFixed(1)} ${units[unitIndex]}`;
-}
+const ACTIVITY_PAGE_SIZE = 10;
 
 export default function DocumentDetail() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
+  const { user, loading: sessionLoading, error: sessionError, reload } = useSession();
+  const { pushToast } = useToast();
 
-  const [user, setUser] = useState<UserResponse | null>(null);
   const [doc, setDoc] = useState<DocumentResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [accessDenied, setAccessDenied] = useState(false);
 
-  // The list page passes the server-derived effective permission; on a
-  // hard refresh it is absent and only the owner-derived view is assumed.
   const effectivePermission =
     (location.state as { effectivePermission?: string } | null)?.effectivePermission ?? null;
   const isOwner = user !== null && doc !== null && user.id === doc.owner_id;
   const canEdit = isOwner || effectivePermission === 'edit';
+  const isAdmin = user?.role === 'admin';
+
+  const [tab, setTab] = useState('overview');
 
   const [editing, setEditing] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
@@ -73,22 +75,30 @@ export default function DocumentDetail() {
   const [grantsError, setGrantsError] = useState<string | null>(null);
   const [shareUserId, setShareUserId] = useState('');
   const [sharePermission, setSharePermission] = useState<'read' | 'edit'>('read');
+  const [reviewingShare, setReviewingShare] = useState(false);
   const [sharing, setSharing] = useState(false);
   const [shareError, setShareError] = useState<string | null>(null);
   const [revokeArmedId, setRevokeArmedId] = useState<string | null>(null);
   const [revokingId, setRevokingId] = useState<string | null>(null);
 
+  const [activityEvents, setActivityEvents] = useState<AuditEventResponse[]>([]);
+  const [activityTotal, setActivityTotal] = useState(0);
+  const [activityPage, setActivityPage] = useState(1);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityError, setActivityError] = useState<string | null>(null);
+  const activityRequestRef = useRef(0);
+
   const loadGrants = useCallback(
     async (grantsForOwner: boolean) => {
       if (!grantsForOwner) {
         setGrants([]);
+        setGrantsError(null);
         return;
       }
       try {
         const result = await listGrants(id);
         setGrants(result.grants);
       } catch (err) {
-        // The server deliberately 404s non-owners; nobody else sees this view.
         setGrantsError(describeError(err, 'Could not load permission grants'));
       }
     },
@@ -96,24 +106,20 @@ export default function DocumentDetail() {
   );
 
   const loadAll = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
+    setAccessDenied(false);
     try {
-      // The leading await keeps initial state updates out of the effect tick.
-      const session = await getMe();
-      if (!session) {
-        navigate('/login', { replace: true });
-        return;
-      }
-      setUser(session);
       const document = await getDocument(id);
       setDoc(document);
       setTitleDraft(document.title);
       setCategoryDraft(document.category);
-      setAccessDenied(false);
-      await loadGrants(session.id === document.owner_id);
+      if (user) {
+        await loadGrants(user.id === document.owner_id);
+      }
       setLoading(false);
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) {
-        // Deliberate 404: the document does not exist or the caller has no grant.
         setAccessDenied(true);
         setLoading(false);
         return;
@@ -125,12 +131,59 @@ export default function DocumentDetail() {
       setLoading(false);
       setLoadError(describeError(err, 'Could not load the document'));
     }
-  }, [id, loadGrants, navigate]);
+  }, [id, loadGrants, navigate, user]);
 
   useEffect(() => {
-    // eslint-disable-next-line react/set-state-in-effect -- external backend sync; setState runs after awaits
-    loadAll();
-  }, [loadAll]);
+    if (!user) {
+      return;
+    }
+    // eslint-disable-next-line react/set-state-in-effect -- page fetch reflects server state after session load
+    void loadAll();
+  }, [loadAll, user]);
+
+  const loadActivity = useCallback(
+    async (targetPage: number) => {
+      const request = activityRequestRef.current + 1;
+      activityRequestRef.current = request;
+      setActivityLoading(true);
+      setActivityError(null);
+      try {
+        const result = await listDocumentActivity({
+          document_id: id,
+          page: targetPage,
+          page_size: ACTIVITY_PAGE_SIZE,
+        });
+        if (request !== activityRequestRef.current) {
+          return;
+        }
+        setActivityEvents(result.events);
+        setActivityTotal(result.total);
+        setActivityPage(result.page);
+        setActivityLoading(false);
+      } catch (err) {
+        if (request !== activityRequestRef.current) {
+          return;
+        }
+        setActivityLoading(false);
+        setActivityError(describeError(err, 'Could not load document activity'));
+      }
+    },
+    [id],
+  );
+
+  useEffect(() => {
+    if (!isAdmin || tab !== 'activity') {
+      return;
+    }
+    // eslint-disable-next-line react/set-state-in-effect -- lazy tab fetch reflects server state
+    void loadActivity(1);
+  }, [isAdmin, loadActivity, tab]);
+
+  const handleTabChange = (next: string) => {
+    if (next === 'overview' || next === 'access' || (next === 'activity' && isAdmin)) {
+      setTab(next);
+    }
+  };
 
   const handleEdit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -145,6 +198,7 @@ export default function DocumentDetail() {
       setTitleDraft(updated.title);
       setCategoryDraft(updated.category);
       setEditing(false);
+      pushToast({ title: 'Document updated', tone: 'success' });
     } catch (err) {
       setEditError(describeError(err, 'Update failed. Please try again.'));
     } finally {
@@ -162,6 +216,7 @@ export default function DocumentDetail() {
     setDeleteError(null);
     try {
       await deleteDocument(id);
+      pushToast({ title: 'Document deleted', tone: 'success' });
       navigate('/documents', { replace: true });
     } catch (err) {
       setDeleting(false);
@@ -181,18 +236,30 @@ export default function DocumentDetail() {
     }
   };
 
-  const handleShare = async (event: FormEvent<HTMLFormElement>) => {
+  const handleShareReview = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setShareError(null);
     if (shareUserId.trim() === '') {
       setShareError('A user ID is required.');
       return;
     }
+    setReviewingShare(true);
+  };
+
+  const handleConfirmShare = async () => {
+    setShareError(null);
+    if (shareUserId.trim() === '') {
+      setShareError('A user ID is required.');
+      setReviewingShare(false);
+      return;
+    }
     setSharing(true);
     try {
       await createGrant(id, shareUserId.trim(), sharePermission);
       setShareUserId('');
+      setReviewingShare(false);
       await loadGrants(true);
+      pushToast({ title: 'Access granted', tone: 'success' });
     } catch (err) {
       setShareError(describeError(err, 'Grant failed. Please try again.'));
     } finally {
@@ -211,6 +278,7 @@ export default function DocumentDetail() {
     try {
       await revokeGrant(id, grant.user_id);
       await loadGrants(true);
+      pushToast({ title: 'Access revoked', tone: 'success' });
     } catch (err) {
       setShareError(describeError(err, 'Revoke failed. Please try again.'));
     } finally {
@@ -218,203 +286,536 @@ export default function DocumentDetail() {
     }
   };
 
+  if (!user) {
+    return (
+      <main className="standalone-state" aria-busy={sessionLoading || undefined}>
+        {sessionError ? (
+          <>
+            <div role="alert" className="alert alert-error">
+              {sessionError}
+            </div>
+            <button type="button" className="btn btn-primary" onClick={() => void reload()}>
+              <RefreshIcon width={16} height={16} />
+              Retry
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="brand-mark">
+              <ShieldIcon width={22} height={22} />
+            </span>
+            <p className="section-copy">Loading document access…</p>
+          </>
+        )}
+      </main>
+    );
+  }
+
   if (loading) {
     return (
-      <main className="document-detail" aria-busy="true">
-        <p>Loading…</p>
-      </main>
+      <AppShell user={user}>
+        <div className="panel" aria-busy="true">
+          <div className="panel-body">
+            <Skeleton lines={7} label="Loading document" />
+          </div>
+        </div>
+      </AppShell>
     );
   }
 
   if (accessDenied) {
     return (
-      <main className="document-detail">
-        <h2>Document not found</h2>
-        <p role="alert">
-          This document does not exist, or you do not have permission to see it.
-        </p>
-        <Link to="/documents">Back to documents</Link>
-      </main>
+      <AppShell user={user}>
+        <div className="standalone-state">
+          <span className="empty-state-icon" aria-hidden="true">
+            <FileIcon width={24} height={24} />
+          </span>
+          <h1 className="page-title">Document not found</h1>
+          <p role="alert" className="page-description">
+            This document does not exist, or you do not have permission to see it.
+          </p>
+          <Link to="/documents" className="btn btn-secondary">
+            Back to documents
+          </Link>
+        </div>
+      </AppShell>
     );
   }
 
   if (loadError || doc === null) {
     return (
-      <main className="document-detail">
-        <p role="alert" className="error">
-          {loadError ?? 'Could not load the document'}
-        </p>
-        <button type="button" onClick={loadAll}>
-          Retry
-        </button>
-      </main>
+      <AppShell user={user}>
+        <div className="standalone-state">
+          <div role="alert" className="alert alert-error">
+            {loadError ?? 'Could not load the document'}
+          </div>
+          <button type="button" className="btn btn-primary" onClick={() => void loadAll()}>
+            <RefreshIcon width={16} height={16} />
+            Retry
+          </button>
+        </div>
+      </AppShell>
     );
   }
 
+  const tabs = [
+    { id: 'overview', label: 'Overview' },
+    { id: 'access', label: 'Access' },
+    ...(isAdmin ? [{ id: 'activity', label: 'Activity' }] : []),
+  ];
+  const activityTotalPages = Math.max(1, Math.ceil(activityTotal / ACTIVITY_PAGE_SIZE));
+  const hasActivityPrev = activityPage > 1 && !activityLoading;
+  const hasActivityNext = activityPage < activityTotalPages && !activityLoading;
+
   return (
-    <main className="document-detail">
-      <p>
-        <Link to="/documents">← Back to documents</Link>
-      </p>
-      <h2>{doc.title}</h2>
+    <AppShell user={user}>
+      <div className="document-detail">
+        <Link to="/documents" className="back-link">
+          <ChevronLeftIcon width={14} height={14} />
+          Back to documents
+        </Link>
 
-      <dl className="document-meta">
-        <dt>Filename</dt>
-        <dd>{doc.original_filename}</dd>
-        <dt>Size</dt>
-        <dd>{formatSize(doc.file_size_bytes)}</dd>
-        <dt>Type</dt>
-        <dd>{doc.mime_type}</dd>
-        <dt>Category</dt>
-        <dd>{doc.category}</dd>
-        <dt>Created</dt>
-        <dd>{doc.created_at}</dd>
-        <dt>Updated</dt>
-        <dd>{doc.updated_at}</dd>
-      </dl>
-
-      {(downloadError || deleteError) && (
-        <p role="alert" className="error">
-          {downloadError ?? deleteError}
-        </p>
-      )}
-
-      <div className="document-actions">
-        <button type="button" onClick={handleDownload} disabled={downloading}>
-          {downloading ? 'Downloading…' : 'Download'}
-        </button>
-        {isOwner && (
-          <button type="button" onClick={handleDelete} disabled={deleting}>
-            {deleteArmed ? 'Confirm delete?' : deleting ? 'Deleting…' : 'Delete'}
-          </button>
-        )}
-      </div>
-
-      {canEdit && (
-        <section aria-label="Edit document metadata">
-          <h3>Edit metadata</h3>
-          {editError && (
-            <p role="alert" className="error">
-              {editError}
-            </p>
-          )}
-          {!editing ? (
-            <button type="button" onClick={() => setEditing(true)}>
-              Edit title / category
-            </button>
-          ) : (
-            <form onSubmit={handleEdit}>
-              <div>
-                <label htmlFor="edit-title">Title</label>
-                <input
-                  id="edit-title"
-                  type="text"
-                  value={titleDraft}
-                  onChange={(e) => setTitleDraft(e.target.value)}
-                  maxLength={255}
-                  required
-                />
-              </div>
-              <div>
-                <label htmlFor="edit-category">Category</label>
-                <input
-                  id="edit-category"
-                  type="text"
-                  value={categoryDraft}
-                  onChange={(e) => setCategoryDraft(e.target.value)}
-                  maxLength={100}
-                  required
-                />
-              </div>
-              <button type="submit" disabled={saving}>
-                {saving ? 'Saving…' : 'Save'}
-              </button>
-              <button type="button" onClick={() => setEditing(false)} disabled={saving}>
-                Cancel
-              </button>
-            </form>
-          )}
-        </section>
-      )}
-
-      {isOwner && (
-        <section aria-label="Sharing permissions">
-          <h3>Sharing</h3>
-          {(grantsError || shareError) && (
-            <p role="alert" className="error">
-              {grantsError ?? shareError}
-            </p>
-          )}
-          <form onSubmit={handleShare} className="share-form">
-            <div>
-              <label htmlFor="share-user">User ID</label>
-              <input
-                id="share-user"
-                type="text"
-                value={shareUserId}
-                onChange={(e) => setShareUserId(e.target.value)}
-                maxLength={64}
-                placeholder="u_recipient_123"
-              />
-            </div>
-            <div>
-              <label htmlFor="share-permission">Permission</label>
-              <select
-                id="share-permission"
-                value={sharePermission}
-                onChange={(e) =>
-                  setSharePermission(e.target.value === 'edit' ? 'edit' : 'read')
-                }
+        <PageHeader
+          eyebrow={isOwner ? 'Owned document' : `${effectivePermission ?? 'Shared'} access`}
+          title={doc.title}
+          backTo="/documents"
+          backLabel="My documents"
+          description={`Document ${shortId(doc.id)} · access is re-checked on every request.`}
+          actions={
+            <>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => void handleDownload()}
+                disabled={downloading}
               >
-                <option value="read">read</option>
-                <option value="edit">edit</option>
-              </select>
-            </div>
-            <button type="submit" disabled={sharing}>
-              {sharing ? 'Sharing…' : 'Grant access'}
-            </button>
-          </form>
+                <DownloadIcon width={15} height={15} />
+                {downloading ? 'Downloading…' : 'Download'}
+              </button>
+              {isOwner && (
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  onClick={() => void handleDelete()}
+                  disabled={deleting}
+                >
+                  <TrashIcon width={15} height={15} />
+                  {deleteArmed ? 'Confirm delete?' : deleting ? 'Deleting…' : 'Delete'}
+                </button>
+              )}
+            </>
+          }
+        />
 
-          {grants.length === 0 ? (
-            <p>No permission grants for this document yet.</p>
-          ) : (
-            <table className="grants-table">
-              <thead>
-                <tr>
-                  <th scope="col">User ID</th>
-                  <th scope="col">Permission</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {grants.map((grant) => (
-                  <tr key={grant.id}>
-                    <td>{grant.user_id}</td>
-                    <td>{grant.permission}</td>
-                    <td>{grant.is_revoked ? 'revoked' : 'active'}</td>
-                    <td>
-                      {!grant.is_revoked && (
+        {(downloadError || deleteError) && (
+          <div role="alert" className="alert alert-error">
+            {downloadError ?? deleteError}
+          </div>
+        )}
+
+        <Tabs label="Document sections" tabs={tabs} value={tab} onChange={handleTabChange} />
+
+        {tab === 'overview' && (
+          <div role="tabpanel" aria-label="Overview" className="tab-panel">
+            <div className="detail-grid">
+              <section className="panel" aria-labelledby="document-meta-title">
+                <div className="panel-header">
+                  <div>
+                    <h2 id="document-meta-title" className="panel-title">
+                      Metadata
+                    </h2>
+                    <p className="panel-description">Values stored for this document.</p>
+                  </div>
+                  <PermissionBadge
+                    permission={isOwner ? 'owner' : effectivePermission === 'edit' ? 'edit' : 'read'}
+                  />
+                </div>
+                <div className="panel-body">
+                  <dl className="document-meta">
+                    <dt>Category</dt>
+                    <dd>{doc.category || 'Uncategorized'}</dd>
+                    <dt>Owner</dt>
+                    <dd className="mono">{shortId(doc.owner_id)}</dd>
+                    <dt>Created</dt>
+                    <dd>{formatDateTime(doc.created_at)}</dd>
+                    <dt>Updated</dt>
+                    <dd>{formatDateTime(doc.updated_at)}</dd>
+                  </dl>
+                </div>
+              </section>
+
+              <div className="detail-side">
+                <section className="panel" aria-labelledby="file-title">
+                  <div className="panel-header">
+                    <div>
+                      <h2 id="file-title" className="panel-title">
+                        File
+                      </h2>
+                      <p className="panel-description">Original upload details.</p>
+                    </div>
+                    <FileIcon width={17} height={17} />
+                  </div>
+                  <div className="panel-body">
+                    <div className="snapshot-list">
+                      <div className="snapshot-row">
+                        <span className="snapshot-label">Filename</span>
+                        <span className="snapshot-value">{doc.original_filename}</span>
+                      </div>
+                      <div className="snapshot-row">
+                        <span className="snapshot-label">Size</span>
+                        <span className="snapshot-value">{formatBytes(doc.file_size_bytes)}</span>
+                      </div>
+                      <div className="snapshot-row">
+                        <span className="snapshot-label">Type</span>
+                        <span className="snapshot-value">{doc.mime_type}</span>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                {canEdit && (
+                  <section className="panel" aria-labelledby="edit-document-title">
+                    <div className="panel-header">
+                      <div>
+                        <h2 id="edit-document-title" className="panel-title">
+                          Edit metadata
+                        </h2>
+                        <p className="panel-description">
+                          Server-confirmed changes to title and category.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="panel-body">
+                      {editError && (
+                        <div role="alert" className="alert alert-error">
+                          {editError}
+                        </div>
+                      )}
+                      {!editing ? (
                         <button
                           type="button"
-                          onClick={() => handleRevoke(grant)}
-                          disabled={revokingId === grant.user_id}
+                          className="btn btn-secondary"
+                          onClick={() => setEditing(true)}
                         >
-                          {revokeArmedId === grant.user_id
-                            ? 'Confirm revoke?'
-                            : revokingId === grant.user_id
-                              ? 'Revoking…'
-                              : 'Revoke'}
+                          Edit title / category
                         </button>
+                      ) : (
+                        <form onSubmit={handleEdit} className="auth-form">
+                          <div className="field">
+                            <label htmlFor="edit-title">Title</label>
+                            <input
+                              id="edit-title"
+                              className="input"
+                              type="text"
+                              value={titleDraft}
+                              onChange={(e) => setTitleDraft(e.target.value)}
+                              maxLength={255}
+                              required
+                            />
+                          </div>
+                          <div className="field">
+                            <label htmlFor="edit-category">Category</label>
+                            <input
+                              id="edit-category"
+                              className="input"
+                              type="text"
+                              value={categoryDraft}
+                              onChange={(e) => setCategoryDraft(e.target.value)}
+                              maxLength={100}
+                              required
+                            />
+                          </div>
+                          <div className="form-actions">
+                            <button type="submit" className="btn btn-primary" disabled={saving}>
+                              {saving ? 'Saving…' : 'Save'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-ghost"
+                              onClick={() => setEditing(false)}
+                              disabled={saving}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </form>
                       )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </section>
-      )}
-    </main>
+                    </div>
+                  </section>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {tab === 'access' && (
+          <div role="tabpanel" aria-label="Access" className="tab-panel">
+            {isOwner ? (
+              <section className="panel panel-sharing" aria-labelledby="sharing-permissions-title">
+                <div className="panel-header">
+                  <div>
+                    <h2 id="sharing-permissions-title" className="panel-title">
+                      Sharing
+                    </h2>
+                    <p className="panel-description">
+                      Grants are read from and written to the server.
+                    </p>
+                  </div>
+                  <StatusPill />
+                </div>
+                <div className="panel-body">
+                  {(grantsError || shareError) && (
+                    <div role="alert" className="alert alert-error">
+                      {grantsError ?? shareError}
+                    </div>
+                  )}
+                  {!reviewingShare ? (
+                    <form onSubmit={handleShareReview} className="share-form">
+                      <div className="field">
+                        <label htmlFor="share-user">User ID</label>
+                        <input
+                          id="share-user"
+                          className="input"
+                          type="text"
+                          value={shareUserId}
+                          onChange={(e) => setShareUserId(e.target.value)}
+                          maxLength={64}
+                          placeholder="u_recipient_123"
+                        />
+                      </div>
+                      <div className="field">
+                        <label htmlFor="share-permission">Permission</label>
+                        <select
+                          id="share-permission"
+                          className="select"
+                          value={sharePermission}
+                          onChange={(e) =>
+                            setSharePermission(e.target.value === 'edit' ? 'edit' : 'read')
+                          }
+                        >
+                          <option value="read">read</option>
+                          <option value="edit">edit</option>
+                        </select>
+                      </div>
+                      <button type="submit" className="btn btn-primary" disabled={sharing}>
+                        <ShareIcon width={15} height={15} />
+                        Review grant
+                      </button>
+                    </form>
+                  ) : (
+                    <div className="share-review" role="group" aria-label="Review grant">
+                      <dl className="document-meta">
+                        <dt>Recipient</dt>
+                        <dd className="mono">{shareUserId.trim()}</dd>
+                        <dt>Permission</dt>
+                        <dd>
+                          <PermissionBadge permission={sharePermission} />
+                        </dd>
+                      </dl>
+                      <div className="form-actions">
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          onClick={() => void handleConfirmShare()}
+                          disabled={sharing}
+                        >
+                          <ShareIcon width={15} height={15} />
+                          {sharing ? 'Sharing…' : 'Confirm grant access'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          onClick={() => setReviewingShare(false)}
+                          disabled={sharing}
+                        >
+                          Back
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {grants.length === 0 ? (
+                    <div className="empty-state">
+                      <span className="empty-state-icon" aria-hidden="true">
+                        <KeyIcon width={24} height={24} />
+                      </span>
+                      <p className="empty-state-title">
+                        No permission grants for this document yet.
+                      </p>
+                      <p className="empty-state-copy">
+                        Add a recipient above to grant read or edit access.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="table-wrap grants-table">
+                      <table>
+                        <caption>Permission grants</caption>
+                        <thead>
+                          <tr>
+                            <th scope="col">User ID</th>
+                            <th scope="col">Permission</th>
+                            <th scope="col">Status</th>
+                            <th scope="col">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {grants.map((grant) => (
+                            <tr key={grant.id}>
+                              <td className="mono">{grant.user_id}</td>
+                              <td>
+                                <PermissionBadge permission={grant.permission} />
+                              </td>
+                              <td>{grant.is_revoked ? 'revoked' : 'active'}</td>
+                              <td>
+                                {!grant.is_revoked && (
+                                  <button
+                                    type="button"
+                                    className="btn btn-danger btn-sm"
+                                    onClick={() => void handleRevoke(grant)}
+                                    disabled={revokingId === grant.user_id}
+                                  >
+                                    {revokeArmedId === grant.user_id
+                                      ? 'Confirm revoke?'
+                                      : revokingId === grant.user_id
+                                        ? 'Revoking…'
+                                        : 'Revoke'}
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </section>
+            ) : (
+              <section className="panel" aria-labelledby="access-title">
+                <div className="panel-header">
+                  <div>
+                    <h2 id="access-title" className="panel-title">
+                      Your access
+                    </h2>
+                    <p className="panel-description">Sharing is managed by the document owner.</p>
+                  </div>
+                  {effectivePermission === 'read' || effectivePermission === 'edit' ? (
+                    <PermissionBadge permission={effectivePermission} />
+                  ) : (
+                    <StatusBadge label="Re-checked per request" />
+                  )}
+                </div>
+                <div className="panel-body">
+                  <p className="section-copy">
+                    TrustVault confirms your permission on every request. Permission grants for
+                    this document are only visible to its owner.
+                  </p>
+                </div>
+              </section>
+            )}
+          </div>
+        )}
+
+        {isAdmin && tab === 'activity' && (
+          <div role="tabpanel" aria-label="Activity" className="tab-panel">
+            <section className="panel" aria-labelledby="document-activity-title">
+              <div className="panel-header">
+                <div>
+                  <h2 id="document-activity-title" className="panel-title">
+                    Document activity
+                  </h2>
+                  <p className="panel-description">
+                    Audit events tied to this document, newest first.
+                  </p>
+                </div>
+              </div>
+              <div className="panel-body">
+                {activityError && (
+                  <div role="alert" className="alert alert-error">
+                    {activityError}
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => void loadActivity(1)}
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
+                {activityLoading ? (
+                  <Skeleton lines={5} label="Loading document activity" />
+                ) : activityEvents.length === 0 ? (
+                  <div className="empty-state">
+                    <p className="empty-state-title">No activity recorded for this document yet.</p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="table-wrap">
+                      <table>
+                        <caption>{activityTotal} events</caption>
+                        <thead>
+                          <tr>
+                            <th scope="col">Time</th>
+                            <th scope="col">Action</th>
+                            <th scope="col">Actor</th>
+                            <th scope="col">Outcome</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {activityEvents.map((event) => (
+                            <tr key={event.id}>
+                              <td>{formatDateTime(event.timestamp)}</td>
+                              <td>
+                                <span className="cell-title-link">{event.action}</span>
+                              </td>
+                              <td className="mono">{shortId(event.actor_id)}</td>
+                              <td>
+                                <OutcomeBadge outcome={event.outcome} />
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <nav className="pagination" aria-label="Document activity pagination">
+                      <span className="pagination-info">
+                        Page {activityPage} of {activityTotalPages}
+                      </span>
+                      <div className="pagination-controls">
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          disabled={!hasActivityPrev}
+                          onClick={() => void loadActivity(activityPage - 1)}
+                        >
+                          Previous
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          disabled={!hasActivityNext}
+                          onClick={() => void loadActivity(activityPage + 1)}
+                        >
+                          Next
+                        </button>
+                      </div>
+                    </nav>
+                  </>
+                )}
+              </div>
+            </section>
+          </div>
+        )}
+      </div>
+    </AppShell>
+  );
+}
+
+function StatusPill() {
+  return (
+    <span className="badge badge-owner">
+      <ShieldIcon width={12} height={12} />
+      Owner controls
+    </span>
   );
 }

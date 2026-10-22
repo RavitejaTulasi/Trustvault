@@ -5,13 +5,18 @@ import { dirname, resolve } from 'path';
 
 export default defineConfig({
   plugins: [react()],
-  base: './',
+  base: '/',
   build: {
     outDir: 'dist',
   },
   server: {
     proxy: {
       '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+        secure: false,
+      },
+      '/health': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
         secure: false,

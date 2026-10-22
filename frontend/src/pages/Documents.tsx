@@ -1,59 +1,47 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { deleteDocument, downloadDocument, getMe, listDocuments, uploadDocument } from '../auth';
-import { ApiError, NetworkError } from '../api';
-import type { DocumentListItem, UserResponse } from '../types';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import {
+  deleteDocument,
+  downloadDocument,
+  listDocuments,
+  uploadDocument,
+} from '../auth';
+import { ApiError } from '../api';
+import type { DocumentListItem } from '../types';
+import AppShell from '../components/AppShell';
+import EmptyState from '../components/EmptyState';
+import PageHeader from '../components/PageHeader';
+import Skeleton from '../components/Skeleton';
+import { PermissionBadge } from '../components/Badges';
+import { useToast } from '../components/useToast';
+import {
+  DownloadIcon,
+  RefreshIcon,
+  SearchIcon,
+  ShieldIcon,
+  TrashIcon,
+  UploadIcon,
+} from '../components/Icons';
+import { useSession } from '../hooks/useSession';
+import { canManageDocuments } from '../lib/navigation';
+import { describeError, formatBytes, formatDate } from '../lib/format';
 
 const PAGE_SIZE = 25;
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  const units = ['KB', 'MB', 'GB'];
-  let value = bytes;
-  let unitIndex = -1;
-  do {
-    value /= 1024;
-    unitIndex += 1;
-  } while (value >= 1024 && unitIndex < units.length - 1);
-  return `${value.toFixed(1)} ${units[unitIndex]}`;
-}
-
-function formatDate(iso: string): string {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) {
-    return iso;
-  }
-  return date.toISOString().slice(0, 10);
-}
-
-function describeActionError(err: unknown, fallback: string): string {
-  if (err instanceof ApiError) {
-    return err.detail;
-  }
-  if (err instanceof NetworkError) {
-    return err.message;
-  }
-  return fallback;
-}
-
-function canUpload(user: UserResponse | null): boolean {
-  return user !== null && (user.role === 'owner' || user.role === 'admin');
-}
-
 export default function Documents() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const { user, loading: sessionLoading, error: sessionError, reload } = useSession();
+  const { pushToast } = useToast();
+  const uploadPanelRef = useRef<HTMLElement>(null);
 
-  const [user, setUser] = useState<UserResponse | null>(null);
   const [documents, setDocuments] = useState<DocumentListItem[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // Draft inputs (editable) vs applied filters (drive the request).
   const [searchDraft, setSearchDraft] = useState('');
   const [categoryDraft, setCategoryDraft] = useState('');
   const [appliedSearch, setAppliedSearch] = useState('');
@@ -62,6 +50,7 @@ export default function Documents() {
   const [uploadTitle, setUploadTitle] = useState('');
   const [uploadCategory, setUploadCategory] = useState('');
   const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [reviewingUpload, setReviewingUpload] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
@@ -89,7 +78,7 @@ export default function Documents() {
           navigate('/login', { replace: true });
           return;
         }
-        setLoadError(describeActionError(err, 'Could not load documents'));
+        setLoadError(describeError(err, 'Could not load documents'));
       } finally {
         setLoading(false);
       }
@@ -97,28 +86,21 @@ export default function Documents() {
     [navigate],
   );
 
-  const loadSessionAndDocuments = useCallback(async () => {
-    try {
-      // The leading await keeps state updates out of the effect tick.
-      const session = await getMe();
-      if (!session) {
-        navigate('/login', { replace: true });
-        return;
-      }
-      setUser(session);
-      await loadDocuments(1, appliedSearch, appliedCategory);
-    } catch (err) {
-      // 5xx / network failures stay on the page with a retry option; they must
-      // NOT be treated as an unauthenticated session.
-      setLoading(false);
-      setLoadError(describeActionError(err, 'Could not load your session'));
+  useEffect(() => {
+    if (!user) {
+      return;
     }
-  }, [appliedCategory, appliedSearch, loadDocuments, navigate]);
+    // eslint-disable-next-line react/set-state-in-effect -- page fetch reflects server state after session load
+    void loadDocuments(1, appliedSearch, appliedCategory);
+  }, [appliedCategory, appliedSearch, loadDocuments, user]);
 
   useEffect(() => {
-    // eslint-disable-next-line react/set-state-in-effect -- external backend sync; setState runs after awaits
-    loadSessionAndDocuments();
-  }, [loadSessionAndDocuments]);
+    if (searchParams.get('upload') !== '1') {
+      return;
+    }
+    uploadPanelRef.current?.scrollIntoView?.({ block: 'center' });
+    document.querySelector<HTMLInputElement>('#upload-file')?.focus();
+  }, [searchParams, user]);
 
   const handleSearch = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -134,26 +116,46 @@ export default function Documents() {
     setUploadError(null);
   };
 
-  const handleUpload = async (event: FormEvent<HTMLFormElement>) => {
+  const handleUpload = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setUploadError(null);
     if (!uploadFile || uploadTitle.trim() === '') {
       setUploadError('A file and a title are required.');
       return;
     }
+    setReviewingUpload(true);
+  };
+
+  const handleConfirmUpload = async () => {
+    setUploadError(null);
+    if (!uploadFile || uploadTitle.trim() === '') {
+      setUploadError('A file and a title are required.');
+      setReviewingUpload(false);
+      return;
+    }
     setUploading(true);
     try {
-      await uploadDocument(uploadFile, uploadTitle.trim(), uploadCategory.trim() || undefined);
+      const uploaded = await uploadDocument(
+        uploadFile,
+        uploadTitle.trim(),
+        uploadCategory.trim() || undefined,
+      );
       setUploadFile(null);
       setUploadTitle('');
       setUploadCategory('');
+      setReviewingUpload(false);
       const fileInput = document.querySelector<HTMLInputElement>('#upload-file');
       if (fileInput) {
         fileInput.value = '';
       }
       await loadDocuments(1, appliedSearch, appliedCategory);
+      pushToast({
+        title: 'Document uploaded',
+        description: `“${uploaded.title}” is now available in your library.`,
+        tone: 'success',
+      });
     } catch (err) {
-      setUploadError(describeActionError(err, 'Upload failed. Please try again.'));
+      setUploadError(describeError(err, 'Upload failed. Please try again.'));
     } finally {
       setUploading(false);
     }
@@ -165,7 +167,7 @@ export default function Documents() {
     try {
       await downloadDocument(doc.id, doc.original_filename);
     } catch (err) {
-      setActionError(describeActionError(err, `Could not download "${doc.title}"`));
+      setActionError(describeError(err, `Could not download "${doc.title}"`));
     } finally {
       setDownloadingId(null);
     }
@@ -182,8 +184,13 @@ export default function Documents() {
     try {
       await deleteDocument(doc.id);
       await loadDocuments(page, appliedSearch, appliedCategory);
+      pushToast({
+        title: 'Document deleted',
+        description: `“${doc.title}” was removed from your library.`,
+        tone: 'success',
+      });
     } catch (err) {
-      setActionError(describeActionError(err, `Could not delete "${doc.title}"`));
+      setActionError(describeError(err, `Could not delete "${doc.title}"`));
     } finally {
       setDeletingId(null);
     }
@@ -193,186 +200,317 @@ export default function Documents() {
   const hasPrev = page > 1 && !loading;
   const hasNext = page < totalPages && !loading;
 
+  if (!user) {
+    return (
+      <main className="standalone-state" aria-busy={sessionLoading || undefined}>
+        {sessionError ? (
+          <>
+            <div role="alert" className="alert alert-error">
+              {sessionError}
+            </div>
+            <button type="button" className="btn btn-primary" onClick={() => void reload()}>
+              <RefreshIcon width={16} height={16} />
+              Retry
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="brand-mark">
+              <ShieldIcon width={22} height={22} />
+            </span>
+            <p className="section-copy">Loading your document library…</p>
+          </>
+        )}
+      </main>
+    );
+  }
+
+  const canUpload = canManageDocuments(user.role);
+
   return (
-    <main className="documents-page">
-      <header>
-        <h2>Documents</h2>
-        <p>
-          Signed in as {user?.full_name} ({user?.role}) ·{' '}
-          <Link to="/dashboard">Dashboard</Link>
-        </p>
-      </header>
+    <AppShell user={user}>
+      <div className="documents-page">
+        <PageHeader
+          eyebrow="Library"
+          title="Documents"
+          description="Search visible files, upload as an owner or administrator, and act only on the permissions the server returns."
+          backTo="/"
+          backLabel="Overview"
+        />
 
-      {loadError && (
-        <p role="alert" className="error">
-          {loadError}{' '}
-          <button type="button" onClick={loadSessionAndDocuments}>
-            Retry
-          </button>
-        </p>
-      )}
-
-      <form onSubmit={handleSearch} className="search-form" aria-label="Search documents">
-        <div>
-          <label htmlFor="search-q">Search</label>
-          <input
-            id="search-q"
-            type="text"
-            value={searchDraft}
-            onChange={(e) => setSearchDraft(e.target.value)}
-            placeholder="Title or filename"
-            maxLength={255}
-          />
-        </div>
-        <div>
-          <label htmlFor="search-category">Category</label>
-          <input
-            id="search-category"
-            type="text"
-            value={categoryDraft}
-            onChange={(e) => setCategoryDraft(e.target.value)}
-            placeholder="Category"
-            maxLength={100}
-          />
-        </div>
-        <button type="submit">Search</button>
-        <button type="button" onClick={handleClearFilters}>
-          Clear
-        </button>
-      </form>
-
-      {canUpload(user) && (
-        <form onSubmit={handleUpload} className="upload-form" aria-label="Upload a document">
-          <h3>Upload a document</h3>
-          {uploadError && (
-            <p role="alert" className="error">
-              {uploadError}
-            </p>
-          )}
-          <div>
-            <label htmlFor="upload-file">File</label>
-            <input
-              id="upload-file"
-              type="file"
-              onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)}
-            />
+        {loadError && (
+          <div role="alert" className="alert alert-error">
+            {loadError}
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={() => void loadDocuments(page, appliedSearch, appliedCategory)}
+            >
+              <RefreshIcon width={14} height={14} />
+              Retry
+            </button>
           </div>
-          <div>
-            <label htmlFor="upload-title">Title</label>
+        )}
+
+        <form onSubmit={handleSearch} className="search-form" aria-label="Search documents">
+          <div className="field">
+            <label htmlFor="search-q">Search</label>
             <input
-              id="upload-title"
+              id="search-q"
+              className="input"
               type="text"
-              value={uploadTitle}
-              onChange={(e) => setUploadTitle(e.target.value)}
+              value={searchDraft}
+              onChange={(e) => setSearchDraft(e.target.value)}
+              placeholder="Title or filename"
               maxLength={255}
-              required
             />
           </div>
-          <div>
-            <label htmlFor="upload-category">Category (optional)</label>
+          <div className="field">
+            <label htmlFor="search-category">Category</label>
             <input
-              id="upload-category"
+              id="search-category"
+              className="input"
               type="text"
-              value={uploadCategory}
-              onChange={(e) => setUploadCategory(e.target.value)}
+              value={categoryDraft}
+              onChange={(e) => setCategoryDraft(e.target.value)}
+              placeholder="Category"
               maxLength={100}
-              placeholder="General"
             />
           </div>
-          <button type="submit" disabled={uploading}>
-            {uploading ? 'Uploading…' : 'Upload'}
+          <button type="submit" className="btn btn-primary">
+            <SearchIcon width={15} height={15} />
+            Search
+          </button>
+          <button type="button" className="btn btn-ghost" onClick={handleClearFilters}>
+            Clear
           </button>
         </form>
-      )}
 
-      {actionError && (
-        <p role="alert" className="error">
-          {actionError}
-        </p>
-      )}
-
-      {loading ? (
-        <p aria-busy="true">Loading…</p>
-      ) : documents.length === 0 ? (
-        <p>No documents found.</p>
-      ) : (
-        <table className="documents-table">
-          <caption>
-            {total} document{total === 1 ? '' : 's'}
-          </caption>
-          <thead>
-            <tr>
-              <th scope="col">Title</th>
-              <th scope="col">Filename</th>
-              <th scope="col">Size</th>
-              <th scope="col">Category</th>
-              <th scope="col">Access</th>
-              <th scope="col">Created</th>
-              <th scope="col">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {documents.map((doc) => (
-              <tr key={doc.id}>
-                <td>
-                  <Link to={`/documents/${doc.id}`}>{doc.title}</Link>
-                </td>
-                <td>{doc.original_filename}</td>
-                <td>{formatBytes(doc.file_size_bytes)}</td>
-                <td>{doc.category}</td>
-                <td>
-                  <span className={`permission permission-${doc.effective_permission}`}>
-                    {doc.effective_permission}
-                  </span>
-                </td>
-                <td>{formatDate(doc.created_at)}</td>
-                <td>
-                  <button
-                    type="button"
-                    onClick={() => handleDownload(doc)}
-                    disabled={downloadingId === doc.id}
-                  >
-                    {downloadingId === doc.id ? 'Downloading…' : 'Download'}
-                  </button>
-                  {doc.effective_permission === 'owner' && (
+        {canUpload && (
+          <section
+            ref={uploadPanelRef}
+            className="panel upload-panel"
+            aria-labelledby="upload-panel-title"
+          >
+            <div className="panel-header">
+              <div>
+                <h2 id="upload-panel-title" className="panel-title">
+                  Upload a document
+                </h2>
+                <p className="panel-description">
+                  Owners and administrators can add files to the library.
+                </p>
+              </div>
+              <span className="badge badge-owner">
+                <UploadIcon width={12} height={12} />
+                Owner tools
+              </span>
+            </div>
+            <div className="panel-body">
+              {uploadError && (
+                <p role="alert" className="alert alert-error">
+                  {uploadError}
+                </p>
+              )}
+              {reviewingUpload && uploadFile ? (
+                <div className="upload-review" role="group" aria-label="Review upload">
+                  <dl className="document-meta">
+                    <dt>File</dt>
+                    <dd className="mono">{uploadFile.name}</dd>
+                    <dt>Size</dt>
+                    <dd>{formatBytes(uploadFile.size)}</dd>
+                    <dt>Type</dt>
+                    <dd className="mono">{uploadFile.type || 'unknown'}</dd>
+                    <dt>Title</dt>
+                    <dd>{uploadTitle.trim()}</dd>
+                    <dt>Category</dt>
+                    <dd>{uploadCategory.trim() || 'Uncategorized'}</dd>
+                  </dl>
+                  <div className="form-actions">
                     <button
                       type="button"
-                      onClick={() => handleDelete(doc)}
-                      disabled={deletingId === doc.id}
+                      className="btn btn-primary"
+                      onClick={() => void handleConfirmUpload()}
+                      disabled={uploading}
                     >
-                      {deleteArmedId === doc.id
-                        ? 'Confirm delete?'
-                        : deletingId === doc.id
-                          ? 'Deleting…'
-                          : 'Delete'}
+                      <UploadIcon width={15} height={15} />
+                      {uploading ? 'Uploading…' : 'Confirm upload'}
                     </button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={() => setReviewingUpload(false)}
+                      disabled={uploading}
+                    >
+                      Back
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <form onSubmit={handleUpload} className="upload-form" aria-label="Upload a document">
+                <div className="field">
+                  <label htmlFor="upload-file">File</label>
+                  <input
+                    id="upload-file"
+                    type="file"
+                    onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="upload-title">Title</label>
+                  <input
+                    id="upload-title"
+                    className="input"
+                    type="text"
+                    value={uploadTitle}
+                    onChange={(e) => setUploadTitle(e.target.value)}
+                    maxLength={255}
+                    required
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="upload-category">Category (optional)</label>
+                  <input
+                    id="upload-category"
+                    className="input"
+                    type="text"
+                    value={uploadCategory}
+                    onChange={(e) => setUploadCategory(e.target.value)}
+                    maxLength={100}
+                    placeholder="General"
+                  />
+                </div>
+                <button type="submit" className="btn btn-primary" disabled={uploading}>
+                  <UploadIcon width={15} height={15} />
+                  Review upload
+                </button>
+              </form>
+              )}
+            </div>
+          </section>
+        )}
 
-      <nav className="pagination" aria-label="Documents pagination">
-        <button
-          type="button"
-          disabled={!hasPrev}
-          onClick={() => loadDocuments(page - 1, appliedSearch, appliedCategory)}
-        >
-          Previous
-        </button>
-        <span>
-          Page {page} of {totalPages}
-        </span>
-        <button
-          type="button"
-          disabled={!hasNext}
-          onClick={() => loadDocuments(page + 1, appliedSearch, appliedCategory)}
-        >
-          Next
-        </button>
-      </nav>
-    </main>
+        {actionError && (
+          <div role="alert" className="alert alert-error">
+            {actionError}
+          </div>
+        )}
+
+        {loading ? (
+          <div className="panel" aria-busy="true">
+            <div className="panel-body">
+              <Skeleton lines={6} label="Loading documents" />
+            </div>
+          </div>
+        ) : documents.length === 0 ? (
+          <div className="panel empty-panel">
+            <EmptyState
+              title="No documents found."
+              description={
+                canUpload
+                  ? 'Upload a file above, or adjust the current filters.'
+                  : 'No visible documents match the current filters.'
+              }
+            />
+          </div>
+        ) : (
+          <div className="table-wrap">
+            <table className="documents-table">
+              <caption>
+                {total} document{total === 1 ? '' : 's'}
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Title</th>
+                  <th scope="col">Filename</th>
+                  <th scope="col">Size</th>
+                  <th scope="col">Category</th>
+                  <th scope="col">Access</th>
+                  <th scope="col">Created</th>
+                  <th scope="col">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {documents.map((doc) => (
+                  <tr key={doc.id}>
+                    <td>
+                      <div className="cell-title">
+                        <Link
+                          to={`/documents/${doc.id}`}
+                          state={{ effectivePermission: doc.effective_permission }}
+                          className="cell-title-link"
+                        >
+                          {doc.title}
+                        </Link>
+                        <span className="cell-sub">{doc.category}</span>
+                      </div>
+                    </td>
+                    <td className="mono">{doc.original_filename}</td>
+                    <td>{formatBytes(doc.file_size_bytes)}</td>
+                    <td>{doc.category}</td>
+                    <td>
+                      <PermissionBadge permission={doc.effective_permission} />
+                    </td>
+                    <td>{formatDate(doc.created_at)}</td>
+                    <td>
+                      <div className="cell-actions">
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => void handleDownload(doc)}
+                          disabled={downloadingId === doc.id}
+                        >
+                          <DownloadIcon width={14} height={14} />
+                          {downloadingId === doc.id ? 'Downloading…' : 'Download'}
+                        </button>
+                        {doc.effective_permission === 'owner' && (
+                          <button
+                            type="button"
+                            className="btn btn-danger btn-sm"
+                            onClick={() => void handleDelete(doc)}
+                            disabled={deletingId === doc.id}
+                          >
+                            <TrashIcon width={14} height={14} />
+                            {deleteArmedId === doc.id
+                              ? 'Confirm delete?'
+                              : deletingId === doc.id
+                                ? 'Deleting…'
+                                : 'Delete'}
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <nav className="pagination" aria-label="Documents pagination">
+          <span className="pagination-info">
+            Page {page} of {totalPages}
+          </span>
+          <div className="pagination-controls">
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={!hasPrev}
+              onClick={() => void loadDocuments(page - 1, appliedSearch, appliedCategory)}
+            >
+              Previous
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={!hasNext}
+              onClick={() => void loadDocuments(page + 1, appliedSearch, appliedCategory)}
+            >
+              Next
+            </button>
+          </div>
+        </nav>
+      </div>
+    </AppShell>
   );
 }

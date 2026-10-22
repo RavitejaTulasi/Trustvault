@@ -14,10 +14,8 @@ def make_settings(**overrides: object) -> Settings:
         "ENVIRONMENT": "production",
         "SESSION_COOKIE_SECURE": True,
         "DATABASE_URL": PRODUCTION_DATABASE_URL,
-        "AUDIT_ANCHOR_MODE": "s3",
+        "AUDIT_ANCHOR_MODE": "local_file",
         "AUDIT_ANCHOR_HMAC_KEY": "k" * 64,
-        "AUDIT_ANCHOR_S3_BUCKET": "audit-bucket",
-        "AUDIT_ANCHOR_S3_REGION": "us-east-1",
     }
     values.update(overrides)
     return Settings(**values)
@@ -37,6 +35,11 @@ def test_supported_environments_are_accepted(environment: str):
 def test_invalid_environment_values_are_rejected(environment: str):
     with pytest.raises(ValidationError):
         make_settings(ENVIRONMENT=environment)
+
+
+def test_s3_is_not_a_supported_checkpoint_mode():
+    with pytest.raises(ValidationError, match="AUDIT_ANCHOR_MODE"):
+        make_settings(AUDIT_ANCHOR_MODE="s3")
 
 
 def test_nonproduction_allows_sqlite_and_insecure_session_cookies():
@@ -138,6 +141,20 @@ def test_production_accepts_postgresql_url_with_explicit_credentials(
 def test_production_rejects_disabled_audit_anchoring():
     with pytest.raises(ValidationError, match="AUDIT_ANCHOR_MODE"):
         make_settings(AUDIT_ANCHOR_MODE="disabled")
+
+
+def test_production_accepts_local_file_audit_anchoring():
+    configured = make_settings(
+        AUDIT_ANCHOR_MODE="local_file",
+        AUDIT_ANCHOR_HMAC_KEY="k" * 64,
+    )
+
+    assert configured.AUDIT_ANCHOR_MODE == "local_file"
+
+
+def test_local_file_audit_anchoring_requires_hmac_key_in_production():
+    with pytest.raises(ValidationError, match="AUDIT_ANCHOR_HMAC_KEY"):
+        make_settings(AUDIT_ANCHOR_MODE="local_file", AUDIT_ANCHOR_HMAC_KEY="")
 
 
 def test_nonproduction_allows_disabled_audit_anchoring():

@@ -9,10 +9,13 @@ import {
   ApiError,
   NetworkError,
   apiFetch,
+  changePassword,
   getCookie,
   getMe,
   login,
   logout,
+  register,
+  updateMe,
 } from '../api';
 import type { UserResponse } from '../types';
 
@@ -22,6 +25,7 @@ const SAMPLE_USER: UserResponse = {
   full_name: 'Ada Lovelace',
   role: 'Viewer',
   is_active: true,
+  must_change_password: false,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',
 };
@@ -86,17 +90,34 @@ describe('apiFetch request construction', () => {
     expect(init.credentials).toBe('include');
     const headers = init.headers as Headers;
     expect(headers.get('X-CSRF-Token')).toBe('tok-123');
+    expect(headers.get('X-Request-ID')).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
     // logout sends no body, so no Content-Type is attached
     expect(headers.has('Content-Type')).toBe(false);
   });
 
-  it('does not inject a CSRF header for GET requests', async () => {
+  it('keeps a caller-supplied request ID on mutations', async () => {
+    document.cookie = 'trustvault_csrf=tok-123; path=/';
+    fetchMock.mockResolvedValueOnce(new Response(undefined, { status: 204 }));
+
+    await apiFetch('/api/v1/auth/logout', {
+      method: 'POST',
+      headers: { 'X-Request-ID': 'ui-test-123' },
+    });
+
+    const headers = (fetchMock.mock.calls[0] as [string, RequestInit])[1].headers as Headers;
+    expect(headers.get('X-Request-ID')).toBe('ui-test-123');
+  });
+
+  it('does not inject a CSRF or request ID header for GET requests', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(401, { detail: 'Not authenticated' }));
 
     await apiFetch('/api/v1/auth/me');
 
     const headers = (fetchMock.mock.calls[0] as [string, RequestInit])[1].headers as Headers;
     expect(headers.get('X-CSRF-Token')).toBeNull();
+    expect(headers.get('X-Request-ID')).toBeNull();
   });
 
   it('bootstraps the CSRF cookie with a GET before the first mutating request', async () => {
@@ -178,6 +199,68 @@ describe('login', () => {
     await expect(login('ada@example.com', 'x')).rejects.toMatchObject({
       status: 502,
       detail: 'Request failed (HTTP 502)',
+    });
+  });
+});
+
+describe('register / updateMe', () => {
+  beforeEach(() => {
+    document.cookie = 'trustvault_csrf=tok-123; path=/';
+  });
+
+  it('posts registration fields and returns the created user', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(201, SAMPLE_USER));
+
+    const user = await register('Ada Lovelace', 'ada@example.com', 'correct horse');
+
+    expect(user).toEqual(SAMPLE_USER);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/v1/auth/register');
+    expect(init.method).toBe('POST');
+    expect(init.body).toBe(
+      JSON.stringify({
+        full_name: 'Ada Lovelace',
+        email: 'ada@example.com',
+        password: 'correct horse',
+      }),
+    );
+  });
+
+  it('PATCHes only the supplied profile changes', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, SAMPLE_USER));
+
+    await updateMe({ full_name: 'Ada Byron' });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/v1/auth/me');
+    expect(init.method).toBe('PATCH');
+    expect(init.body).toBe(JSON.stringify({ full_name: 'Ada Byron' }));
+  });
+
+  it('posts the current and replacement passwords for a mandatory change', async () => {
+    const changed = { ...SAMPLE_USER, must_change_password: false };
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, changed));
+
+    const user = await changePassword('Temporary!Pass1', 'Changed!Pass2');
+
+    expect(user).toEqual(changed);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/v1/auth/change-password');
+    expect(init.method).toBe('POST');
+    expect(init.body).toBe(
+      JSON.stringify({
+        current_password: 'Temporary!Pass1',
+        new_password: 'Changed!Pass2',
+      }),
+    );
+  });
+
+  it('surfaces registration conflicts', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(409, { detail: 'Email already registered' }));
+
+    await expect(register('Ada', 'ada@example.com', 'correct horse')).rejects.toMatchObject({
+      status: 409,
+      detail: 'Email already registered',
     });
   });
 });

@@ -8,11 +8,15 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.exceptions import HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.staticfiles import StaticFiles
+from starlette.types import Scope
 
 from backend.app.api.health import router as health_router
 from backend.app.api.router import api_router
@@ -31,6 +35,7 @@ from backend.app.services.checkpoint_runtime import checkpoint_scheduler
 from backend.app.services.storage_lifecycle import StorageLifecycleService
 
 logger = logging.getLogger(__name__)
+FRONTEND_DIST_DIR = Path(__file__).resolve().parents[2] / "frontend_dist"
 
 
 @asynccontextmanager
@@ -170,9 +175,35 @@ app.include_router(api_router, prefix=settings.API_V1_PREFIX)
 @app.get("/", tags=["Root"])
 def root_info():
     """Root info endpoint."""
+    index_path = FRONTEND_DIST_DIR / "index.html"
+    if index_path.is_file():
+        return FileResponse(index_path)
     return {
         "app": settings.APP_NAME,
         "status": "online",
         "health": "/health",
         "api_v1": settings.API_V1_PREFIX,
     }
+
+
+class SPAStaticFiles(StaticFiles):
+    """Serve the frontend entry point for client-side routes."""
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        normalized_path = path.replace("\\", "/").lstrip("/")
+        if normalized_path == "api" or normalized_path.startswith("api/"):
+            return await super().get_response(path, scope)
+        try:
+            return await super().get_response(path, scope)
+        except HTTPException as exc:
+            if exc.status_code != 404 or Path(path).suffix:
+                raise
+            return await super().get_response("index.html", scope)
+
+
+if FRONTEND_DIST_DIR.is_dir():
+    app.mount(
+        "/",
+        SPAStaticFiles(directory=str(FRONTEND_DIST_DIR), html=True),
+        name="frontend",
+    )

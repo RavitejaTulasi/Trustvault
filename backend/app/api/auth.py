@@ -23,12 +23,13 @@ from backend.app.database import get_db
 from backend.app.models.audit import AuditOutcome
 from backend.app.models.user import User, UserRole
 from backend.app.schemas.auth import (
+    PasswordChangeRequest,
     UserLoginRequest,
     UserRegisterRequest,
     UserResponse,
     UserUpdateRequest,
 )
-from backend.app.security.auth import get_current_user
+from backend.app.security.auth import get_authenticated_user, get_current_user
 from backend.app.security.csrf import generate_csrf_token
 from backend.app.security.passwords import (
     hash_password,
@@ -324,7 +325,7 @@ def login(
 def logout(
     request: Request,
     response: Response,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_authenticated_user),
     db: Session = Depends(get_db),
 ) -> None:
     ip = request.state.client_ip
@@ -357,8 +358,85 @@ def logout(
     description="Returns profile information for the currently authenticated user.",
 )
 def get_me(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_authenticated_user),
 ) -> UserResponse:
+    return UserResponse.model_validate(current_user)
+
+
+@router.post(
+    "/change-password",
+    response_model=UserResponse,
+    summary="Complete a required password change",
+    description=(
+        "Verifies the current password, replaces it, clears the mandatory-change "
+        "flag, revokes every existing session, and issues a fresh session."
+    ),
+)
+def change_password(
+    body: PasswordChangeRequest,
+    request: Request,
+    response: Response,
+    current_user: User = Depends(get_authenticated_user),
+    db: Session = Depends(get_db),
+) -> UserResponse:
+    ip = request.state.client_ip
+    user_agent = request.state.user_agent
+    request_id = request.state.request_id
+
+    if not verify_password(body.current_password, current_user.hashed_password):
+        AuditService.log_event(
+            db,
+            action="user.password_change",
+            outcome=AuditOutcome.DENIED,
+            actor_id=current_user.id,
+            resource_type="user",
+            resource_id=current_user.id,
+            ip_address=ip,
+            user_agent=user_agent,
+            request_id=request_id,
+            details={"reason": "current_password_invalid"},
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+
+    if body.new_password == body.current_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from the current password",
+        )
+
+    current_user.hashed_password = hash_password(body.new_password)
+    current_user.must_change_password = False
+    sessions_revoked = revoke_all_user_sessions(db, current_user.id)
+    raw_token, _ = create_session(
+        db,
+        user=current_user,
+        ip_address=ip,
+        user_agent=user_agent,
+    )
+
+    AuditService.log_event(
+        db,
+        action="user.password_change",
+        outcome=AuditOutcome.SUCCESS,
+        actor_id=current_user.id,
+        resource_type="user",
+        resource_id=current_user.id,
+        ip_address=ip,
+        user_agent=user_agent,
+        request_id=request_id,
+        details={
+            "sessions_revoked": sessions_revoked,
+            "session_rotated": True,
+        },
+    )
+    db.commit()
+    db.refresh(current_user)
+
+    _set_session_cookie(response, raw_token)
     return UserResponse.model_validate(current_user)
 
 
