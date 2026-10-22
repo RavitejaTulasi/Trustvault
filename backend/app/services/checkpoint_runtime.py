@@ -421,7 +421,12 @@ def build_audit_anchor_health(
     details = {
         "status": status,
         "mode": mode,
-        "independent": mode == "s3",
+        # Selecting the S3 adapter is not evidence of independence: the endpoint
+        # may be on the same host or controlled by the same operator. This build
+        # has no verified external destination, so it never claims independence.
+        "independent": False,
+        "external_adapter": mode == "s3",
+        "independence_verified": False,
         "available": snapshot.last_checkpoint_at is not None,
         "last_checkpoint_at": _iso(snapshot.last_checkpoint_at),
         "checkpoint_sequence": snapshot.last_checkpoint_sequence,

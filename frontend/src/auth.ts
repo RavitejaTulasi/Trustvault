@@ -1,4 +1,7 @@
 import {
+  register as apiRegister,
+  changePassword as apiChangePassword,
+  updateMe as apiUpdateMe,
   login as apiLogin,
   getMe as apiGetMe,
   logout as apiLogout,
@@ -20,7 +23,27 @@ import type {
   GrantListResponse,
   GrantResponse,
   UserResponse,
+  UserUpdateRequest,
 } from './types';
+
+export async function register(
+  fullName: string,
+  email: string,
+  password: string,
+): Promise<UserResponse> {
+  return apiRegister(fullName, email, password);
+}
+
+export async function updateMe(changes: UserUpdateRequest): Promise<UserResponse> {
+  return apiUpdateMe(changes);
+}
+
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<UserResponse> {
+  return apiChangePassword(currentPassword, newPassword);
+}
 
 export async function login(email: string, password: string): Promise<UserResponse> {
   return apiLogin(email, password);

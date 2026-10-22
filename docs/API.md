@@ -41,7 +41,7 @@ This document details the complete API contract for TrustVault, including authen
 ### `GET /health`
 - **Authentication**: None (Public)
 - **Action**: Checks database connectivity and private-storage writability, and reports the checkpoint scheduler's last attempt, last success, last failure, latest checkpoint sequence/age, and overdue state. It does not contact the external checkpoint provider on every request.
-- **Response `200 OK`**: `status` is `healthy` when core services and anchoring are healthy, or `degraded` when core services are healthy but `components.audit_anchor` is not. The audit-anchor `status` is one of `not_configured`, `local_development_only`, `scheduler_stopped`, `starting`, `overdue`, `ok`, `invalid`, `incomplete`, `unavailable`, or `error`.
+- **Response `200 OK`**: `status` is `healthy` when core services and anchoring are healthy, or `degraded` when core services are healthy but `components.audit_anchor` is not. The audit-anchor `status` is one of `not_configured`, `local_development_only`, `scheduler_stopped`, `starting`, `overdue`, `ok`, `invalid`, `incomplete`, `unavailable`, or `error`. `mode` reports the configured adapter. `external_adapter` is true only when the `s3` adapter is selected. `independent` and `independence_verified` are always false in this build because no provider-side independent control or verification evidence exists; adapter selection alone never sets them.
 - **Response `503 Service Unavailable`**: Database or private storage is unavailable; `status` is `unhealthy`.
 - **Operational Note**: Alert on top-level `degraded` and on anchor failures/overdue conditions. A `local_development_only` anchor is non-independent and is never accepted in production.
 

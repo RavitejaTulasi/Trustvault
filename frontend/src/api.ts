@@ -1,11 +1,25 @@
 import type {
+  AdminPasswordResetResponse,
+  AdminUserCreateRequest,
+  AdminUserUpdateRequest,
+  AuditCheckpointCreateResponse,
+  AuditOutcome,
+  AuditCheckpointInfoResponse,
+  AuditCheckpointVerificationResponse,
+  AuditEventListParams,
+  AuditEventListResponse,
+  AuditVerificationResponse,
   DocumentListParams,
   DocumentListResponse,
   DocumentResponse,
   DocumentUpdateRequest,
   GrantListResponse,
   GrantResponse,
+  HealthResponse,
+  UserListResponse,
   UserResponse,
+  UserSessionsRevokedResponse,
+  UserUpdateRequest,
 } from './types';
 
 /**
@@ -49,6 +63,16 @@ export function getCookie(name: string): string | undefined {
 
 const CSRF_HEADER_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
+function ensureRequestId(headers: Headers): void {
+  if (headers.has('X-Request-ID')) {
+    return;
+  }
+  if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
+    return;
+  }
+  headers.set('X-Request-ID', crypto.randomUUID());
+}
+
 /**
  * The backend CSRF middleware sets the `trustvault_csrf` cookie on the response
  * of any request when the browser does not have one yet. A single harmless GET
@@ -75,6 +99,7 @@ export async function apiFetch(path: string, options: RequestInit = {}): Promise
   }
 
   if (CSRF_HEADER_METHODS.has(method)) {
+    ensureRequestId(headers);
     let csrfToken = getCookie(CSRF_COOKIE_NAME);
     if (!csrfToken) {
       await bootstrapCsrfCookie();
@@ -128,6 +153,49 @@ export async function parseJsonResponse<T>(response: Response): Promise<T> {
   }
 }
 
+export async function register(
+  fullName: string,
+  email: string,
+  password: string,
+): Promise<UserResponse> {
+  const response = await apiFetch('/api/v1/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ full_name: fullName, email, password }),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<UserResponse>(response);
+}
+
+export async function updateMe(changes: UserUpdateRequest): Promise<UserResponse> {
+  const response = await apiFetch('/api/v1/auth/me', {
+    method: 'PATCH',
+    body: JSON.stringify(changes),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<UserResponse>(response);
+}
+
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<UserResponse> {
+  const response = await apiFetch('/api/v1/auth/change-password', {
+    method: 'POST',
+    body: JSON.stringify({
+      current_password: currentPassword,
+      new_password: newPassword,
+    }),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<UserResponse>(response);
+}
+
 export async function login(email: string, password: string): Promise<UserResponse> {
   const response = await apiFetch('/api/v1/auth/login', {
     method: 'POST',
@@ -162,6 +230,19 @@ export async function logout(): Promise<void> {
   }
 }
 
+/**
+ * Read deployment health without exposing any secret material. The audit
+ * anchor component is used to decide whether checkpoint controls are honest
+ * to display: only an independently verified external provider qualifies.
+ */
+export async function getHealth(): Promise<HealthResponse> {
+  const response = await apiFetch('/health');
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<HealthResponse>(response);
+}
+
 function buildQuery(params: DocumentListParams): string {
   const query = new URLSearchParams();
   const entries: Array<[string, string]> = [];
@@ -172,6 +253,10 @@ function buildQuery(params: DocumentListParams): string {
   const category = params.category?.trim() ?? '';
   if (category !== '') {
     entries.push(['category', category]);
+  }
+  const ownerId = params.owner_id?.trim() ?? '';
+  if (ownerId !== '') {
+    entries.push(['owner_id', ownerId]);
   }
   if (params.created_from !== undefined && params.created_from !== '') {
     entries.push(['created_from', params.created_from]);
@@ -323,4 +408,167 @@ export async function revokeGrant(id: string, userId: string): Promise<void> {
   if (!response.ok) {
     throw await toApiError(response);
   }
+}
+
+function buildAuditQuery(params: AuditEventListParams): string {
+  const query = new URLSearchParams();
+  if (params.page !== undefined) query.append('page', String(params.page));
+  if (params.page_size !== undefined) query.append('page_size', String(params.page_size));
+  if (params.actor_id !== undefined && params.actor_id.trim() !== '') {
+    query.append('actor_id', params.actor_id.trim());
+  }
+  if (params.action !== undefined && params.action.trim() !== '') {
+    query.append('action', params.action.trim());
+  }
+  if (params.resource_type !== undefined && params.resource_type.trim() !== '') {
+    query.append('resource_type', params.resource_type.trim());
+  }
+  if (params.resource_id !== undefined && params.resource_id.trim() !== '') {
+    query.append('resource_id', params.resource_id.trim());
+  }
+  if (params.outcome !== undefined) query.append('outcome', params.outcome);
+  if (params.timestamp_from !== undefined && params.timestamp_from !== '') {
+    query.append('timestamp_from', params.timestamp_from);
+  }
+  if (params.timestamp_to !== undefined && params.timestamp_to !== '') {
+    query.append('timestamp_to', params.timestamp_to);
+  }
+  const encoded = query.toString();
+  return encoded === '' ? '' : `?${encoded}`;
+}
+
+export async function listAuditEvents(
+  params: AuditEventListParams = {},
+): Promise<AuditEventListResponse> {
+  const response = await apiFetch(`/api/v1/admin/audit${buildAuditQuery(params)}`);
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<AuditEventListResponse>(response);
+}
+
+export async function verifyAuditChain(): Promise<AuditVerificationResponse> {
+  const response = await apiFetch('/api/v1/admin/audit/verify');
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<AuditVerificationResponse>(response);
+}
+
+export async function getAuditCheckpoint(): Promise<AuditCheckpointInfoResponse> {
+  const response = await apiFetch('/api/v1/admin/audit/checkpoints');
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<AuditCheckpointInfoResponse>(response);
+}
+
+export async function createAuditCheckpoint(): Promise<AuditCheckpointCreateResponse> {
+  const response = await apiFetch('/api/v1/admin/audit/checkpoints', { method: 'POST' });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<AuditCheckpointCreateResponse>(response);
+}
+
+export async function verifyAuditCheckpoint(): Promise<AuditCheckpointVerificationResponse> {
+  const response = await apiFetch('/api/v1/admin/audit/checkpoints/verify');
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<AuditCheckpointVerificationResponse>(response);
+}
+
+export async function listDocumentActivity(params: {
+  document_id?: string;
+  actor_id?: string;
+  action?: string;
+  outcome?: AuditOutcome;
+  page?: number;
+  page_size?: number;
+}): Promise<AuditEventListResponse> {
+  const query = new URLSearchParams();
+  if (params.document_id) query.append('document_id', params.document_id);
+  if (params.actor_id) query.append('actor_id', params.actor_id);
+  if (params.action) query.append('action', params.action);
+  if (params.outcome) query.append('outcome', params.outcome);
+  if (params.page !== undefined) query.append('page', String(params.page));
+  if (params.page_size !== undefined) query.append('page_size', String(params.page_size));
+  const response = await apiFetch(`/api/v1/admin/documents/activity?${query.toString()}`);
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<AuditEventListResponse>(response);
+}
+
+export async function listUsers(params: {
+  page?: number;
+  page_size?: number;
+} = {}): Promise<UserListResponse> {
+  const query = new URLSearchParams();
+  if (params.page !== undefined) query.append('page', String(params.page));
+  if (params.page_size !== undefined) query.append('page_size', String(params.page_size));
+  const encoded = query.toString();
+  const response = await apiFetch(`/api/v1/admin/users${encoded === '' ? '' : `?${encoded}`}`);
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<UserListResponse>(response);
+}
+
+export async function createUser(
+  account: AdminUserCreateRequest,
+): Promise<UserResponse> {
+  const response = await apiFetch('/api/v1/admin/users', {
+    method: 'POST',
+    body: JSON.stringify(account),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<UserResponse>(response);
+}
+
+export async function updateUser(
+  id: string,
+  changes: AdminUserUpdateRequest,
+): Promise<UserResponse> {
+  const response = await apiFetch(`/api/v1/admin/users/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(changes),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<UserResponse>(response);
+}
+
+export async function resetUserPassword(
+  id: string,
+  password: string,
+): Promise<AdminPasswordResetResponse> {
+  const response = await apiFetch(
+    `/api/v1/admin/users/${encodeURIComponent(id)}/reset-password`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    },
+  );
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<AdminPasswordResetResponse>(response);
+}
+
+export async function revokeUserSessions(
+  id: string,
+): Promise<UserSessionsRevokedResponse> {
+  const response = await apiFetch(
+    `/api/v1/admin/users/${encodeURIComponent(id)}/revoke-sessions`,
+    { method: 'POST' },
+  );
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<UserSessionsRevokedResponse>(response);
 }

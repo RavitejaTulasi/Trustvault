@@ -21,19 +21,15 @@ from backend.app.models.user import User, UserRole
 from backend.app.security.sessions import get_valid_session
 
 
-def get_current_user(
+def get_authenticated_user(
     request: Request,
     db: Session = Depends(get_db),
 ) -> User:
     """
-    FastAPI dependency that authenticates the current request via session cookie.
+    Authenticate the request without enforcing a completed password change.
 
-    Raises HTTP 401 if:
-    - No session cookie is present
-    - The session token is invalid, expired, or revoked
-    - The associated user account is deactivated
-
-    Returns the User ORM object on success.
+    Only endpoints needed to finish the mandatory password-change flow should use
+    this dependency directly. All workspace APIs must use ``get_current_user``.
     """
     raw_token: str | None = request.cookies.get(settings.SESSION_COOKIE_NAME)
 
@@ -65,6 +61,19 @@ def get_current_user(
     return user
 
 
+def get_current_user(
+    current_user: User = Depends(get_authenticated_user),
+) -> User:
+    """Return an authenticated user who has completed any required password change."""
+    if current_user.must_change_password:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Password change required",
+            headers={"X-Password-Change-Required": "true"},
+        )
+    return current_user
+
+
 def get_current_user_optional(
     request: Request,
     db: Session = Depends(get_db),
@@ -74,7 +83,7 @@ def get_current_user_optional(
     Useful for endpoints that serve both authenticated and anonymous users differently.
     """
     try:
-        return get_current_user(request=request, db=db)
+        return get_authenticated_user(request=request, db=db)
     except HTTPException:
         return None
 

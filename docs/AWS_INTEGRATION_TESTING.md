@@ -7,6 +7,28 @@ explicitly approved test bucket can verify the adapter end to end. Until that
 run happens and its output is recorded, no live verification of the S3 adapter
 is claimed.
 
+## Exact infrastructure blocker
+
+Independent anchoring cannot be enabled from this worktree until all of the
+following exist:
+
+1. An independently administered AWS account (or equivalently controlled
+   S3-compatible provider) with a dedicated bucket for audit checkpoints.
+2. Bucket versioning enabled and, for tamper resistance, Object Lock enabled at
+   bucket creation with an approved retention mode and duration.
+3. A least-privilege workload identity that can write and read only the anchor
+   prefix and cannot delete objects or bypass retention. Credentials must reach
+   boto3 through an approved credential chain, never through source control.
+4. An approved region and, for a custom provider, an HTTPS endpoint whose
+   conditional-write and read-after-write behavior has been verified.
+5. A recorded live run of the opt-in tests and the checkpoint create/verify API,
+   with provider-side configuration evidence. Until then, `/health` must keep
+   reporting `independent: false` and `independence_verified: false`.
+
+The repository itself supplies none of these. The local Docker/MinIO attempt is
+also blocked because the required container image could not be pulled. Local
+file anchoring is development-only and does not satisfy this requirement.
+
 The default unit suite (`python -m pytest backend/tests/ -q`) never touches
 AWS. The integration module is collected but skipped, and it is reported as
 skipped (`NOT RUN`), never as passed.

@@ -10,6 +10,7 @@ Exports:
 """
 
 from backend.app.security.auth import (
+    get_authenticated_user,
     get_current_user,
     get_current_user_optional,
     require_admin,
@@ -30,6 +31,7 @@ __all__ = [
     "LoginRateLimiter",
     "create_session",
     "generate_csrf_token",
+    "get_authenticated_user",
     "get_current_user",
     "get_current_user_optional",
     "get_valid_session",

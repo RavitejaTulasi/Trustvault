@@ -81,11 +81,17 @@ describe('listDocuments', () => {
       jsonResponse(200, { documents: [], total: 0, page: 1, page_size: 25 }),
     );
 
-    await listDocuments({ page: 2, page_size: 50, q: 'aud it%', category: 'Fin youre' });
+    await listDocuments({
+      page: 2,
+      page_size: 50,
+      q: 'aud it%',
+      category: 'Fin youre',
+      owner_id: ' usr 2 ',
+    });
 
     const url = (fetchMock.mock.calls[0] as [string, RequestInit])[0];
     expect(url).toBe(
-      '/api/v1/documents?page=2&page_size=50&q=aud+it%25&category=Fin+youre',
+      '/api/v1/documents?page=2&page_size=50&q=aud+it%25&category=Fin+youre&owner_id=usr+2',
     );
   });
 
@@ -94,7 +100,7 @@ describe('listDocuments', () => {
       jsonResponse(200, { documents: [], total: 0, page: 3, page_size: 25 }),
     );
 
-    await listDocuments({ page: 3, q: '  ', category: '' });
+    await listDocuments({ page: 3, q: '  ', category: '', owner_id: '  ' });
 
     const url = (fetchMock.mock.calls[0] as [string, RequestInit])[0];
     expect(url).toBe('/api/v1/documents?page=3');

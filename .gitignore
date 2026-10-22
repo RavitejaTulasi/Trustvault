@@ -68,3 +68,10 @@ dist-ssr/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+
+# Local OpenCode configuration
+/opencode.json
+
+# Temporary recovery artifact
+/trustvault-recovery.patch

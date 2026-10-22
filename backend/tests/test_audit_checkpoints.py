@@ -843,4 +843,6 @@ async def test_health_reports_anchor_mode(
     assert local_response.status_code == 200
     local_anchor = local_response.json()["components"]["audit_anchor"]
     assert local_anchor["status"] == "local_development_only"
+    assert local_anchor["external_adapter"] is False
     assert local_anchor["independent"] is False
+    assert local_anchor["independence_verified"] is False

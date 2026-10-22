@@ -43,6 +43,7 @@ const OWNER: UserResponse = {
   full_name: 'Ada Lovelace',
   role: 'owner',
   is_active: true,
+  must_change_password: false,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',
 };
@@ -53,6 +54,7 @@ const VIEWER: UserResponse = {
   full_name: 'Bob Viewer',
   role: 'viewer',
   is_active: true,
+  must_change_password: false,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',
 };
@@ -165,7 +167,7 @@ describe('Documents page (component)', () => {
     expect(screen.getByLabelText('File')).toBeInTheDocument();
   });
 
-  it('uploads with the selected file, title, and category, then reloads page 1', async () => {
+  it('reviews an upload before sending the selected file, title, and category', async () => {
     const user = userEvent.setup();
     mockGetMe.mockResolvedValue(OWNER);
     mockListDocuments.mockResolvedValue(listResponse());
@@ -178,7 +180,14 @@ describe('Documents page (component)', () => {
     await user.upload(screen.getByLabelText('File'), file);
     await user.type(screen.getByLabelText('Title'), 'Quarterly Financial Audit');
     await user.type(screen.getByLabelText('Category (optional)'), 'Financial');
-    await user.click(screen.getByRole('button', { name: 'Upload' }));
+    await user.click(screen.getByRole('button', { name: 'Review upload' }));
+
+    expect(mockUploadDocument).not.toHaveBeenCalled();
+    expect(screen.getByRole('group', { name: 'Review upload' })).toHaveTextContent(
+      'Quarterly Financial Audit',
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Confirm upload' }));
 
     await waitFor(() => expect(mockUploadDocument).toHaveBeenCalledTimes(1));
     const [sentFile, sentTitle, sentCategory] = mockUploadDocument.mock.calls[0];
@@ -186,7 +195,7 @@ describe('Documents page (component)', () => {
     expect(sentTitle).toBe('Quarterly Financial Audit');
     expect(sentCategory).toBe('Financial');
     expect(mockListDocuments.mock.lastCall?.[0]).toMatchObject({ page: 1 });
-    expect(screen.getByRole('button', { name: 'Upload' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Review upload' })).toBeEnabled();
   });
 
   it('shows the backend rejection detail when an upload fails', async () => {
@@ -203,7 +212,8 @@ describe('Documents page (component)', () => {
       new File(['x'], 'big.bin', { type: 'application/octet-stream' }),
     );
     await user.type(screen.getByLabelText('Title'), 'Big file');
-    await user.click(screen.getByRole('button', { name: 'Upload' }));
+    await user.click(screen.getByRole('button', { name: 'Review upload' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm upload' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Storage quota exceeded');
   });
@@ -300,6 +310,7 @@ describe('DocumentDetail page (component)', () => {
   }
 
   it('shows metadata plus owner-only edit/delete/sharing controls', async () => {
+    const user = userEvent.setup();
     mockGetMe.mockResolvedValue(OWNER);
     mockGetDocument.mockResolvedValue(DOC_A);
     mockListGrants.mockResolvedValue({ grants: [] });
@@ -308,9 +319,13 @@ describe('DocumentDetail page (component)', () => {
 
     expect(await screen.findByText('Quarterly Financial Audit')).toBeInTheDocument();
     expect(screen.getByText('q3_audit.pdf')).toBeInTheDocument();
-    expect(screen.getByText('Sharing')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Edit title / category' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('tab', { name: 'Access' }));
+    expect(
+      screen.getByRole('heading', { name: 'Sharing', level: 2 }),
+    ).toBeInTheDocument();
   });
 
   it('shows the deliberate 404 message when the caller has no access', async () => {
@@ -381,10 +396,14 @@ describe('DocumentDetail page (component)', () => {
     });
 
     renderDetail();
+    await user.click(await screen.findByRole('tab', { name: 'Access' }));
     await screen.findByText('No permission grants for this document yet.');
 
     await user.type(screen.getByLabelText('User ID'), 'usr_2');
-    await user.click(screen.getByRole('button', { name: 'Grant access' }));
+    await user.click(screen.getByRole('button', { name: 'Review grant' }));
+    expect(mockCreateGrant).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: 'Confirm grant access' }));
 
     await waitFor(() => expect(mockCreateGrant).toHaveBeenCalledWith('doc_1', 'usr_2', 'read'));
     expect(await screen.findByText('usr_2')).toBeInTheDocument();
@@ -408,6 +427,7 @@ describe('DocumentDetail page (component)', () => {
     mockRevokeGrant.mockResolvedValue(undefined);
 
     renderDetail();
+    await user.click(await screen.findByRole('tab', { name: 'Access' }));
     await screen.findByText('usr_2');
 
     await user.click(screen.getByRole('button', { name: 'Revoke' }));
@@ -439,6 +459,7 @@ describe('DocumentDetail page (component)', () => {
     mockRevokeGrant.mockRejectedValue(new ApiError(404, 'No active grant for that recipient'));
 
     renderDetail();
+    await user.click(await screen.findByRole('tab', { name: 'Access' }));
     await screen.findByText('usr_2');
 
     await user.click(screen.getByRole('button', { name: 'Revoke' }));

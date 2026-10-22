@@ -867,7 +867,9 @@ async def test_health_reports_unstarted_external_anchor_as_degraded(
     anchor = data["components"]["audit_anchor"]
     assert anchor["status"] == "scheduler_stopped"
     assert anchor["mode"] == "s3"
-    assert anchor["independent"] is True
+    assert anchor["external_adapter"] is True
+    assert anchor["independent"] is False
+    assert anchor["independence_verified"] is False
     assert anchor["available"] is False
     assert anchor["scheduler"]["running"] is False
 

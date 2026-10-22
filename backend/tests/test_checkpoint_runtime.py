@@ -262,6 +262,30 @@ def test_health_reports_provider_unavailability_from_scheduler_evidence():
     assert health.details["overdue"] is False
 
 
+def test_health_never_claims_independence_from_adapter_selection():
+    local = build_audit_anchor_health(
+        make_config(AUDIT_ANCHOR_MODE="local_file"),
+        FakeScheduler(snapshot()),
+        now=NOW,
+    )
+    custom_endpoint = build_audit_anchor_health(
+        make_config(
+            AUDIT_ANCHOR_MODE="s3",
+            AUDIT_ANCHOR_S3_BUCKET="audit-bucket",
+            AUDIT_ANCHOR_S3_REGION="us-east-1",
+            AUDIT_ANCHOR_S3_ENDPOINT_URL="http://127.0.0.1:9000",
+        ),
+        FakeScheduler(snapshot()),
+        now=NOW,
+    )
+
+    assert local.details["external_adapter"] is False
+    assert local.details["independent"] is False
+    assert custom_endpoint.details["external_adapter"] is True
+    assert custom_endpoint.details["independent"] is False
+    assert custom_endpoint.details["independence_verified"] is False
+
+
 def test_disabled_anchor_is_healthy_outside_production():
     health = build_audit_anchor_health(
         make_config(AUDIT_ANCHOR_MODE="disabled"),

@@ -30,6 +30,7 @@ const SAMPLE_USER: UserResponse = {
   full_name: 'Ada Lovelace',
   role: 'Viewer',
   is_active: true,
+  must_change_password: false,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',
 };
@@ -39,7 +40,8 @@ function renderLoginRoutes(initialEntry: string) {
     <MemoryRouter initialEntries={[initialEntry]}>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
-        <Route path="/dashboard" element={<div>Dashboard region</div>} />
+        <Route path="/" element={<div>Dashboard region</div>} />
+        <Route path="/change-password" element={<div>Mandatory password region</div>} />
         <Route path="*" element={<div>Unknown route</div>} />
       </Routes>
     </MemoryRouter>,
@@ -101,6 +103,19 @@ describe('LoginPage (component)', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Incorrect email or password');
   }, 10000);
 
+  it('routes first-login accounts to the mandatory password page', async () => {
+    const user = userEvent.setup();
+    mockGetMe.mockResolvedValue(null);
+    mockLogin.mockResolvedValue({ ...SAMPLE_USER, must_change_password: true });
+
+    renderLoginRoutes('/login');
+    await user.type(screen.getByLabelText('Email'), 'ada@example.com');
+    await user.type(screen.getByLabelText('Password'), 'temporary pass');
+    await user.click(screen.getByRole('button', { name: 'Sign in' }));
+
+    expect(await screen.findByText('Mandatory password region')).toBeInTheDocument();
+  }, 10000);
+
   it('shows a network failure distinctly from a rejected password', async () => {
     const user = userEvent.setup();
     mockGetMe.mockResolvedValue(null);
@@ -120,6 +135,17 @@ describe('Dashboard (component)', () => {
     mockGetMe.mockResolvedValue(SAMPLE_USER);
     renderDashboardRoutes('/dashboard');
     expect(await screen.findByText(/Welcome, Ada Lovelace/)).toBeInTheDocument();
+  });
+
+  it('renders immediately when the home route already resolved the session', () => {
+    render(
+      <MemoryRouter>
+        <Dashboard initialUser={SAMPLE_USER} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/Welcome, Ada Lovelace/)).toBeInTheDocument();
+    expect(mockGetMe).not.toHaveBeenCalled();
   });
 
   it('redirects to login when the session is gone (401 → null)', async () => {

@@ -57,6 +57,36 @@ class UserLoginRequest(BaseModel):
     )
 
 
+class PasswordChangeRequest(BaseModel):
+    """Request body for replacing the signed-in user's password."""
+    current_password: str = Field(
+        min_length=1,
+        max_length=128,
+        description="The account's current password",
+    )
+    new_password: str = Field(
+        min_length=12,
+        max_length=128,
+        description="New password (12-128 characters with full complexity)",
+    )
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_password_strength(cls, v: str) -> str:
+        errors = []
+        if not any(c.isupper() for c in v):
+            errors.append("at least one uppercase letter")
+        if not any(c.islower() for c in v):
+            errors.append("at least one lowercase letter")
+        if not any(c.isdigit() for c in v):
+            errors.append("at least one digit")
+        if not any(c in "!@#$%^&*()_+-=[]{}|;':\",./<>?" for c in v):
+            errors.append("at least one special character")
+        if errors:
+            raise ValueError(f"Password must contain {', '.join(errors)}")
+        return v
+
+
 class UserResponse(BaseModel):
     """Safe user representation for API responses (never exposes password hash)."""
     id: str
@@ -64,6 +94,7 @@ class UserResponse(BaseModel):
     full_name: str
     role: str
     is_active: bool
+    must_change_password: bool
     created_at: datetime
     updated_at: datetime
 
@@ -112,6 +143,58 @@ class UserUpdateRequest(BaseModel):
         if len(stripped) < 2:
             raise ValueError("Full name must be at least 2 characters")
         return stripped
+
+
+class AdminUserCreateRequest(UserRegisterRequest):
+    """Admin-only: create an account with an explicit role."""
+    role: str = Field(
+        default="viewer",
+        description="Initial role: 'admin', 'owner', or 'viewer'",
+    )
+    is_active: bool = Field(
+        default=True,
+        description="Whether the account can sign in immediately",
+    )
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        from backend.app.models.user import UserRole
+
+        if v not in UserRole.ALL_ROLES:
+            raise ValueError(f"Role must be one of: {sorted(UserRole.ALL_ROLES)}")
+        return v
+
+
+class AdminPasswordResetRequest(BaseModel):
+    """Admin-only: set a replacement password for another account."""
+    password: str = Field(
+        min_length=12,
+        max_length=128,
+        description="Replacement password (12-128 characters with full complexity)",
+    )
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, v: str) -> str:
+        errors = []
+        if not any(c.isupper() for c in v):
+            errors.append("at least one uppercase letter")
+        if not any(c.islower() for c in v):
+            errors.append("at least one lowercase letter")
+        if not any(c.isdigit() for c in v):
+            errors.append("at least one digit")
+        if not any(c in "!@#$%^&*()_+-=[]{}|;':\",./<>?" for c in v):
+            errors.append("at least one special character")
+        if errors:
+            raise ValueError(f"Password must contain {', '.join(errors)}")
+        return v
+
+
+class AdminPasswordResetResponse(BaseModel):
+    """Result of an administrator-assisted password reset."""
+    user_id: str
+    sessions_revoked: int
 
 
 class AdminUserUpdateRequest(BaseModel):
