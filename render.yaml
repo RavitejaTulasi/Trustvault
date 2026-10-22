@@ -37,15 +37,13 @@ services:
         value: "true"
       - key: CORS_ORIGINS
         value: https://trustvault.onrender.com
-      # Production startup requires external checkpoint anchoring. Supply these
-      # values from the Render dashboard before deploying. No bucket, endpoint,
-      # credentials, or HMAC key is stored in this repository.
+      # Local checkpoints are HMAC-protected but share the application's
+      # persistent disk and are not independent/tamper-resistant against host
+      # compromise. External checkpoint adapters are not included in this build.
       - key: AUDIT_ANCHOR_MODE
-        value: s3
-      - key: AUDIT_ANCHOR_S3_BUCKET
-        sync: false
-      - key: AUDIT_ANCHOR_S3_REGION
-        sync: false
+        value: local_file
+      - key: AUDIT_ANCHOR_DIR
+        value: /var/data/private_storage/audit_checkpoints
       - key: AUDIT_ANCHOR_HMAC_KEY
         sync: false
       - key: AUDIT_CHECKPOINT_INTERVAL_SECONDS

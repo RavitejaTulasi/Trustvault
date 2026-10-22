@@ -12,8 +12,3 @@ pytest>=8.3.0
 pytest-asyncio>=0.24.0
 cryptography>=43.0.0
 email-validator>=2.2.0
-# External audit checkpoint anchoring (AUDIT_ANCHOR_MODE=s3). Uses the AWS
-# default credential chain; no credentials are configured in this repository.
-# Conditional PutObject (IfNoneMatch) requires a client model with S3
-# conditional-write support; 1.36.0 is the documented minimum.
-boto3>=1.36.0

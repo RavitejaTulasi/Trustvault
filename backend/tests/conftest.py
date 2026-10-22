@@ -30,10 +30,6 @@ def pytest_configure(config):
     """Register opt-in markers so unknown-mark warnings never fail strict runs."""
     config.addinivalue_line(
         "markers",
-        "aws_integration: opt-in tests that use real AWS S3 and an explicitly approved bucket",
-    )
-    config.addinivalue_line(
-        "markers",
         "postgres_integration: opt-in tests that use an explicitly approved PostgreSQL test database",
     )
 

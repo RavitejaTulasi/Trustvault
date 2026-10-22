@@ -52,10 +52,8 @@ def make_production_config(**overrides: object) -> Settings:
         "ENVIRONMENT": "production",
         "SESSION_COOKIE_SECURE": True,
         "DATABASE_URL": PRODUCTION_DATABASE_URL,
-        "AUDIT_ANCHOR_MODE": "s3",
+        "AUDIT_ANCHOR_MODE": "local_file",
         "AUDIT_ANCHOR_HMAC_KEY": "k" * 64,
-        "AUDIT_ANCHOR_S3_BUCKET": "audit-bucket",
-        "AUDIT_ANCHOR_S3_REGION": "us-east-1",
         "AUDIT_CHECKPOINT_INTERVAL_SECONDS": 60,
         "AUDIT_CHECKPOINT_MAX_AGE_SECONDS": 120,
     }
@@ -229,7 +227,7 @@ def test_health_reports_overdue_checkpoint():
     )
 
     health = build_audit_anchor_health(
-        make_config(AUDIT_ANCHOR_MODE="s3", AUDIT_ANCHOR_S3_BUCKET="audit-bucket", AUDIT_ANCHOR_S3_REGION="us-east-1"),
+        make_config(AUDIT_ANCHOR_MODE="local_file"),
         FakeScheduler(state),
         now=NOW,
     )
@@ -240,7 +238,7 @@ def test_health_reports_overdue_checkpoint():
     assert health.details["checkpoint_age_seconds"] == 300
 
 
-def test_health_reports_provider_unavailability_from_scheduler_evidence():
+def test_health_reports_store_unavailability_from_scheduler_evidence():
     state = snapshot(
         last_success_at=None,
         last_checkpoint_at=None,
@@ -251,7 +249,7 @@ def test_health_reports_provider_unavailability_from_scheduler_evidence():
     )
 
     health = build_audit_anchor_health(
-        make_config(AUDIT_ANCHOR_MODE="s3", AUDIT_ANCHOR_S3_BUCKET="audit-bucket", AUDIT_ANCHOR_S3_REGION="us-east-1"),
+        make_config(AUDIT_ANCHOR_MODE="local_file"),
         FakeScheduler(state),
         now=NOW,
     )
@@ -262,28 +260,31 @@ def test_health_reports_provider_unavailability_from_scheduler_evidence():
     assert health.details["overdue"] is False
 
 
-def test_health_never_claims_independence_from_adapter_selection():
+def test_local_file_health_never_claims_independence():
     local = build_audit_anchor_health(
         make_config(AUDIT_ANCHOR_MODE="local_file"),
         FakeScheduler(snapshot()),
         now=NOW,
     )
-    custom_endpoint = build_audit_anchor_health(
-        make_config(
-            AUDIT_ANCHOR_MODE="s3",
-            AUDIT_ANCHOR_S3_BUCKET="audit-bucket",
-            AUDIT_ANCHOR_S3_REGION="us-east-1",
-            AUDIT_ANCHOR_S3_ENDPOINT_URL="http://127.0.0.1:9000",
+
+    assert local.details["independent"] is False
+    assert local.details["external_adapter"] is False
+    assert local.details["independence_verified"] is False
+
+
+def test_production_local_file_anchor_health_is_degraded():
+    health = build_audit_anchor_health(
+        make_production_config(
+            AUDIT_ANCHOR_MODE="local_file",
         ),
         FakeScheduler(snapshot()),
         now=NOW,
     )
 
-    assert local.details["external_adapter"] is False
-    assert local.details["independent"] is False
-    assert custom_endpoint.details["external_adapter"] is True
-    assert custom_endpoint.details["independent"] is False
-    assert custom_endpoint.details["independence_verified"] is False
+    assert health.status == "local_only"
+    assert health.healthy is False
+    assert health.details["available"] is True
+    assert health.details["independent"] is False
 
 
 def test_disabled_anchor_is_healthy_outside_production():
@@ -306,13 +307,15 @@ def test_runtime_validation_rejects_disabled_production_anchor():
         validate_checkpoint_runtime(config)
 
 
-def test_runtime_validation_requires_external_production_adapter():
+def test_runtime_validation_accepts_local_file_production_adapter(tmp_path):
     config = make_production_config().model_copy(
-        update={"AUDIT_ANCHOR_MODE": "local_file"}
+        update={
+            "AUDIT_ANCHOR_MODE": "local_file",
+            "AUDIT_ANCHOR_DIR": str(tmp_path / "audit_checkpoints"),
+        }
     )
 
-    with pytest.raises(RuntimeError, match="s3 adapter"):
-        validate_checkpoint_runtime(config)
+    assert validate_checkpoint_runtime(config) is True
 
 
 def test_runtime_validation_fails_when_production_adapter_cannot_initialize(

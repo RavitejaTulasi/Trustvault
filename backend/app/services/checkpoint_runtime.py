@@ -110,11 +110,7 @@ def _failure_status(reason: str) -> str:
         return "invalid"
     if reason == "chain_incomplete":
         return "incomplete"
-    if reason in {
-        "anchor_unavailable",
-        "anchor_access_denied",
-        "database_unavailable",
-    }:
+    if reason in {"anchor_unavailable", "database_unavailable"}:
         return "unavailable"
     return "error"
 
@@ -340,9 +336,8 @@ def validate_checkpoint_runtime(config: Settings = settings) -> bool:
     """
     Validate that scheduled anchoring can start.
 
-    Production must use an external adapter and must not start with a missing
-    SDK/configuration. A provider being unreachable is not a startup failure; the
-    scheduler records that as an observable runtime failure instead.
+    Production must have an initialized checkpoint store. A local-file store
+    that becomes unavailable after startup is reported by the scheduler.
     """
     if config.AUDIT_ANCHOR_MODE == "disabled":
         if config.ENVIRONMENT == "production":
@@ -350,11 +345,6 @@ def validate_checkpoint_runtime(config: Settings = settings) -> bool:
                 "Audit checkpoint anchoring must be enabled in production."
             )
         return False
-
-    if config.ENVIRONMENT == "production" and config.AUDIT_ANCHOR_MODE != "s3":
-        raise RuntimeError(
-            "Production audit checkpoint anchoring requires the external s3 adapter."
-        )
 
     store = create_checkpoint_store(config)
     if isinstance(store, UnavailableCheckpointStore):
@@ -403,7 +393,7 @@ def build_audit_anchor_health(
         status = _failure_status(snapshot.last_failure_reason or "internal_error")
         healthy = False
     elif mode == "local_file":
-        status = "local_development_only"
+        status = "overdue" if overdue else "local_only"
         healthy = config.ENVIRONMENT != "production" and not overdue
     elif not snapshot.running:
         status = "scheduler_stopped"
@@ -421,11 +411,9 @@ def build_audit_anchor_health(
     details = {
         "status": status,
         "mode": mode,
-        # Selecting the S3 adapter is not evidence of independence: the endpoint
-        # may be on the same host or controlled by the same operator. This build
-        # has no verified external destination, so it never claims independence.
+        # Local files share the application's host and filesystem failure domain.
         "independent": False,
-        "external_adapter": mode == "s3",
+        "external_adapter": False,
         "independence_verified": False,
         "available": snapshot.last_checkpoint_at is not None,
         "last_checkpoint_at": _iso(snapshot.last_checkpoint_at),

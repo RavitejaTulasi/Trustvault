@@ -14,9 +14,7 @@ import SharedWithMe from '../pages/SharedWithMe';
 import AccessSharing from '../pages/AccessSharing';
 import Activity from '../pages/Activity';
 import type {
-  AuditCheckpointCreateResponse,
   AuditCheckpointInfoResponse,
-  AuditCheckpointVerificationResponse,
   AuditEventResponse,
   DocumentListItem,
   GrantResponse,
@@ -147,33 +145,6 @@ const NO_CHECKPOINT: AuditCheckpointInfoResponse = {
   format_version: null,
 };
 
-const CHECKPOINT_INFO: AuditCheckpointInfoResponse = {
-  anchor_mode: 's3',
-  available: true,
-  stream_id: 'audit',
-  sequence_number: 12,
-  created_at: '2026-01-02T00:00:00Z',
-  format_version: 1,
-};
-
-const CHECKPOINT_CREATE: AuditCheckpointCreateResponse = {
-  status: 'CREATED',
-  anchor_mode: 's3',
-  stream_id: 'audit',
-  sequence_number: 13,
-  created_at: '2026-01-03T00:00:00Z',
-};
-
-const CHECKPOINT_VERIFICATION: AuditCheckpointVerificationResponse = {
-  status: 'VALID',
-  is_valid: true,
-  records_verified: 13,
-  checkpoint_sequence: 13,
-  chain_head_sequence: 13,
-  failure_reason: null,
-  anchor_mode: 's3',
-};
-
 const DISABLED_HEALTH: HealthResponse = {
   status: 'healthy',
   app: 'TrustVault',
@@ -200,15 +171,16 @@ const DISABLED_HEALTH: HealthResponse = {
   },
 };
 
-const OPERATIONAL_HEALTH: HealthResponse = {
+const LOCAL_FILE_HEALTH: HealthResponse = {
   ...DISABLED_HEALTH,
+  status: 'degraded',
   components: {
     audit_anchor: {
-      status: 'ok',
-      mode: 's3',
-      independent: true,
-      external_adapter: true,
-      independence_verified: true,
+      status: 'local_only',
+      mode: 'local_file',
+      independent: false,
+      external_adapter: false,
+      independence_verified: false,
       available: true,
       last_checkpoint_at: '2026-01-02T00:00:00Z',
       checkpoint_sequence: 12,
@@ -567,7 +539,7 @@ describe('Activity (component)', () => {
     expect(mockGetAuditCheckpoint).not.toHaveBeenCalled();
   }, 15000);
 
-  it('shows checkpoint controls only when the external anchor is verified', async () => {
+  it('hides independent checkpoint controls for local-file anchoring', async () => {
     const user = userEvent.setup();
     mockGetMe.mockResolvedValue(ADMIN);
     mockListAuditEvents.mockResolvedValue({
@@ -576,26 +548,22 @@ describe('Activity (component)', () => {
       page: 1,
       page_size: 25,
     });
-    mockGetHealth.mockResolvedValue(OPERATIONAL_HEALTH);
-    mockGetAuditCheckpoint.mockResolvedValue(CHECKPOINT_INFO);
-    mockCreateAuditCheckpoint.mockResolvedValue(CHECKPOINT_CREATE);
-    mockVerifyAuditCheckpoint.mockResolvedValue(CHECKPOINT_VERIFICATION);
+    mockGetHealth.mockResolvedValue(LOCAL_FILE_HEALTH);
 
     renderRoute('/activity', <Activity />);
 
     await user.click(await screen.findByRole('tab', { name: 'Verification' }));
-    expect(await screen.findByText('Available')).toBeInTheDocument();
-    expect(screen.getByText('Sequence')).toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: 'Create checkpoint' }));
+    expect(
+      await screen.findByText(/not configured for this deployment/),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Checkpoint anchor/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Create checkpoint' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Verify against checkpoint' }),
+    ).not.toBeInTheDocument();
+    expect(mockGetAuditCheckpoint).not.toHaveBeenCalled();
     expect(mockCreateAuditCheckpoint).not.toHaveBeenCalled();
-
-    await user.click(screen.getByRole('button', { name: 'Confirm create checkpoint' }));
-    expect(mockCreateAuditCheckpoint).toHaveBeenCalledTimes(1);
-    expect(await screen.findByText(/Checkpoint created · sequence 13/)).toBeInTheDocument();
-
-    await user.click(screen.getByRole('button', { name: 'Verify against checkpoint' }));
-    expect(mockVerifyAuditCheckpoint).toHaveBeenCalledTimes(1);
-    expect(await screen.findByText(/VALID · 13 records verified/)).toBeInTheDocument();
+    expect(mockVerifyAuditCheckpoint).not.toHaveBeenCalled();
   }, 15000);
 });

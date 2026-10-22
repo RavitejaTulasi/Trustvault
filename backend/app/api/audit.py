@@ -50,7 +50,6 @@ from backend.app.services.checkpoint_store import (
     CheckpointIntegrityError,
     CheckpointStore,
     CheckpointStoreUnavailableError,
-    create_s3_client,
 )
 from backend.app.services.checkpoint_store_factory import create_checkpoint_store
 
@@ -65,9 +64,6 @@ _CHECKPOINT_FAILURE_DETAILS = {
         "Checkpoint creation refused: audit chain verification was incomplete"
     ),
     "anchor_unavailable": "Checkpoint anchoring is not configured or unavailable",
-    "anchor_access_denied": (
-        "Checkpoint creation refused: checkpoint store access was denied"
-    ),
     "anchor_integrity_failure": (
         "Checkpoint creation refused: stored checkpoint failed its integrity check"
     ),
@@ -154,10 +150,9 @@ def get_checkpoint_store() -> CheckpointStore:
 
     Disabled or invalid configuration resolves to a fail-closed store so that
     administrative operations surface unavailability instead of claiming that an
-    external anchor exists. Provider credentials are never read here; the S3
-    client uses the AWS default credential chain.
+    anchor exists.
     """
-    return create_checkpoint_store(settings, s3_client_factory=create_s3_client)
+    return create_checkpoint_store(settings)
 
 
 def _enforce_checkpoint_rate_limit(actor_id: str) -> None:
@@ -401,7 +396,7 @@ def create_audit_checkpoint(
         )
         status_code = (
             503
-            if exc.reason in {"anchor_unavailable", "anchor_access_denied"}
+            if exc.reason == "anchor_unavailable"
             else 409
         )
         raise HTTPException(
@@ -491,8 +486,8 @@ def get_audit_checkpoint(
     summary="Verify the audit chain against its checkpoint",
     description=(
         "Admin only. Performs a bounded verification of the live audit chain and "
-        "compares the checkpointed sequence and hash with the independently stored "
-        "checkpoint. An unavailable or access-denied provider produces UNAVAILABLE; "
+        "compares the checkpointed sequence and hash with the stored "
+        "checkpoint. An unavailable checkpoint store produces UNAVAILABLE; "
         "a missing checkpoint, a genesis-only checkpoint, or a bounded verification "
         "limit produces INCOMPLETE; neither is reported as VALID. Raw hashes are "
         "never returned."

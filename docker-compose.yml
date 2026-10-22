@@ -42,13 +42,11 @@ services:
       AUDIT_RETENTION_AUTO_DELETE: "false"
       SESSION_COOKIE_SECURE: "true"
       CORS_ORIGINS: http://localhost:5173,http://localhost:3000
-      # Production startup requires external checkpoint anchoring. Configure a
-      # real independently controlled S3-compatible bucket before starting.
-      AUDIT_ANCHOR_MODE: s3
+      # Local checkpoints share the application host and are not independent
+      # anchoring. External checkpoint adapters are not included in this build.
+      AUDIT_ANCHOR_MODE: local_file
+      AUDIT_ANCHOR_DIR: /app/private_storage/audit_checkpoints
       AUDIT_ANCHOR_HMAC_KEY: "${AUDIT_ANCHOR_HMAC_KEY:?AUDIT_ANCHOR_HMAC_KEY must be set}"
-      AUDIT_ANCHOR_S3_BUCKET: "${AUDIT_ANCHOR_S3_BUCKET:?AUDIT_ANCHOR_S3_BUCKET must be set}"
-      AUDIT_ANCHOR_S3_REGION: "${AUDIT_ANCHOR_S3_REGION:?AUDIT_ANCHOR_S3_REGION must be set}"
-      AUDIT_ANCHOR_S3_PREFIX: "${AUDIT_ANCHOR_S3_PREFIX:-trustvault-audit-checkpoints}"
       AUDIT_CHECKPOINT_INTERVAL_SECONDS: "${AUDIT_CHECKPOINT_INTERVAL_SECONDS:-3600}"
       AUDIT_CHECKPOINT_MAX_AGE_SECONDS: "${AUDIT_CHECKPOINT_MAX_AGE_SECONDS:-7200}"
       # This Compose service publishes the backend directly. Leave this empty

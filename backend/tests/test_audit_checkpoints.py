@@ -478,19 +478,20 @@ def test_local_store_detects_tampered_checkpoint(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_local_anchor_is_rejected_in_production():
-    with pytest.raises(ValidationError):
-        Settings(
-            _env_file=None,
-            ENVIRONMENT="production",
-            SESSION_COOKIE_SECURE=True,
-            DATABASE_URL=(
-                "postgresql+psycopg://trustvault_app:test-only-db-password"
-                "@db:5432/trustvault"
-            ),
-            AUDIT_ANCHOR_MODE="local_file",
-            AUDIT_ANCHOR_HMAC_KEY="k" * 64,
-        )
+def test_local_anchor_is_accepted_in_production():
+    configured = Settings(
+        _env_file=None,
+        ENVIRONMENT="production",
+        SESSION_COOKIE_SECURE=True,
+        DATABASE_URL=(
+            "postgresql+psycopg://trustvault_app:test-only-db-password"
+            "@db:5432/trustvault"
+        ),
+        AUDIT_ANCHOR_MODE="local_file",
+        AUDIT_ANCHOR_HMAC_KEY="k" * 64,
+    )
+
+    assert configured.AUDIT_ANCHOR_MODE == "local_file"
 
 
 def test_local_anchor_requires_strong_hmac_key():
@@ -842,7 +843,7 @@ async def test_health_reports_anchor_mode(
     local_response = await async_client.get("/health")
     assert local_response.status_code == 200
     local_anchor = local_response.json()["components"]["audit_anchor"]
-    assert local_anchor["status"] == "local_development_only"
+    assert local_anchor["status"] == "local_only"
     assert local_anchor["external_adapter"] is False
     assert local_anchor["independent"] is False
     assert local_anchor["independence_verified"] is False

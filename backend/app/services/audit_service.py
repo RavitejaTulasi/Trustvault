@@ -12,9 +12,9 @@ the stable event ID, recorded client IP address, and user agent. Existing versio
 Honest Security Limitation Notice:
 Hash chaining ensures that any mid-chain alteration or omission is immediately detectable.
 However, hash chaining alone cannot protect against an attacker with full database overwrite
-privileges who rewrites the entire chain from a given point forward. For production deployment,
-we recommend external anchoring (e.g., streaming logs to write-once-read-many / WORM cloud storage,
-AWS S3 Object Lock, or publishing periodic root hashes to an external timestamping service).
+privileges who rewrites the entire chain from a given point forward. For production deployment, external anchoring (for example, a separately
+controlled filesystem or external timestamping service) provides stronger
+protection than checkpoints stored on the application host.
 """
 
 import hashlib

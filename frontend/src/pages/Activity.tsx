@@ -493,11 +493,9 @@ export default function Activity() {
               <div>
                 <dt>Anchor mode</dt>
                 <dd className="mono">
-                  {checkpoint.anchor_mode === 's3'
-                    ? 's3 (external)'
-                    : checkpoint.anchor_mode === 'local_file'
-                      ? 'local file (not independent)'
-                      : checkpoint.anchor_mode}
+                  {checkpoint.anchor_mode === 'local_file'
+                    ? 'local file (not independent)'
+                    : checkpoint.anchor_mode}
                 </dd>
               </div>
             )}
