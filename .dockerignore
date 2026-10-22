@@ -45,9 +45,9 @@ env.bak/
 venv.bak/
 
 # Node and frontend build artifacts
-node_modules/
-dist/
-build/
+**/node_modules/
+**/dist/
+**/build/
 
 # Documentation and repository-only files
 docs/

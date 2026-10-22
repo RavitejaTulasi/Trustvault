@@ -1,9 +1,10 @@
 services:
   - type: web
     name: trustvault-backend
-    runtime: python
-    buildCommand: pip install -r backend/requirements.txt && alembic upgrade head
-    startCommand: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    startCommand: alembic -c /app/alembic.ini upgrade head && uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: ENVIRONMENT
         value: production
@@ -36,7 +37,7 @@ services:
       - key: SESSION_COOKIE_SECURE
         value: "true"
       - key: CORS_ORIGINS
-        value: https://trustvault.onrender.com
+        value: https://trustvault-backend.onrender.com
       # Local checkpoints are HMAC-protected but share the application's
       # persistent disk and are not independent/tamper-resistant against host
       # compromise. External checkpoint adapters are not included in this build.
@@ -50,13 +51,10 @@ services:
         value: "3600"
       - key: AUDIT_CHECKPOINT_MAX_AGE_SECONDS
         value: "7200"
-      # Render terminates public traffic at its load balancer. Supply the exact
-      # proxy CIDR(s) for this service via the dashboard; do not use a wildcard
-      # or trust forwarded headers from arbitrary peers. Until configured, the
-      # app safely ignores X-Forwarded-For and uses the immediate peer address,
-      # which may be a shared proxy and therefore a shared login limit.
+      # Leave forwarded headers untrusted until exact Render proxy CIDRs are
+      # verified. The app safely ignores X-Forwarded-For while this is empty.
       - key: TRUSTED_PROXY_IPS
-        sync: false
+        value: ""
     disk:
       name: private-storage
       mountPath: /var/data/private_storage

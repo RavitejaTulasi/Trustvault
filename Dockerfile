@@ -1,6 +1,14 @@
 # ==============================================================================
-# TrustVault - Production Backend Dockerfile
+# TrustVault - Production Web Application Dockerfile
 # ==============================================================================
+
+FROM node:24-bookworm-slim AS frontend-build
+
+WORKDIR /frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
 
 FROM python:3.12-slim-bookworm AS base
 
@@ -27,6 +35,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY backend /app/backend
 COPY alembic.ini /app/alembic.ini
 COPY .env.example /app/.env.example
+COPY --from=frontend-build /frontend/dist /app/frontend_dist
 
 # Create directory for private persistent document storage
 RUN mkdir -p /app/private_storage && chmod 700 /app/private_storage
@@ -40,6 +49,6 @@ EXPOSE 8000
 
 # Health check probe
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f "http://localhost:${PORT:-8000}/health" || exit 1
 
 CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
