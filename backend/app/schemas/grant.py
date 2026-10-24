@@ -4,7 +4,7 @@ Pydantic Schemas for Document Grants and Permission Sharing
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from backend.app.models.grant import PermissionLevel
 
@@ -22,6 +22,14 @@ class GrantCreateRequest(BaseModel):
         if norm not in PermissionLevel.ALL_PERMISSIONS:
             raise ValueError(f"Permission must be one of: {sorted(PermissionLevel.ALL_PERMISSIONS)}")
         return norm
+
+
+class GrantRecipientLookupRequest(BaseModel):
+    email: EmailStr = Field(description="Email address of an existing recipient")
+
+
+class GrantRecipientLookupResponse(BaseModel):
+    user_id: str
 
 
 class GrantResponse(BaseModel):

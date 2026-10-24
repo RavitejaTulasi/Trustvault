@@ -12,6 +12,7 @@ reconciliation removes such files after a grace period.
 """
 
 import logging
+import hashlib
 import os
 import secrets
 from dataclasses import dataclass, field
@@ -19,10 +20,24 @@ from pathlib import Path
 from typing import BinaryIO
 
 from fastapi import HTTPException, status
+from storage3.exceptions import StorageApiError
 
 from backend.app.config import settings
+from supabase import create_client
 
 logger = logging.getLogger(__name__)
+
+
+def _get_supabase_bucket():
+    """Return the configured private Supabase Storage bucket."""
+    if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase Storage credentials are not configured")
+    client = create_client(
+        settings.SUPABASE_URL,
+        settings.SUPABASE_SERVICE_ROLE_KEY,
+    )
+    return client.storage.from_(settings.SUPABASE_STORAGE_BUCKET)
+
 
 _STORAGE_KEY_HEX_LENGTH = 64
 _STAGING_DIRECTORY_NAME = ".staging"
@@ -30,31 +45,100 @@ _STAGING_DIRECTORY_NAME = ".staging"
 
 @dataclass
 class StagedUpload:
-    """A fully written temporary upload that is not yet visible as a document."""
+    """A validated upload staged locally before publication."""
 
     storage_key: str
     staging_path: Path
     final_path: Path
     size_bytes: int
+    content_sha256: str
+    operation_id: str | None = None
     _finalized: bool = field(default=False, init=False)
+    _remote_upload_attempted: bool = field(default=False, init=False)
+    _remote_uploaded: bool = field(default=False, init=False)
 
     def finalize(self) -> None:
-        """Atomically publish the staged file at its final storage key."""
+        """Publish the staged upload to the configured storage backend."""
         if self._finalized:
             raise RuntimeError("Upload has already been finalized")
-        if self.final_path.exists():
-            raise FileExistsError("Storage key collision")
-        os.replace(self.staging_path, self.final_path)
-        self._finalized = True
-        _fsync_directory(self.final_path.parent)
 
-    def discard(self) -> None:
-        """Best-effort removal of both staged and finalized file paths."""
-        for path in (self.staging_path, self.final_path):
+        if settings.STORAGE_BACKEND == "local":
+            if self.final_path.exists():
+                raise FileExistsError("Storage key collision")
+
+            os.replace(self.staging_path, self.final_path)
+            self._finalized = True
+            _fsync_directory(self.final_path.parent)
+            return
+
+        if settings.STORAGE_BACKEND == "supabase":
+            if self.operation_id is None:
+                raise RuntimeError(
+                    "Supabase uploads require a durable storage operation"
+                )
+            bucket = _get_supabase_bucket()
+            self._remote_upload_attempted = True
+            bucket.upload(
+                self.storage_key,
+                str(self.staging_path),
+                file_options={
+                    "content-type": "application/octet-stream",
+                    "upsert": "false",
+                    "metadata": {
+                        "trustvault_operation_id": self.operation_id,
+                        "sha256": self.content_sha256,
+                    },
+                },
+            )
+            self._remote_uploaded = True
+            self._finalized = True
+            return
+
+        raise RuntimeError("Unsupported storage backend")
+
+    def complete(self) -> bool:
+        """Clean up local staging after the database transaction commits."""
+        if settings.STORAGE_BACKEND != "supabase" or not self._remote_uploaded:
+            return True
+        try:
+            self.staging_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception(
+                "Unable to remove staged file after successful Supabase upload"
+            )
+            return False
+        return True
+
+    def discard(self, *, preserve_final: bool = False) -> None:
+        """Best-effort cleanup after an unsuccessful upload transaction."""
+        if settings.STORAGE_BACKEND == "local":
+            paths = (
+                (self.staging_path,)
+                if preserve_final
+                else (self.staging_path, self.final_path)
+            )
+            for path in paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Unable to remove incomplete private storage file")
+            return
+
+        if settings.STORAGE_BACKEND == "supabase":
+            if self._remote_upload_attempted or self._remote_uploaded:
+                logger.warning(
+                    "Supabase upload may have reached storage; preserving its "
+                    "local staged file for durable recovery"
+                )
+                return
+
             try:
-                path.unlink(missing_ok=True)
+                self.staging_path.unlink(missing_ok=True)
             except OSError:
-                logger.warning("Unable to remove incomplete private storage file")
+                logger.warning("Unable to remove incomplete staged upload")
+            return
+
+        logger.error("Unsupported storage backend while discarding staged upload")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -75,6 +159,15 @@ def is_valid_storage_key(storage_key: str | None) -> bool:
     if not storage_key or len(storage_key) != _STORAGE_KEY_HEX_LENGTH:
         return False
     return all(character in "0123456789abcdef" for character in storage_key)
+
+
+def is_storage_object_not_found(exc: Exception) -> bool:
+    """Accept only the SDK's explicit object-not-found response as absence."""
+    return (
+        isinstance(exc, StorageApiError)
+        and str(exc.status) == "404"
+        and exc.code == "NotFound"
+    )
 
 
 class StorageService:
@@ -180,6 +273,7 @@ class StorageService:
         total_bytes = 0
         chunk_size = 64 * 1024
         first_chunk = True
+        content_digest = hashlib.sha256()
 
         try:
             with open(staging_path, "xb") as destination:
@@ -202,6 +296,7 @@ class StorageService:
                             ),
                         )
                     destination.write(chunk)
+                    content_digest.update(chunk)
 
                 destination.flush()
                 os.fsync(destination.fileno())
@@ -224,6 +319,7 @@ class StorageService:
             staging_path=staging_path,
             final_path=final_path,
             size_bytes=total_bytes,
+            content_sha256=content_digest.hexdigest(),
         )
 
     @classmethod
@@ -234,9 +330,16 @@ class StorageService:
         max_size_bytes: int | None = None,
     ) -> tuple[str, int]:
         """Compatibility helper that stages and immediately finalizes an upload."""
+        if settings.STORAGE_BACKEND != "local":
+            raise RuntimeError(
+                "save_file() supports local storage only. "
+                "Supabase uploads must use the durable storage-operation workflow."
+            )
+
         staged = cls.stage_file(file_obj, original_filename, max_size_bytes)
         try:
             staged.finalize()
+            staged.complete()
         except Exception:
             staged.discard()
             raise
@@ -266,12 +369,63 @@ class StorageService:
         return target_path
 
     @classmethod
+    def get_file_bytes(cls, storage_key: str) -> bytes:
+        """Retrieve file bytes from the configured private storage backend."""
+        if not is_valid_storage_key(storage_key):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid storage key format",
+            )
+
+        if settings.STORAGE_BACKEND == "local":
+            return cls.get_file_path(storage_key).read_bytes()
+
+        if settings.STORAGE_BACKEND == "supabase":
+            try:
+                return _get_supabase_bucket().download(storage_key)
+            except Exception as exc:
+                logger.error(
+                    "Supabase document download failed: error_type=%s",
+                    type(exc).__name__,
+                )
+                if is_storage_object_not_found(exc):
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Document file not found in storage",
+                    ) from None
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Document storage is temporarily unavailable",
+                ) from None
+
+        raise RuntimeError("Unsupported storage backend")
+
+    @classmethod
     def delete_file(cls, storage_key: str) -> bool:
-        """Remove a file from private storage, reporting cleanup success."""
-        try:
-            path = cls.get_file_path(storage_key)
-            path.unlink(missing_ok=True)
-            return True
-        except (HTTPException, OSError):
-            logger.warning("Private storage file cleanup failed")
+        """Remove a file from the configured private storage backend."""
+        if not is_valid_storage_key(storage_key):
+            logger.warning("Storage cleanup rejected an invalid storage key")
             return False
+
+        if settings.STORAGE_BACKEND == "local":
+            try:
+                path = cls.get_file_path(storage_key)
+                path.unlink(missing_ok=True)
+                return True
+            except (HTTPException, OSError):
+                logger.warning("Private local storage cleanup failed")
+                return False
+
+        if settings.STORAGE_BACKEND == "supabase":
+            try:
+                _get_supabase_bucket().remove([storage_key])
+                return True
+            except Exception as exc:
+                logger.error(
+                    "Supabase Storage cleanup failed: error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+
+        logger.error("Unsupported storage backend for deletion")
+        return False

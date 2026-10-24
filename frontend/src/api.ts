@@ -14,6 +14,7 @@ import type {
   DocumentResponse,
   DocumentUpdateRequest,
   GrantListResponse,
+  GrantRecipientLookupResponse,
   GrantResponse,
   HealthResponse,
   UserListResponse,
@@ -292,6 +293,7 @@ export async function getDocument(id: string): Promise<DocumentResponse> {
 export async function uploadDocument(
   file: File,
   title: string,
+  idempotencyKey: string,
   category?: string,
 ): Promise<DocumentResponse> {
   const form = new FormData();
@@ -300,7 +302,11 @@ export async function uploadDocument(
   if (category !== undefined && category !== '') {
     form.append('category', category);
   }
-  const response = await apiFetch('/api/v1/documents', { method: 'POST', body: form });
+  const response = await apiFetch('/api/v1/documents', {
+    method: 'POST',
+    body: form,
+    headers: { 'Idempotency-Key': idempotencyKey },
+  });
   if (!response.ok) {
     throw await toApiError(response);
   }
@@ -383,6 +389,23 @@ export async function listGrants(id: string): Promise<GrantListResponse> {
     throw await toApiError(response);
   }
   return parseJsonResponse<GrantListResponse>(response);
+}
+
+export async function resolveGrantRecipient(
+  id: string,
+  email: string,
+): Promise<GrantRecipientLookupResponse> {
+  const response = await apiFetch(
+    `/api/v1/documents/${encodeURIComponent(id)}/permissions/recipient`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    },
+  );
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<GrantRecipientLookupResponse>(response);
 }
 
 export async function createGrant(

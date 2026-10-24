@@ -232,6 +232,7 @@ class CheckpointScheduler:
                 logger.error("Scheduled audit checkpoint failed unexpectedly")
                 return None
 
+            store: CheckpointStore | None = None
             try:
                 self._acquire_writer_lock(session)
                 store = self._store_factory()
@@ -289,6 +290,8 @@ class CheckpointScheduler:
                 logger.error("Scheduled audit checkpoint failed unexpectedly")
                 return None
             finally:
+                if store is not None:
+                    store.close()
                 if owns_session:
                     session.close()
 
@@ -339,11 +342,16 @@ def validate_checkpoint_runtime(config: Settings = settings) -> bool:
     Production must have an initialized checkpoint store. A local-file store
     that becomes unavailable after startup is reported by the scheduler.
     """
+    if (
+        config.ENVIRONMENT == "production"
+        and config.AUDIT_ANCHOR_MODE != "postgresql"
+    ):
+        raise RuntimeError(
+            "Production requires independently administered PostgreSQL "
+            "audit anchoring."
+        )
+
     if config.AUDIT_ANCHOR_MODE == "disabled":
-        if config.ENVIRONMENT == "production":
-            raise RuntimeError(
-                "Audit checkpoint anchoring must be enabled in production."
-            )
         return False
 
     store = create_checkpoint_store(config)
@@ -358,6 +366,7 @@ def validate_checkpoint_runtime(config: Settings = settings) -> bool:
             "adapter is unavailable"
         )
         return False
+    store.close()
     return True
 
 
@@ -411,9 +420,9 @@ def build_audit_anchor_health(
     details = {
         "status": status,
         "mode": mode,
-        # Local files share the application's host and filesystem failure domain.
-        "independent": False,
-        "external_adapter": False,
+        # Host and administration independence still require operator verification.
+        "independent": mode == "postgresql",
+        "external_adapter": mode == "postgresql",
         "independence_verified": False,
         "available": snapshot.last_checkpoint_at is not None,
         "last_checkpoint_at": _iso(snapshot.last_checkpoint_at),

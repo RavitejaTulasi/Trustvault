@@ -14,7 +14,7 @@ This document details the complete API contract for TrustVault, including authen
 - `401 Unauthorized`: Authentication required or invalid/expired session cookie.
 - `403 Forbidden`: Authenticated identity lacks the required platform role (for example, an admin-only endpoint).
 - `404 Not Found`: Deliberate 404 returned for inaccessible or non-existent documents to prevent existence discovery, or a non-existent endpoint/resource.
-- `409 Conflict`: The audit chain could not be anchored because it is invalid or incompletely verified, or the stored checkpoint rejected a rollback or conflicting write; also returned when an upload would exceed the per-user active-document count.
+- `409 Conflict`: The audit chain could not be anchored because it is invalid or incompletely verified, or the stored checkpoint rejected a rollback or conflicting write; also returned for upload count limits and idempotency-key conflicts or requests that are still processing.
 - `413 Payload Too Large`: Request body or upload exceeds its configured limit, or an upload would exceed per-user or platform storage bytes.
 - `422 Unprocessable Entity`: Malformed query parameter, invalid filter value, or invalid date range.
 - `429 Too Many Requests`: Rate limit exceeded (e.g. login brute-force throttle).
@@ -99,7 +99,8 @@ This document details the complete API contract for TrustVault, including authen
   - `file`: UploadFile (binary, max `MAX_FILE_SIZE_BYTES`, validated extension & magic bytes)
   - `title`: string (1-255 chars)
   - `category`: string (optional, 1-100 chars, default: "General")
-- **Storage Controls**: The file is streamed into a private staging directory, validated and fsynced, then atomically published before the document row commits. Rejected or failed uploads remove the staged/final file. Quota admission serializes on the `storage_quota_state` row and counts active documents only. Limits: `MAX_UPLOADS_PER_USER` (`409`), `MAX_USER_STORAGE_BYTES` (`413`), `MAX_GLOBAL_STORAGE_BYTES` (`413`).
+- **Header**: `Idempotency-Key` is required (16-128 letters, digits, `.`, `_`, `:`, or `-`). Reuse the same key only when retrying the same file and metadata. The server scopes it to the authenticated owner and verifies a digest of the file and request metadata. A completed retry replays the original `201` document response; a different payload or unresolved request returns `409`.
+- **Storage Controls**: Each storage key has a durable global owner across documents and versions. Database triggers atomically claim the registry row before a reference is inserted and reject references to deleting, deleted, or already-owned keys. The file is streamed into a private staging directory, validated and fsynced, then atomically published before the document row commits for local storage. Remote upload intent, document, audit event, registry state, and the idempotent response are committed in their appropriate durable order. Ambiguous remote outcomes remain in review; they are not automatically deleted. Quota admission serializes on the `storage_quota_state` row and counts active documents only. Limits: `MAX_UPLOADS_PER_USER` (`409`), `MAX_USER_STORAGE_BYTES` (`413`), `MAX_GLOBAL_STORAGE_BYTES` (`413`).
 - **Response `201 Created`**:
   ```json
   {
@@ -349,9 +350,10 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 Checkpoint endpoints use the storage mode selected by `AUDIT_ANCHOR_MODE`:
 
 - `disabled` (default outside production): no anchoring; creation returns `503` and verification returns `UNAVAILABLE`. Production startup rejects this mode.
-- `local_file`: HMAC-protected directory (`AUDIT_ANCHOR_DIR`) on the app host; allowed in production but is not independent anchoring, and production health remains degraded.
+- `local_file`: HMAC-protected directory (`AUDIT_ANCHOR_DIR`) on the app host; development only and not independent.
+- `postgresql`: HMAC-protected checkpoints in the separately administered PostgreSQL service configured by `AUDIT_ANCHOR_DATABASE_URL`. Production requires this mode. The application role should have only `SELECT` and `INSERT` privileges on the separately provisioned checkpoint table.
 
-When anchoring is enabled, an in-process scheduler attempts a checkpoint every `AUDIT_CHECKPOINT_INTERVAL_SECONDS` and records the last attempt, success, failure reason, and checkpoint metadata in `GET /health` under `components.audit_anchor`. A successful attempt also appends `audit.checkpoint_scheduled` to the audit trail. Alert on `components.audit_anchor.status` other than `ok`/`local_only` and on top-level `status=degraded`. `AUDIT_CHECKPOINT_MAX_AGE_SECONDS` controls when the last successful checkpoint is reported as overdue and must be at least the interval.
+When anchoring is enabled, an in-process scheduler attempts a checkpoint at startup and every `AUDIT_CHECKPOINT_INTERVAL_SECONDS` and records the last attempt, success, failure reason, and checkpoint metadata in `GET /health` under `components.audit_anchor`. A successful attempt also appends `audit.checkpoint_scheduled` to the audit trail. Production should alert on `components.audit_anchor.status` other than `ok` and on top-level `status` other than `healthy`. The health response does not verify provider-level independence; operators must confirm that the anchor has separate administrators and a separate failure domain. `AUDIT_CHECKPOINT_MAX_AGE_SECONDS` controls when the last successful checkpoint is reported as overdue and must be at least the interval.
 
 ### `POST /api/v1/admin/audit/checkpoints`
 - **Authentication**: Required
@@ -366,12 +368,12 @@ When anchoring is enabled, an in-process scheduler attempts a checkpoint every `
     "stream_id": "trustvault.audit",
     "sequence_number": 42,
     "created_at": "2026-10-19T10:00:00.000000Z",
-    "anchor_mode": "local_file"
+    "anchor_mode": "postgresql"
   }
   ```
-  `status` is `CREATED` or `ALREADY_PRESENT`. `anchor_mode` is `local_file`. Response fields never include record hashes, HMAC tags, signing keys, or filesystem paths.
+  `status` is `CREATED` or `ALREADY_PRESENT`. Production responses use `anchor_mode: "postgresql"`. Response fields never include record hashes, HMAC tags, signing keys, connection strings, or filesystem paths.
 - **Refusal `409 Conflict`**: Returned when the chain fails verification (altered record, broken link, gap), when the bounded pass was incomplete, when the stored checkpoint is ahead of the chain, or when the anchor store rejects a rollback or conflicting write. The detail is a generic message; the stored `audit.checkpoint_created` failure event records an allowlisted `reason` such as `chain_invalid`, `chain_incomplete`, `anchor_ahead_of_chain`, `anchor_chain_mismatch`, `anchor_rollback_detected`, or `anchor_conflict`.
-- **Unavailable `503 Service Unavailable`**: Returned with a generic detail when no checkpoint store is configured (`AUDIT_ANCHOR_MODE=disabled`) or the local store is unavailable. The failure is recorded as `audit.checkpoint_created` with outcome `FAILURE` and `reason: anchor_unavailable` where the audit trail is available. Other refusal reasons (`anchor_integrity_failure`, `anchor_format_unsupported`, `anchor_stream_mismatch`, `anchor_ahead_of_chain`, `anchor_chain_mismatch`, `anchor_rollback_detected`, `anchor_conflict`) return `409 Conflict`.
+- **Unavailable `503 Service Unavailable`**: Returned with a generic detail when no checkpoint store is configured (`AUDIT_ANCHOR_MODE=disabled`) or the configured store is unavailable. The failure is recorded as `audit.checkpoint_created` with outcome `FAILURE` and `reason: anchor_unavailable` where the audit trail is available. Other refusal reasons (`anchor_integrity_failure`, `anchor_format_unsupported`, `anchor_stream_mismatch`, `anchor_ahead_of_chain`, `anchor_chain_mismatch`, `anchor_rollback_detected`, `anchor_conflict`) return `409 Conflict`.
 - **Rate Limit Response**: Checkpoint creation shares a separate per-administrator limiter from hash-chain verification. Exceeding `AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS` per `AUDIT_CHECKPOINT_RATE_LIMIT_WINDOW_SECONDS` returns `429` with `Retry-After`.
 - **Audit Event**: `audit.checkpoint_created` (SUCCESS with allowlisted `details.already_present` and `details.checkpoint_sequence`; FAILURE with allowlisted `details.reason`). The chain verification and anchor comparison inspect only records committed before the event is appended.
 - **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
@@ -384,15 +386,15 @@ When anchoring is enabled, an in-process scheduler attempts a checkpoint every `
   ```json
   {
     "available": true,
-    "anchor_mode": "local_file",
+    "anchor_mode": "postgresql",
     "stream_id": "trustvault.audit",
     "sequence_number": 42,
     "created_at": "2026-10-19T10:00:00.000000Z",
     "format_version": 1
   }
   ```
-  When no checkpoint store is configured (`AUDIT_ANCHOR_MODE=disabled`), the endpoint returns `200 OK` with `available: false` and `null` checkpoint fields instead of failing. If the local store is configured but no checkpoint has been written yet, it returns `200 OK` with `available: false`.
-- **Unavailable `503 Service Unavailable` / Conflict `409 Conflict`**: `503` is returned when the local checkpoint store is unavailable; `409` is returned when the stored checkpoint fails its integrity check. The details are generic.
+  When no checkpoint store is configured (`AUDIT_ANCHOR_MODE=disabled`), the endpoint returns `200 OK` with `available: false` and `null` checkpoint fields instead of failing. If the configured store has no checkpoint yet, it returns `200 OK` with `available: false`.
+- **Unavailable `503 Service Unavailable` / Conflict `409 Conflict`**: `503` is returned when the configured checkpoint store is unavailable; `409` is returned when the stored checkpoint fails its integrity check. The details are generic.
 - **Audit Event**: `audit.checkpoint_read` (with `resource_type` `audit`). If the event cannot be persisted, the endpoint returns `503` with detail `Audit trail unavailable` instead of serving an unaudited response.
 - **Caching**: Responses set `Cache-Control: no-store` and `Pragma: no-cache`.
 
@@ -401,10 +403,10 @@ When anchoring is enabled, an in-process scheduler attempts a checkpoint every `
 - **Authorization Rule**: Administrator role only (`403 Forbidden` for owners/viewers).
 - **Action**: Runs the same bounded chain verification as `GET /api/v1/admin/audit/verify`, then compares the verified chain against the latest stored checkpoint. The chain is verified first, so integrity failures take precedence over anchor state.
 - **Status Semantics**:
-  - `VALID`: the bounded chain verification passed, a checkpoint exists at a non-genesis sequence, and the record hash at the checkpointed sequence equals the checkpoint's stored hash. The chain may legitimately extend beyond the checkpoint; `chain_head_sequence` reports the verified head. `is_valid` is `true`. Because checkpoints are stored on the application host, this does not protect against an attacker who can modify both the database and local checkpoint files.
+  - `VALID`: the bounded chain verification passed, a checkpoint exists at a non-genesis sequence, and the record hash at the checkpointed sequence equals the checkpoint's stored hash. The chain may legitimately extend beyond the checkpoint; `chain_head_sequence` reports the verified head. `is_valid` is `true`. Production checkpoints are stored in a separately administered PostgreSQL service. This does not protect against compromise of the application runtime or its HMAC key.
   - `INVALID`: the chain failed verification, the checkpointed sequence no longer exists (tail truncation), the chain's hash at that sequence no longer matches the checkpoint (history rewrite), or the stored checkpoint fails its HMAC integrity check. `is_valid` is `false`.
   - `INCOMPLETE`: the chain passed verification but no checkpoint has been stored yet, the bounded pass hit the record limit or time budget, or the latest checkpoint is genesis-only (`sequence_number=0`). A genesis-only checkpoint cannot distinguish a legitimately empty chain from truncation to zero, so it is never reported as `VALID`. `is_valid` is `false` and `failure_reason` states why a complete comparison could not be made.
-  - `UNAVAILABLE`: the anchor is not configured (`AUDIT_ANCHOR_MODE=disabled`) or the local checkpoint store is unavailable. `is_valid` is `false` and `checkpoint_sequence` is `null`. This is an operational availability state, not evidence that the audit chain is valid.
+  - `UNAVAILABLE`: the anchor is not configured (`AUDIT_ANCHOR_MODE=disabled`) or the configured checkpoint store is unavailable. `is_valid` is `false` and `checkpoint_sequence` is `null`. This is an operational availability state, not evidence that the audit chain is valid.
 - **Response `200 OK`**:
   ```json
   {
@@ -414,7 +416,7 @@ When anchoring is enabled, an in-process scheduler attempts a checkpoint every `
     "checkpoint_sequence": 40,
     "chain_head_sequence": 42,
     "failure_reason": null,
-    "anchor_mode": "local_file"
+    "anchor_mode": "postgresql"
   }
   ```
 - **Resource Limits**: Uses the same `AUDIT_VERIFY_*` settings as `GET /api/v1/admin/audit/verify`. Full 64-character hash values in the underlying diagnostic are redacted as `[redacted]`.

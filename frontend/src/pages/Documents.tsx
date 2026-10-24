@@ -28,6 +28,65 @@ import { canManageDocuments } from '../lib/navigation';
 import { describeError, formatBytes, formatDate } from '../lib/format';
 
 const PAGE_SIZE = 25;
+const PENDING_UPLOAD_KEY = 'trustvault.pending-upload-idempotency-key';
+
+type PendingUploadIdentity = {
+  fingerprint: string;
+  key: string;
+};
+
+async function getUploadFingerprint(
+  file: File,
+  title: string,
+  category: string,
+): Promise<string> {
+  if (!window.crypto.subtle) {
+    throw new Error('Secure upload retries are unavailable in this browser.');
+  }
+  const contentHash = await window.crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+  const contentSha256 = Array.from(new Uint8Array(contentHash))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+  const requestIdentity = JSON.stringify({
+    category: category.trim() || 'General',
+    content_sha256: contentSha256,
+    filename: file.name,
+    mime_type: file.type.trim() || 'application/octet-stream',
+    size_bytes: file.size,
+    title: title.trim(),
+  });
+  const fingerprint = await window.crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(requestIdentity),
+  );
+  return Array.from(new Uint8Array(fingerprint))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function readPendingUploadIdentity(): PendingUploadIdentity | null {
+  const stored = window.sessionStorage.getItem(PENDING_UPLOAD_KEY);
+  if (!stored) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      'fingerprint' in parsed &&
+      typeof parsed.fingerprint === 'string' &&
+      'key' in parsed &&
+      typeof parsed.key === 'string' &&
+      /^[A-Za-z0-9._:-]{16,128}$/.test(parsed.key)
+    ) {
+      return { fingerprint: parsed.fingerprint, key: parsed.key };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
 
 export default function Documents() {
   const navigate = useNavigate();
@@ -35,6 +94,7 @@ export default function Documents() {
   const { user, loading: sessionLoading, error: sessionError, reload } = useSession();
   const { pushToast } = useToast();
   const uploadPanelRef = useRef<HTMLElement>(null);
+  const uploadIdempotency = useRef<PendingUploadIdentity | null>(null);
 
   const [documents, setDocuments] = useState<DocumentListItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -135,11 +195,32 @@ export default function Documents() {
     }
     setUploading(true);
     try {
+      const fingerprint = await getUploadFingerprint(
+        uploadFile,
+        uploadTitle,
+        uploadCategory,
+      );
+      const pending = uploadIdempotency.current ?? readPendingUploadIdentity();
+      if (!pending || pending.fingerprint !== fingerprint) {
+        uploadIdempotency.current = {
+          fingerprint,
+          key: crypto.randomUUID(),
+        };
+        window.sessionStorage.setItem(
+          PENDING_UPLOAD_KEY,
+          JSON.stringify(uploadIdempotency.current),
+        );
+      } else {
+        uploadIdempotency.current = pending;
+      }
       const uploaded = await uploadDocument(
         uploadFile,
         uploadTitle.trim(),
+        uploadIdempotency.current.key,
         uploadCategory.trim() || undefined,
       );
+      window.sessionStorage.removeItem(PENDING_UPLOAD_KEY);
+      uploadIdempotency.current = null;
       setUploadFile(null);
       setUploadTitle('');
       setUploadCategory('');
@@ -155,7 +236,11 @@ export default function Documents() {
         tone: 'success',
       });
     } catch (err) {
-      setUploadError(describeError(err, 'Upload failed. Please try again.'));
+      setUploadError(
+        err instanceof Error && !(err instanceof ApiError)
+          ? err.message
+          : describeError(err, 'Upload failed. Please try again.'),
+      );
     } finally {
       setUploading(false);
     }

@@ -2,10 +2,14 @@
 
 import logging
 
+from sqlalchemy.exc import ArgumentError, SQLAlchemyError
+
 from backend.app.config import Settings
 from backend.app.services.checkpoint_store import (
     CheckpointStore,
+    CheckpointStoreUnavailableError,
     LocalFileCheckpointStore,
+    PostgresCheckpointStore,
     UnavailableCheckpointStore,
 )
 
@@ -22,4 +26,27 @@ def create_checkpoint_store(config: Settings) -> CheckpointStore:
             )
         except (OSError, ValueError):
             logger.error("Audit checkpoint store initialization failed")
+    if config.AUDIT_ANCHOR_MODE == "postgresql":
+        try:
+            store = PostgresCheckpointStore(
+                config.AUDIT_ANCHOR_DATABASE_URL,
+                config.AUDIT_ANCHOR_HMAC_KEY.encode("utf-8"),
+            )
+            try:
+                store.read_latest()
+            except Exception:
+                store.close()
+                raise
+            return store
+        except (
+            ArgumentError,
+            OSError,
+            ValueError,
+            CheckpointStoreUnavailableError,
+            SQLAlchemyError,
+        ) as exc:
+            logger.error(
+                "Independent audit checkpoint store initialization failed (%s)",
+                type(exc).__name__,
+            )
     return UnavailableCheckpointStore()

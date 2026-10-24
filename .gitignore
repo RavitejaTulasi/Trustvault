@@ -39,6 +39,7 @@ venv.bak/
 *.sqlite3
 *.db
 private_storage/
+private_storage_dev/
 storage/
 uploads/
 # Development-only audit checkpoint directory (never commit anchor data)
@@ -75,3 +76,5 @@ desktop.ini
 
 # Temporary recovery artifact
 /trustvault-recovery.patch
+
+migration-preview.sql

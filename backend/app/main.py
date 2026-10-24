@@ -33,6 +33,7 @@ from backend.app.security.request_validation import (
 )
 from backend.app.services.checkpoint_runtime import checkpoint_scheduler
 from backend.app.services.storage_lifecycle import StorageLifecycleService
+from backend.app.services.storage_recovery import storage_recovery_scheduler
 
 logger = logging.getLogger(__name__)
 FRONTEND_DIST_DIR = Path(__file__).resolve().parents[2] / "frontend_dist"
@@ -40,30 +41,42 @@ FRONTEND_DIST_DIR = Path(__file__).resolve().parents[2] / "frontend_dist"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ensure private storage directory exists on startup
-    storage_path = settings.resolved_storage_path
-    storage_path.mkdir(parents=True, exist_ok=True)
-
-    try:
-        with SessionLocal() as db:
-            report = StorageLifecycleService.reconcile(db)
+    if settings.STORAGE_BACKEND == "local":
+        # Ensure private local storage directory exists on startup.
+        storage_path = settings.resolved_storage_path
+        storage_path.mkdir(parents=True, exist_ok=True)
+        try:
+            with SessionLocal() as db:
+                report = StorageLifecycleService.reconcile(db)
+            logger.info(
+                "Storage reconciliation completed: orphaned=%d deleted=%d "
+                "staging=%d missing_active=%d failures=%d bytes=%d",
+                report.removed_orphaned_files,
+                report.removed_deleted_files,
+                report.removed_staging_files,
+                report.missing_active_files,
+                report.cleanup_failures,
+                report.removed_bytes,
+            )
+        except Exception:
+            logger.exception(
+                "Local storage reconciliation failed; application will continue"
+            )
+    else:
         logger.info(
-            "Storage reconciliation completed: orphaned=%d deleted=%d "
-            "staging=%d missing_active=%d failures=%d bytes=%d",
-            report.removed_orphaned_files,
-            report.removed_deleted_files,
-            report.removed_staging_files,
-            report.missing_active_files,
-            report.cleanup_failures,
-            report.removed_bytes,
+            "Supabase Storage selected; local filesystem reconciliation skipped"
         )
-    except Exception:
-        logger.exception("Storage reconciliation failed; application will continue")
+        try:
+            await storage_recovery_scheduler.run_once_async()
+        except Exception:
+            logger.exception("Initial remote storage recovery cycle failed")
+        storage_recovery_scheduler.start()
 
     checkpoint_scheduler.start()
     try:
         yield
     finally:
+        await storage_recovery_scheduler.stop()
         await checkpoint_scheduler.stop()
 
 

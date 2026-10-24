@@ -212,7 +212,7 @@ def test_upgrade_preserves_legacy_hashes_checkpoints_and_actor_references(
             if foreign_key["constrained_columns"] == ["actor_id"]
         ]
         assert len(actor_foreign_keys) == 1
-        assert actor_foreign_keys[0]["options"].get("ondelete") == "RESTRICT"
+        assert actor_foreign_keys[0].get("options", {}).get("ondelete") == "RESTRICT"
 
     with pytest.raises(IntegrityError), upgraded_engine.begin() as connection:
         connection.execute(
@@ -366,3 +366,180 @@ def test_v1_chain_downgrade_and_reupgrade_preserves_verification(
         )
         assert extended.status == "VALID", extended.failure_reason
     engine.dispose()
+
+
+
+def test_upgrade_refuses_corrupted_legacy_audit_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    db_path = tmp_path / "corrupted-legacy-audit.sqlite"
+    config = _alembic_config(monkeypatch, db_path)
+
+    # Create the database at the schema immediately before the target migration.
+    command.upgrade(config, LEGACY_HEAD)
+
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    metadata = MetaData()
+    audit_events = Table("audit_events", metadata, autoload_with=engine)
+
+    event_time = datetime(2026, 10, 20, 12, 0, 1, tzinfo=UTC)
+    event_id = generate_uuid()
+    details = '{"reason":"legacy"}'
+
+    valid_hash = AuditService.calculate_hash(
+        sequence_number=1,
+        timestamp=event_time,
+        actor_id=None,
+        action="test.legacy.corruption",
+        resource_type="legacy",
+        resource_id="legacy-corrupted",
+        outcome=AuditOutcome.SUCCESS,
+        request_id=None,
+        details_str=details,
+        previous_hash=GENESIS_HASH,
+        hash_version=AUDIT_HASH_VERSION_LEGACY,
+    )
+
+    with engine.begin() as connection:
+        connection.execute(
+            audit_events.insert().values(
+                id=event_id,
+                sequence_number=1,
+                timestamp=event_time,
+                actor_id=None,
+                action="test.legacy.corruption",
+                resource_type="legacy",
+                resource_id="legacy-corrupted",
+                outcome=AuditOutcome.SUCCESS,
+                request_id=None,
+                ip_address=None,
+                user_agent=None,
+                details=details,
+                previous_hash=GENESIS_HASH,
+                record_hash=valid_hash,
+            )
+        )
+
+        # Simulate historical audit-record tampering.
+        connection.execute(
+            text(
+                "UPDATE audit_events "
+                "SET record_hash = :bad_hash "
+                "WHERE sequence_number = 1"
+            ),
+            {"bad_hash": "f" * 64},
+        )
+
+    engine.dispose()
+
+    with pytest.raises(RuntimeError, match="record hash mismatch"):
+        command.upgrade(config, "head")
+
+    # Confirm validation failed before the target migration changed the schema.
+    check_engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    try:
+        inspector = inspect(check_engine)
+        column_names = {
+            column["name"]
+            for column in inspector.get_columns("audit_events")
+        }
+
+        assert "hash_version" not in column_names
+        assert "audit_chain_state" not in inspector.get_table_names()
+    finally:
+        check_engine.dispose()
+
+
+
+@pytest.mark.parametrize(
+    ("sequence_number", "stored_previous_hash", "expected_error"),
+    [
+        # Sequence must start at 1 and remain contiguous.
+        (2, GENESIS_HASH, "sequence gap or invalid sequence"),
+        # The first event must link to the genesis hash.
+        (1, "a" * 64, "previous-hash link mismatch"),
+    ],
+    ids=["sequence-gap", "broken-previous-hash"],
+)
+def test_upgrade_refuses_invalid_legacy_chain_structure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sequence_number: int,
+    stored_previous_hash: str,
+    expected_error: str,
+):
+    db_path = tmp_path / f"invalid-chain-{sequence_number}.sqlite"
+    config = _alembic_config(monkeypatch, db_path)
+
+    # Create only the schema preceding the migration under test.
+    command.upgrade(config, LEGACY_HEAD)
+
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    try:
+        audit_events = Table(
+            "audit_events",
+            MetaData(),
+            autoload_with=engine,
+        )
+
+        event_time = datetime(2026, 10, 20, 12, 0, 1, tzinfo=UTC)
+        event_id = generate_uuid()
+        action = "test.legacy.invalid_chain"
+
+        # Calculate a matching hash for the stored fields. This ensures
+        # the broken-link case fails because of the link, not the record hash.
+        record_hash = AuditService.calculate_hash(
+            sequence_number=sequence_number,
+            timestamp=event_time,
+            actor_id=None,
+            action=action,
+            resource_type="legacy",
+            resource_id="invalid-chain",
+            outcome=AuditOutcome.SUCCESS,
+            request_id=None,
+            details_str=None,
+            previous_hash=stored_previous_hash,
+            hash_version=AUDIT_HASH_VERSION_LEGACY,
+        )
+
+        with engine.begin() as connection:
+            connection.execute(
+                audit_events.insert().values(
+                    id=event_id,
+                    sequence_number=sequence_number,
+                    timestamp=event_time,
+                    actor_id=None,
+                    action=action,
+                    resource_type="legacy",
+                    resource_id="invalid-chain",
+                    outcome=AuditOutcome.SUCCESS,
+                    request_id=None,
+                    ip_address=None,
+                    user_agent=None,
+                    details=None,
+                    previous_hash=stored_previous_hash,
+                    record_hash=record_hash,
+                )
+            )
+
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match=expected_error):
+            command.upgrade(config, "head")
+
+        # Validation must reject the chain before altering the schema.
+        check_engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+        try:
+            inspector = inspect(check_engine)
+            column_names = {
+                column["name"]
+                for column in inspector.get_columns("audit_events")
+            }
+
+            assert "hash_version" not in column_names
+            assert "audit_chain_state" not in inspector.get_table_names()
+        finally:
+            check_engine.dispose()
+
+    finally:
+        engine.dispose()

@@ -41,11 +41,13 @@ services:
       AUDIT_RETENTION_DAYS: "${AUDIT_RETENTION_DAYS:-2555}"
       AUDIT_RETENTION_AUTO_DELETE: "false"
       SESSION_COOKIE_SECURE: "true"
+      SESSION_COOKIE_HTTPONLY: "true"
+      SESSION_COOKIE_SAMESITE: "lax"
       CORS_ORIGINS: http://localhost:5173,http://localhost:3000
-      # Local checkpoints share the application host and are not independent
-      # anchoring. External checkpoint adapters are not included in this build.
-      AUDIT_ANCHOR_MODE: local_file
-      AUDIT_ANCHOR_DIR: /app/private_storage/audit_checkpoints
+      # Provision this separately administered PostgreSQL target and schema;
+      # do not point it at the application database.
+      AUDIT_ANCHOR_MODE: postgresql
+      AUDIT_ANCHOR_DATABASE_URL: "${AUDIT_ANCHOR_DATABASE_URL:?AUDIT_ANCHOR_DATABASE_URL must be set}"
       AUDIT_ANCHOR_HMAC_KEY: "${AUDIT_ANCHOR_HMAC_KEY:?AUDIT_ANCHOR_HMAC_KEY must be set}"
       AUDIT_CHECKPOINT_INTERVAL_SECONDS: "${AUDIT_CHECKPOINT_INTERVAL_SECONDS:-3600}"
       AUDIT_CHECKPOINT_MAX_AGE_SECONDS: "${AUDIT_CHECKPOINT_MAX_AGE_SECONDS:-7200}"

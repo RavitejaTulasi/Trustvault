@@ -11,6 +11,7 @@ from pydantic import BaseModel, field_validator
 REDACTED_VALUE = "[redacted]"
 SAFE_DETAIL_KEYS = frozenset(
     {
+        "action",
         "already_present",
         "changed_fields",
         "checkpoint_sequence",
@@ -18,6 +19,7 @@ SAFE_DETAIL_KEYS = frozenset(
         "email",
         "from_role",
         "permission",
+        "previous_state",
         "reason",
         "recipient_id",
         "role",

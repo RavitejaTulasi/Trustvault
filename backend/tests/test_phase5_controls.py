@@ -327,14 +327,15 @@ def test_storage_reconciliation_preserves_active_and_recent_files(
     report = StorageLifecycleService.reconcile(db_session)
 
     assert report.removed_deleted_files == 1
-    assert report.removed_orphaned_files == 1
-    assert report.removed_staging_files == 1
+    assert report.removed_orphaned_files == 0
+    assert report.removed_staging_files == 0
     assert report.missing_active_files == 1
     assert (storage_dir / active_key).is_file()
     assert (storage_dir / recent_orphan_key).is_file()
     assert not (storage_dir / deleted_key).exists()
-    assert not old_orphan.exists()
-    assert not staging_file.exists()
+    assert old_orphan.is_file()
+    assert old_orphan.read_bytes() == b"x" * 16
+    assert staging_file.read_bytes() == b"partial"
 
 
 def test_denial_audit_is_claimed_once_per_ip_window():

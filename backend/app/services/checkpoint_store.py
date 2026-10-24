@@ -10,6 +10,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL, Engine, make_url
+from sqlalchemy.exc import SQLAlchemyError
+
 CHECKPOINT_FORMAT_VERSION = 1
 AUDIT_STREAM_ID = "trustvault.audit"
 GENESIS_CHECKPOINT_SEQUENCE = 0
@@ -17,6 +21,9 @@ _HEX_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _CHECKPOINT_FILENAME_PATTERN = re.compile(r"^checkpoint-(\d{20})\.json$")
 _MIN_HMAC_KEY_BYTES = 32
 _MAX_CHECKPOINT_DOCUMENT_BYTES = 64 * 1024
+_ANCHOR_CONNECT_TIMEOUT_SECONDS = 5
+_ANCHOR_POOL_TIMEOUT_SECONDS = 5
+_ANCHOR_STATEMENT_TIMEOUT_MILLISECONDS = 10_000
 
 
 class CheckpointError(Exception):
@@ -55,6 +62,9 @@ class AuditCheckpoint:
 class CheckpointStore(Protocol):
     """Interface implemented by the configured checkpoint store."""
 
+    def close(self) -> None:
+        """Release resources held by the adapter."""
+
     def read_latest(self) -> AuditCheckpoint | None:
         """Return the highest-sequence checkpoint, or None when none exists."""
 
@@ -76,6 +86,9 @@ class UnavailableCheckpointStore:
     It is not an anchor: every operation raises so callers cannot accidentally
     treat disabled anchoring as a verified checkpoint.
     """
+
+    def close(self) -> None:
+        """The unavailable adapter has no resources to release."""
 
     def read_latest(self) -> AuditCheckpoint | None:
         raise CheckpointStoreUnavailableError("Audit checkpoint anchoring is not configured")
@@ -301,6 +314,9 @@ class LocalFileCheckpointStore:
         self._hmac_key = hmac_key
         self._stream_id = stream_id
 
+    def close(self) -> None:
+        """The local file adapter does not hold persistent resources."""
+
     def _checkpoint_path(self, sequence_number: int) -> Path:
         return self._directory / f"checkpoint-{sequence_number:020d}.json"
 
@@ -371,4 +387,141 @@ class LocalFileCheckpointStore:
                 self._hmac_key, build_checkpoint_payload(checkpoint)
             ),
         )
+        return stored, True
+
+
+class PostgresCheckpointStore:
+    """
+    Checkpoint adapter backed by a separately administered PostgreSQL service.
+
+    The application role must have SELECT and INSERT only on the pre-provisioned
+    table. The table owner and database administrators must be outside the
+    application's control plane for this store to provide independent evidence.
+    """
+
+    def __init__(
+        self,
+        database_url: str | URL,
+        hmac_key: bytes,
+        *,
+        schema: str = "trustvault_audit_anchor",
+        stream_id: str = AUDIT_STREAM_ID,
+    ) -> None:
+        if len(hmac_key) < _MIN_HMAC_KEY_BYTES:
+            raise ValueError(
+                "Audit checkpoint HMAC key must be at least 32 bytes; "
+                "configure AUDIT_ANCHOR_HMAC_KEY."
+            )
+        if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", schema):
+            raise ValueError("Audit checkpoint schema name is invalid")
+
+        parsed_url = make_url(database_url)
+        if parsed_url.get_backend_name() != "postgresql":
+            raise ValueError("Independent audit anchoring requires PostgreSQL")
+
+        self._engine: Engine = create_engine(
+            parsed_url,
+            pool_pre_ping=True,
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=_ANCHOR_POOL_TIMEOUT_SECONDS,
+            connect_args={
+                "connect_timeout": _ANCHOR_CONNECT_TIMEOUT_SECONDS,
+                "options": (
+                    "-c statement_timeout="
+                    f"{_ANCHOR_STATEMENT_TIMEOUT_MILLISECONDS}"
+                ),
+            },
+        )
+        self._hmac_key = hmac_key
+        self._schema = schema
+        self._stream_id = stream_id
+        self._table = f'"{schema}"."checkpoints"'
+
+    def close(self) -> None:
+        self._engine.dispose()
+
+    def read_latest(self) -> AuditCheckpoint | None:
+        statement = text(
+            f"SELECT checkpoint_document FROM {self._table} "
+            "WHERE stream_id = :stream_id "
+            "ORDER BY sequence_number DESC LIMIT 1"
+        )
+        try:
+            with self._engine.connect() as connection:
+                raw = connection.execute(
+                    statement, {"stream_id": self._stream_id}
+                ).scalar_one_or_none()
+        except SQLAlchemyError as exc:
+            raise CheckpointStoreUnavailableError(
+                "Independent audit checkpoint store is unavailable"
+            ) from exc
+        if raw is None:
+            return None
+        checkpoint = parse_checkpoint_document(self._hmac_key, raw)
+        if checkpoint.stream_id != self._stream_id:
+            raise CheckpointIntegrityError(
+                "Stored checkpoint has an unexpected stream identifier"
+            )
+        return checkpoint
+
+    def write_checkpoint(
+        self, checkpoint: AuditCheckpoint
+    ) -> tuple[AuditCheckpoint, bool]:
+        validate_new_checkpoint(checkpoint, stream_id=self._stream_id)
+        select_latest = text(
+            f"SELECT checkpoint_document FROM {self._table} "
+            "WHERE stream_id = :stream_id "
+            "ORDER BY sequence_number DESC LIMIT 1"
+        )
+        insert_checkpoint = text(
+            f"INSERT INTO {self._table} "
+            "(stream_id, sequence_number, record_hash, checkpoint_document) "
+            "VALUES (:stream_id, :sequence_number, :record_hash, "
+            ":checkpoint_document)"
+        )
+        try:
+            with self._engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtextextended(:stream_id, 0))"
+                    ),
+                    {"stream_id": self._stream_id},
+                )
+                raw_latest = connection.execute(
+                    select_latest, {"stream_id": self._stream_id}
+                ).scalar_one_or_none()
+                latest = (
+                    parse_checkpoint_document(self._hmac_key, raw_latest)
+                    if raw_latest is not None
+                    else None
+                )
+                if latest is not None and latest.stream_id != self._stream_id:
+                    raise CheckpointIntegrityError(
+                        "Stored checkpoint has an unexpected stream identifier"
+                    )
+
+                idempotent = enforce_store_progression(latest, checkpoint)
+                if idempotent is not None:
+                    return idempotent
+
+                document = serialize_checkpoint(self._hmac_key, checkpoint)
+                connection.execute(
+                    insert_checkpoint,
+                    {
+                        "stream_id": self._stream_id,
+                        "sequence_number": checkpoint.sequence_number,
+                        "record_hash": checkpoint.record_hash,
+                        "checkpoint_document": document,
+                    },
+                )
+        except CheckpointError:
+            raise
+        except SQLAlchemyError as exc:
+            raise CheckpointStoreUnavailableError(
+                "Independent audit checkpoint store is unavailable"
+            ) from exc
+
+        stored = parse_checkpoint_document(self._hmac_key, document)
         return stored, True

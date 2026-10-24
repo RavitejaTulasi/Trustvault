@@ -21,6 +21,7 @@ vi.mock('../auth', () => ({
   getDocument: vi.fn(),
   updateDocument: vi.fn(),
   listGrants: vi.fn(),
+  resolveGrantRecipient: vi.fn(),
   createGrant: vi.fn(),
   revokeGrant: vi.fn(),
 }));
@@ -34,6 +35,7 @@ const mockDeleteDocument = vi.mocked(auth.deleteDocument);
 const mockGetDocument = vi.mocked(auth.getDocument);
 const mockUpdateDocument = vi.mocked(auth.updateDocument);
 const mockListGrants = vi.mocked(auth.listGrants);
+const mockResolveGrantRecipient = vi.mocked(auth.resolveGrantRecipient);
 const mockCreateGrant = vi.mocked(auth.createGrant);
 const mockRevokeGrant = vi.mocked(auth.revokeGrant);
 
@@ -105,6 +107,7 @@ function renderDocumentsPage(initialEntry = '/documents') {
 }
 
 beforeEach(() => {
+  window.sessionStorage.clear();
   vi.mocked(auth.downloadDocument).mockReset();
   mockGetMe.mockReset();
   mockListDocuments.mockReset();
@@ -113,6 +116,7 @@ beforeEach(() => {
   mockGetDocument.mockReset();
   mockUpdateDocument.mockReset();
   mockListGrants.mockReset();
+  mockResolveGrantRecipient.mockReset();
   mockCreateGrant.mockReset();
   mockRevokeGrant.mockReset();
 });
@@ -190,12 +194,120 @@ describe('Documents page (component)', () => {
     await user.click(screen.getByRole('button', { name: 'Confirm upload' }));
 
     await waitFor(() => expect(mockUploadDocument).toHaveBeenCalledTimes(1));
-    const [sentFile, sentTitle, sentCategory] = mockUploadDocument.mock.calls[0];
+    const [sentFile, sentTitle, , sentCategory] = mockUploadDocument.mock.calls[0];
     expect(sentFile?.name).toBe('q3_audit.pdf');
     expect(sentTitle).toBe('Quarterly Financial Audit');
     expect(sentCategory).toBe('Financial');
     expect(mockListDocuments.mock.lastCall?.[0]).toMatchObject({ page: 1 });
     expect(screen.getByRole('button', { name: 'Review upload' })).toBeEnabled();
+  });
+
+  it('reuses a pending idempotency key after an ambiguous upload failure', async () => {
+    const user = userEvent.setup();
+    mockGetMe.mockResolvedValue(OWNER);
+    mockListDocuments.mockResolvedValue(listResponse());
+    mockUploadDocument
+      .mockRejectedValueOnce(new Error('network interrupted'))
+      .mockResolvedValueOnce(DOC_A);
+
+    renderDocumentsPage();
+    await screen.findByText('Upload a document');
+    await user.upload(
+      screen.getByLabelText('File'),
+      new File(['pdf-bytes'], 'q3_audit.pdf', { type: 'application/pdf' }),
+    );
+    await user.type(screen.getByLabelText('Title'), 'Quarterly Financial Audit');
+    await user.click(screen.getByRole('button', { name: 'Review upload' }));
+
+    await user.click(screen.getByRole('button', { name: 'Confirm upload' }));
+    await screen.findByRole('alert');
+    expect(screen.queryByText('Document uploaded')).not.toBeInTheDocument();
+    const firstKey = mockUploadDocument.mock.calls[0][2];
+    expect(firstKey).toBeTruthy();
+    const storedPendingUpload = window.sessionStorage.getItem(
+      'trustvault.pending-upload-idempotency-key',
+    );
+    expect(storedPendingUpload).not.toContain('Quarterly Financial Audit');
+    expect(storedPendingUpload).not.toContain('q3_audit.pdf');
+    expect(
+      JSON.parse(
+        storedPendingUpload ?? '{}',
+      ),
+    ).toEqual({ fingerprint: expect.any(String), key: firstKey });
+
+    await user.click(screen.getByRole('button', { name: 'Confirm upload' }));
+    await waitFor(() => expect(mockUploadDocument).toHaveBeenCalledTimes(2));
+    expect(mockUploadDocument.mock.calls[1][2]).toBe(firstKey);
+    expect(window.sessionStorage.getItem('trustvault.pending-upload-idempotency-key')).toBeNull();
+  });
+
+  it('uses a new idempotency key when the upload payload changes after a failure', async () => {
+    const user = userEvent.setup();
+    mockGetMe.mockResolvedValue(OWNER);
+    mockListDocuments.mockResolvedValue(listResponse());
+    mockUploadDocument
+      .mockRejectedValueOnce(new Error('network interrupted'))
+      .mockResolvedValueOnce(DOC_A);
+
+    renderDocumentsPage();
+    await screen.findByText('Upload a document');
+    await user.upload(
+      screen.getByLabelText('File'),
+      new File(['pdf-bytes'], 'q3_audit.pdf', { type: 'application/pdf' }),
+    );
+    await user.type(screen.getByLabelText('Title'), 'Quarterly Financial Audit');
+    await user.click(screen.getByRole('button', { name: 'Review upload' }));
+
+    await user.click(screen.getByRole('button', { name: 'Confirm upload' }));
+    await screen.findByRole('alert');
+    const firstKey = mockUploadDocument.mock.calls[0][2];
+
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    await user.clear(screen.getByLabelText('Title'));
+    await user.type(screen.getByLabelText('Title'), 'Updated Financial Audit');
+    await user.click(screen.getByRole('button', { name: 'Review upload' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm upload' }));
+
+    await waitFor(() => expect(mockUploadDocument).toHaveBeenCalledTimes(2));
+    expect(mockUploadDocument.mock.calls[1][2]).not.toBe(firstKey);
+    expect(window.sessionStorage.getItem('trustvault.pending-upload-idempotency-key')).toBeNull();
+  });
+
+  it('uses a new idempotency key when the selected file changes after a failure', async () => {
+    const user = userEvent.setup();
+    mockGetMe.mockResolvedValue(OWNER);
+    mockListDocuments.mockResolvedValue(listResponse());
+    mockUploadDocument
+      .mockRejectedValueOnce(new Error('network interrupted'))
+      .mockResolvedValueOnce(DOC_A);
+
+    renderDocumentsPage();
+    await screen.findByText('Upload a document');
+    await user.upload(
+      screen.getByLabelText('File'),
+      new File(['pdf-bytes'], 'q3_audit.pdf', { type: 'application/pdf' }),
+    );
+    await user.type(screen.getByLabelText('Title'), 'Quarterly Financial Audit');
+    await user.click(screen.getByRole('button', { name: 'Review upload' }));
+
+    await user.click(screen.getByRole('button', { name: 'Confirm upload' }));
+    await screen.findByRole('alert');
+    const firstKey = mockUploadDocument.mock.calls[0][2];
+
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    await user.upload(
+      screen.getByLabelText('File'),
+      new File(['revised-pdf-bytes'], 'q3_audit_revised.pdf', {
+        type: 'application/pdf',
+      }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Review upload' }));
+    await user.click(screen.getByRole('button', { name: 'Confirm upload' }));
+
+    await waitFor(() => expect(mockUploadDocument).toHaveBeenCalledTimes(2));
+    expect(mockUploadDocument.mock.calls[1][0]?.name).toBe('q3_audit_revised.pdf');
+    expect(mockUploadDocument.mock.calls[1][2]).not.toBe(firstKey);
+    expect(window.sessionStorage.getItem('trustvault.pending-upload-idempotency-key')).toBeNull();
   });
 
   it('shows the backend rejection detail when an upload fails', async () => {
@@ -326,6 +438,11 @@ describe('DocumentDetail page (component)', () => {
     expect(
       screen.getByRole('heading', { name: 'Sharing', level: 2 }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'Share with an existing, active TrustVault account by email.',
+      ),
+    ).toBeInTheDocument();
   });
 
   it('shows the deliberate 404 message when the caller has no access', async () => {
@@ -364,10 +481,11 @@ describe('DocumentDetail page (component)', () => {
     expect(await screen.findByRole('heading', { name: 'Renamed audit' })).toBeInTheDocument();
   });
 
-  it('grants a read permission to a named user and refreshes the list', async () => {
+  it('resolves an active recipient email before granting access', async () => {
     const user = userEvent.setup();
     mockGetMe.mockResolvedValue(OWNER);
     mockGetDocument.mockResolvedValue(DOC_A);
+    mockResolveGrantRecipient.mockResolvedValue({ user_id: 'usr_2' });
     mockListGrants
       .mockResolvedValueOnce({ grants: [] })
       .mockResolvedValueOnce({
@@ -399,14 +517,46 @@ describe('DocumentDetail page (component)', () => {
     await user.click(await screen.findByRole('tab', { name: 'Access' }));
     await screen.findByText('No permission grants for this document yet.');
 
-    await user.type(screen.getByLabelText('User ID'), 'usr_2');
+    await user.type(screen.getByLabelText('Recipient email'), 'bob@example.com');
     await user.click(screen.getByRole('button', { name: 'Review grant' }));
+    await waitFor(() =>
+      expect(mockResolveGrantRecipient).toHaveBeenCalledWith(
+        'doc_1',
+        'bob@example.com',
+      ),
+    );
     expect(mockCreateGrant).not.toHaveBeenCalled();
+    expect(await screen.findByText('bob@example.com')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'Confirm grant access' }));
 
     await waitFor(() => expect(mockCreateGrant).toHaveBeenCalledWith('doc_1', 'usr_2', 'read'));
     expect(await screen.findByText('usr_2')).toBeInTheDocument();
+  });
+
+  it('does not grant access when the recipient email cannot be resolved', async () => {
+    const user = userEvent.setup();
+    mockGetMe.mockResolvedValue(OWNER);
+    mockGetDocument.mockResolvedValue(DOC_A);
+    mockListGrants.mockResolvedValue({ grants: [] });
+    mockResolveGrantRecipient.mockRejectedValue(
+      new ApiError(404, 'Recipient user not found or inactive'),
+    );
+
+    renderDetail();
+    await user.click(await screen.findByRole('tab', { name: 'Access' }));
+    await screen.findByText('No permission grants for this document yet.');
+
+    await user.type(
+      screen.getByLabelText('Recipient email'),
+      'missing@example.com',
+    );
+    await user.click(screen.getByRole('button', { name: 'Review grant' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Recipient user not found or inactive',
+    );
+    expect(mockCreateGrant).not.toHaveBeenCalled();
   });
 
   it('revokes an active grant only after confirming twice', async () => {

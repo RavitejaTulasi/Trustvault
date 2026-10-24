@@ -25,7 +25,15 @@ production recovery.
 - [ ] Configure both PostgreSQL URLs for `sslmode=verify-full` and the verified
   provider CA certificate. Supply the CA as a Render Secret File and ensure it
   is available to the one-shot pre-deploy migration process as well as the
-  running web service.
+  running web service. Render documents Docker Secret Files at
+  `/etc/secrets/<filename>` at runtime, but its pre-deploy command runs on a
+  separate instance and does not receive the service's persistent disk. Verify
+  CA-file readability in both processes using a non-migrating staging check
+  before allowing the migration command to run. Production startup rejects
+  either URL unless both TLS query parameters are present and each
+  `sslrootcert` points to a readable regular file. This fail-fast check does
+  not validate certificate contents or prove a successful TLS handshake; both
+  still require isolated staging verification.
 - [ ] Provision the anchor owner and application roles using the provider's
   secure role-management process, then apply
   `backend/scripts/provision_audit_anchor.sql`. The owner must not be available
@@ -230,6 +238,39 @@ values in logs, screenshots, or support requests.
   storage snapshot mechanism, or audit-anchor backup mechanism. Obtain and
   record those details from the actual provider before scheduling a production
   drill. Do not substitute the SQLite utility.
+- **Supabase backup status:** the operator reports that no database backup or
+  PITR is currently listed in the Supabase project. Treat managed recovery as
+  unavailable until the Dashboard confirms otherwise. Supabase documents
+  logical exports with its CLI; a logical database export is not a backup of
+  the bytes in the `trustvault-bucket` object store. The following runbook is
+  prepared but has not been executed.
+- **Supabase application-database export:** after the maintenance/quiescence
+  gate below and explicit operator authorization, use the
+  [Supabase CLI backup/restore procedure](https://supabase.com/docs/guides/platform/migrating-within-supabase/backup-restore)
+  to export roles, schema, and data. Use a protected credential flow; do not
+  put a real connection string or password in shell history, logs, or a
+  command-line argument. Keep the three export files encrypted and outside
+  the Supabase project/account failure domain. Record the project identifier,
+  exact `alembic_version`, UTC capture interval, CLI/tool versions, checksums,
+  encryption-key identifier (never key material), and change-record reference.
+- **Supabase Storage object export:** independently enumerate and download all
+  objects from the private `trustvault-bucket` using an authorized Storage API
+  or provider-supported object export. Preserve each opaque object key and
+  record its byte size, computed SHA-256, content type, and relevant object
+  metadata in a manifest. Store the encrypted object archive and manifest
+  outside the Supabase project/account failure domain. Do not treat a database
+  dump or Storage metadata rows as object-byte recovery.
+- **Isolated Supabase restore drill:** restore the database exports to a
+  dedicated, non-production Supabase/PostgreSQL target with compatible
+  PostgreSQL extensions and roles, and restore the object archive into a new
+  private bucket. Do not reuse the production bucket. Verify the schema and
+  Alembic revision, relational integrity, document/version-to-storage-key
+  references, complete object-key coverage and SHA-256 checksums, and private
+  access behavior. Verify the audit hash chain and compare the restored
+  application audit head with a checkpoint from the matching audit-anchor
+  recovery point. Record the exact recovery point, mismatches, RPO/RTO, and
+  sanitized evidence. Do not call this complete until an actual isolated
+  restore passes.
 - Before backup, put the app into a maintenance/read-only state that blocks
   uploads, deletions, storage recovery/reconciliation, and other database or
   storage mutations. Drain in-flight requests/workers and verify no upload or

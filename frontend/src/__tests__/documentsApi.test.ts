@@ -12,6 +12,7 @@ import {
   getDocument,
   listDocuments,
   listGrants,
+  resolveGrantRecipient,
   parseContentDispositionFilename,
   revokeGrant,
   uploadDocument,
@@ -120,7 +121,12 @@ describe('uploadDocument', () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(201, SAMPLE_DOCUMENT));
     const file = new File(['pdf-bytes'], 'q3_audit.pdf', { type: 'application/pdf' });
 
-    const result = await uploadDocument(file, 'Quarterly Financial Audit', 'Financial');
+    const result = await uploadDocument(
+      file,
+      'Quarterly Financial Audit',
+      'upload-request-key-001',
+      'Financial',
+    );
 
     expect(result).toEqual(SAMPLE_DOCUMENT);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -135,12 +141,17 @@ describe('uploadDocument', () => {
     // Content-Type must be left to the browser so the multipart boundary is valid.
     expect(headers.has('Content-Type')).toBe(false);
     expect(headers.get('X-CSRF-Token')).toBe('tok-123');
+    expect(headers.get('Idempotency-Key')).toBe('upload-request-key-001');
   });
 
   it('omits the category field when none is provided', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(201, SAMPLE_DOCUMENT));
 
-    await uploadDocument(new File(['bytes'], 'a.txt', { type: 'text/plain' }), 'Note');
+    await uploadDocument(
+      new File(['bytes'], 'a.txt', { type: 'text/plain' }),
+      'Note',
+      'upload-request-key-002',
+    );
 
     const form = (fetchMock.mock.calls[0] as [string, RequestInit])[1].body as FormData;
     expect(form.get('category')).toBeNull();
@@ -231,6 +242,33 @@ describe('permission grants', () => {
     await expect(listGrants('doc_1')).resolves.toEqual({ grants: [] });
     const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('/api/v1/documents/doc_1/permissions');
+  });
+
+  it('resolves an email to a user ID without exposing the email in the URL', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { user_id: 'usr_2' }));
+
+    await expect(
+      resolveGrantRecipient('doc_1', 'recipient@example.com'),
+    ).resolves.toEqual({ user_id: 'usr_2' });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/v1/documents/doc_1/permissions/recipient');
+    expect(init.method).toBe('POST');
+    expect(init.body).toBe(JSON.stringify({ email: 'recipient@example.com' }));
+    expect((init.headers as Headers).get('X-CSRF-Token')).toBe('tok-123');
+  });
+
+  it('preserves the generic not-found response for unavailable recipient email', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(404, { detail: 'Recipient user not found or inactive' }),
+    );
+
+    await expect(
+      resolveGrantRecipient('doc_1', 'missing@example.com'),
+    ).rejects.toMatchObject({
+      status: 404,
+      detail: 'Recipient user not found or inactive',
+    });
   });
 
   it('sends the recipient and permission level as JSON', async () => {
