@@ -9,7 +9,6 @@ services:
     # /app/certs/prod-ca-2021.crt, so both this pre-deploy instance and the
     # running service can read the same sslrootcert path.
     preDeployCommand: alembic -c /app/alembic.ini upgrade head
-    startCommand: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: ENVIRONMENT
