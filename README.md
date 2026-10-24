@@ -116,7 +116,7 @@ Use a new destination path. The SQLite database snapshot is consistent, but the 
 
 The local SQLite configuration in `.env.example` is for development only and is rejected when `ENVIRONMENT=production`.
 
-The Render blueprint deploys the API and built frontend in one Docker web service, with PostgreSQL and document storage in Supabase. The API serves the frontend at `/` and serves API routes on the same origin, preserving the existing `SameSite=Lax` session and CSRF cookie behavior. This avoids split-origin authentication problems with Render's shared `onrender.com` domains. If you rename the web service or attach a custom domain, update `CORS_ORIGINS` to that exact origin. Deploy the `feat/trustvault-release-clean` branch, or merge it to `main` first; the current `render.yaml` and deployment changes are not on `main`.
+The Render blueprint deploys the API and built frontend in one Docker web service, with PostgreSQL and document storage in Supabase. The API serves the frontend at `/` and serves API routes on the same origin, preserving the existing `SameSite=Lax` session and CSRF cookie behavior. This avoids split-origin authentication problems with Render's shared `onrender.com` domains. If you rename the web service or attach a custom domain, update `CORS_ORIGINS` to that exact origin. Deploy `main`; the current `render.yaml` and container startup migration are on that branch.
 
 `TRUSTED_PROXY_IPS` is empty by default. Until you configure exact trusted proxy CIDRs, the app safely ignores `X-Forwarded-For` and uses the immediate peer address; if that peer is a shared proxy, clients may share the same login limit.
 
