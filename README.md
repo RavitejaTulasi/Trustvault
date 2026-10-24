@@ -63,10 +63,10 @@ Visit:
 
 - PostgreSQL is not published on the host; only the backend container can reach it over the Compose network.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`, and `SECRET_KEY` must be set in `.env`. Compose refuses to start when any are missing.
-- The backend runs with `ENVIRONMENT=production` and `SESSION_COOKIE_SECURE=true`.
+- The backend runs with `ENVIRONMENT=production`, `SESSION_COOKIE_SECURE=true`, `SESSION_COOKIE_HTTPONLY=true`, and a supported `SESSION_COOKIE_SAMESITE` value (`lax`, `strict`, or `none`).
 - Startup rejects SQLite, missing database credentials, known default database passwords, insecure session cookies, and environment values that are not exactly `development`, `production`, or `testing`.
-- Production rejects `AUDIT_ANCHOR_MODE=disabled`. The deployment templates use HMAC-protected `local_file` checkpoints on persistent storage; these are not independent of the application host and do not protect against host compromise. External checkpoint adapters are not included in this build. The scheduled checkpoint worker starts with the application.
-- Login rate limits are stored in the shared database and survive restarts and multiple workers. Run `alembic upgrade head` before starting a new deployment.
+- Production requires HMAC-protected checkpoints in a separately administered PostgreSQL service (`AUDIT_ANCHOR_MODE=postgresql`). Provision its schema with `backend/scripts/provision_audit_anchor.sql` and grant the application role only `SELECT` and `INSERT`. The service must be in a separate database-server and administration failure domain; a distinct hostname alone is not proof. The scheduled checkpoint worker starts with the application and fails startup if the anchor endpoint/schema cannot be reached.
+- Login rate limits are stored in the shared database and survive restarts and multiple workers. Render runs `alembic upgrade head` as a one-shot pre-deploy command, not on each web-service restart. Take and verify a database backup before a release that runs migrations.
 - `TRUSTED_PROXY_IPS` is empty by default because the Compose backend port is published directly. Set it only to the specific CIDR(s) of a reverse proxy you control. `X-Forwarded-For` is ignored from every other peer.
 
 Create a local `.env` with strong, unique values (never commit it):
@@ -77,15 +77,18 @@ POSTGRES_PASSWORD=<strong-unique-password>
 POSTGRES_DB=trustvault
 DATABASE_URL=postgresql+psycopg://trustvault_app:<url-encoded-strong-password>@db:5432/trustvault
 SECRET_KEY=<at-least-32-random-bytes>
-AUDIT_ANCHOR_MODE=local_file
+AUDIT_ANCHOR_MODE=postgresql
 AUDIT_ANCHOR_HMAC_KEY=<at-least-32-random-bytes>
+AUDIT_ANCHOR_DATABASE_URL=postgresql+psycopg://trustvault_anchor:<url-encoded-secret>@<independent-anchor-host>:5432/trustvault_anchor
 ```
 
-`POSTGRES_PASSWORD` is consumed by PostgreSQL directly. `DATABASE_URL` must contain the URL-encoded form of the same password. Generate values with `openssl rand -hex 32` and percent-encode URL-reserved characters in the URL.
+`POSTGRES_PASSWORD` is consumed by PostgreSQL directly. `DATABASE_URL` must contain the URL-encoded form of the same password. The audit anchor database is a separately provisioned service and must not share the application PostgreSQL host or its administration credentials. Generate secrets with `openssl rand -hex 32` and percent-encode URL-reserved characters in URLs. Provision the anchor owner and restricted app role before enabling PostgreSQL anchoring; `local_file` is development-only.
 
-`GET /health` exposes `components.audit_anchor` with the scheduler's last attempt/success/failure and an `overdue` flag. Local-file anchoring is reported as `local_only` unless the checkpoint is overdue, and keeps overall health degraded in production because it is not independent of the app host. Top-level status also becomes `degraded` when anchoring is unavailable or overdue; alert on any status other than `healthy`. External checkpoint adapters are not included in this build.
+`GET /health` exposes `components.audit_anchor` with the scheduler's last attempt/success/failure and an `overdue` flag. PostgreSQL anchoring reports `ok` after a successful checkpoint. `independence_verified` remains false because provider-level administrative and failure-domain separation must be verified by the operator. Local-file anchoring is reported as `local_only` and is not accepted for production. Alert on any top-level status other than `healthy`.
 
-Validate the resolved Compose configuration, apply migrations, then start:
+For Render, configure the Supabase application database URL, the independent anchor database URL, and Supabase Storage values in the dashboard. The blueprint generates `SECRET_KEY` and `AUDIT_ANCHOR_HMAC_KEY`, and the Docker image includes the Supabase root CA at `/app/certs/prod-ca-2021.crt` for `sslmode=verify-full`. Take a recoverable database backup before a release that runs migrations. Render executes the blueprint `preDeployCommand` once before switching the web service; a failed migration blocks the deploy but does not automatically restore a database backup. Verify the migration logs and health endpoint after release.
+
+For Compose, provision the application database and independent anchor database separately, then:
 
 ```bash
 docker compose config
@@ -93,9 +96,28 @@ docker compose run --rm backend alembic -c /app/alembic.ini upgrade head
 docker compose up --build -d
 ```
 
+The Compose migration command is an explicit operator action: back up PostgreSQL first, inspect the migration/release, run the command once, and only then start or update the backend. Neither deployment path automatically backs up data.
+
+### Isolated SQLite Backup and Restore
+
+`backend/scripts/backup_restore.py` backs up only SQLite databases and local private-storage directories. It creates a consistent SQLite snapshot, includes SHA-256 hashes in the archive manifest, verifies every archive entry before restoring, rejects path traversal and existing output paths, and checks SQLite integrity after restore. It never overwrites the source or an existing destination:
+
+```powershell
+python backend\scripts\backup_restore.py backup `
+  --database D:\Trustvault\trustvault_dev_isolated.db `
+  --storage D:\Trustvault\private_storage_dev `
+  --destination D:\Trustvault\backups\isolated-before.zip
+
+python backend\scripts\backup_restore.py restore `
+  --archive D:\Trustvault\backups\isolated-before.zip `
+  --destination D:\Trustvault\restore-validation
+```
+
+Use a new destination path. The SQLite database snapshot is consistent, but the database and private-storage files are not captured atomically with each other. Quiesce uploads, deletions, and recovery work for a coordinated local capture. The manifest hashes detect accidental archive damage; they are not a signature against an attacker able to rewrite both archive contents and manifest. This utility is not a PostgreSQL backup tool. Production recovery still requires a provider-native PostgreSQL backup, coordinated private-storage and audit-anchor snapshots, and an isolated restore drill.
+
 The local SQLite configuration in `.env.example` is for development only and is rejected when `ENVIRONMENT=production`.
 
-The Render blueprint deploys the API, PostgreSQL, and frontend together in one Docker web service. The API serves the built frontend at `/` and serves API routes on the same origin, preserving the existing `SameSite=Lax` session and CSRF cookie behavior. This avoids split-origin authentication problems with Render's shared `onrender.com` domains. If you rename the web service or attach a custom domain, update `CORS_ORIGINS` to that exact origin.
+The Render blueprint deploys the API and built frontend in one Docker web service, with PostgreSQL and document storage in Supabase. The API serves the frontend at `/` and serves API routes on the same origin, preserving the existing `SameSite=Lax` session and CSRF cookie behavior. This avoids split-origin authentication problems with Render's shared `onrender.com` domains. If you rename the web service or attach a custom domain, update `CORS_ORIGINS` to that exact origin. Deploy the `feat/trustvault-release-clean` branch, or merge it to `main` first; the current `render.yaml` and deployment changes are not on `main`.
 
 `TRUSTED_PROXY_IPS` is empty by default. Until you configure exact trusted proxy CIDRs, the app safely ignores `X-Forwarded-For` and uses the immediate peer address; if that peer is a shared proxy, clients may share the same login limit.
 
@@ -128,7 +150,7 @@ No seed script ships in this repository, so these accounts are not created autom
 
 | Role | Email | Password | Permissions Scope |
 |---|---|---|---|
-| **Administrator** |`you@example.com` | `Youexample@1`  | User management, audit trail inspection |
+| **Administrator** |`you@example.com` | `Youexample@2`  | User management, audit trail inspection |
 | **Document Owner** | `local-owner@example.com` | `Localowner@123` | Upload, download, edit, delete own docs, grant/revoke sharing |
 | **Viewer** | `local-reader@example.com` | `Localviewer@123` | Read & download explicitly granted documents |
 
@@ -140,22 +162,25 @@ No seed script ships in this repository, so these accounts are not created autom
 |---|---|---|
 | `ENVIRONMENT` | Exact running mode: `development`, `production`, or `testing`. Invalid capitalization and typos are rejected at startup. | `development` |
 | `DATABASE_URL` | Development/testing SQLite URL, or a production PostgreSQL URL with non-empty credentials. Production rejects SQLite, missing credentials, and known default passwords. | `sqlite:///./trustvault.db` |
-| `SECRET_KEY` | Key for cryptographic signatures and session sealing. Docker Compose requires an explicit value; set at least 32 random bytes in production. | Insecure development default |
+| `SECRET_KEY` | Accepted by configuration and required by deployment templates, but not currently used by application runtime code. Do not rely on it for session signing or revocation. | Insecure development default |
 | `STORAGE_DIR` | Private document storage directory (outside web root) | `./private_storage` |
 | `SESSION_COOKIE_SECURE` | Must be `true` when `ENVIRONMENT=production`; startup fails otherwise. | `false` |
+| `SESSION_COOKIE_HTTPONLY` | Must be `true` when `ENVIRONMENT=production`; prevents JavaScript from reading the session cookie. | `true` |
+| `SESSION_COOKIE_SAMESITE` | Must be `lax`, `strict`, or `none` in production. `none` requires the secure cookie setting. | `lax` |
 | `LOGIN_RATE_LIMIT_MAX_ATTEMPTS` | Failed login attempts allowed per IP and per IP+email in a window. | `5` |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | Fixed window duration for shared login rate limiting. | `300` |
 | `LOGIN_RATE_LIMIT_MAX_BUCKETS` | Maximum retained shared limiter buckets; new attempts fail closed when full. | `50000` |
 | `TRUSTED_PROXY_IPS` | Comma-separated proxy CIDRs allowed to supply `X-Forwarded-For`. Empty disables forwarding-header trust. Wildcards are rejected. | Empty |
-| `AUDIT_ANCHOR_MODE` | Checkpoint storage: `disabled` or same-host `local_file`. Production rejects `disabled`; `local_file` keeps health degraded because it is not independent. | `disabled` |
-| `AUDIT_ANCHOR_HMAC_KEY` | HMAC key (at least 32 characters) protecting checkpoint documents; required for `local_file`. | Empty |
+| `AUDIT_ANCHOR_MODE` | `disabled`, same-host `local_file` (development only), or separately administered `postgresql`. Production requires `postgresql`. | `disabled` |
+| `AUDIT_ANCHOR_DATABASE_URL` | Connection URL for independent PostgreSQL checkpoint storage. The application role should have only `SELECT` and `INSERT` on its provisioned table. | Empty |
+| `AUDIT_ANCHOR_HMAC_KEY` | HMAC key (at least 32 characters) protecting checkpoint documents; required when anchoring is enabled. | Empty |
 | `AUDIT_CHECKPOINT_INTERVAL_SECONDS` | Interval between scheduled checkpoint attempts when anchoring is enabled. | `3600` |
 | `AUDIT_CHECKPOINT_MAX_AGE_SECONDS` | Age after which health marks the anchor overdue; must be at least the interval. | `7200` |
 | `AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS` / `AUDIT_CHECKPOINT_RATE_LIMIT_WINDOW_SECONDS` | Per-administrator checkpoint API limiter. | `5` / `60` |
 | `MAX_FILE_SIZE_BYTES` | Maximum single file upload limit | `10485760` (10 MiB) |
 | `MAX_MULTIPART_OVERHEAD_BYTES` | Multipart request allowance above the per-file limit | `1048576` (1 MiB) |
 | `MAX_JSON_BODY_BYTES` | Maximum non-multipart request body | `65536` (64 KiB) |
-| `STORAGE_ORPHAN_GRACE_SECONDS` | Minimum age before startup reconciliation removes unreferenced or stale staging files | `3600` |
+| `STORAGE_ORPHAN_GRACE_SECONDS` | Reserved for a future orphan-cleanup policy; currently unused because file age alone cannot prove that an upload has stopped | `3600` |
 | `MAX_USER_STORAGE_BYTES` | Active stored bytes allowed per user | `104857600` (100 MiB) |
 | `MAX_GLOBAL_STORAGE_BYTES` | Active stored bytes allowed across all users | `1073741824` (1 GiB) |
 | `MAX_UPLOADS_PER_USER` | Active document count allowed per user | `1000` |
@@ -170,7 +195,7 @@ No seed script ships in this repository, so these accounts are not created autom
 1. **Hash Chaining vs. Superuser DB Rewrite**:
    - Hash chaining guarantees detection of record modification, sequence deletion, or mid-chain alteration.
    - However, an attacker with full SQL superuser access who rewrites the entire chain from an arbitrary sequence number forward cannot be detected by database-internal hashing alone.
-   - *Implemented Mitigation*: The application writes HMAC-protected checkpoints and schedules them at `AUDIT_CHECKPOINT_INTERVAL_SECONDS`. Deployment templates currently use `local_file` on persistent storage; it shares the application host and is not independent protection. External checkpoint adapters are not included in this build, so this risk remains partially mitigated.
+   - *Implemented Mitigation*: The application can write HMAC-protected checkpoints to a separately administered PostgreSQL anchor service. The application role is restricted to `SELECT` and `INSERT`; the schema/table owner should be a separate non-login role. This protects against an application-database-only rewrite if the anchor service and its administrators remain independent. It does not protect against compromise of the application runtime or its HMAC key, nor an anchor-database administrator who can rewrite the checkpoint table. Verify provider administration, backups, and retention separation before production.
 2. **Post-Download Revocation**:
    - Immediate revocation terminates access for the very next platform request.
    - Revocation cannot wipe a file that a recipient already downloaded to their physical workstation prior to revocation.
@@ -183,7 +208,7 @@ No seed script ships in this repository, so these accounts are not created autom
    - The opt-in PostgreSQL suite exercises eight concurrent first appends, rollback/commit sequence reuse, a concurrent append during bounded verification, and checkpoint writer serialization against PostgreSQL 16. It does not establish behavior under production-scale load or automate deadlock retries.
 5. **Storage Crash Recovery**:
    - Uploads and deletes favor a recoverable ordering: files are atomically published before commit, and soft-deletes commit before unlink. A crash can leave an unreferenced file or a file for a soft-deleted document.
-   - Startup reconciliation removes deleted-document files immediately and removes other unreferenced files only after `STORAGE_ORPHAN_GRACE_SECONDS`. Missing active files are reported, not recreated. The filesystem and database are not a single atomic transaction.
+   - Startup reconciliation removes files referenced by soft-deleted documents. It reports missing active files but does not recreate them, and it currently does not sweep unreferenced or staging files; `STORAGE_ORPHAN_GRACE_SECONDS` is reserved and unused. Back up the database and document storage together and verify them with a restore drill because the filesystem and database are not one atomic transaction.
 6. **Storage Quotas**:
    - Admission serializes on the `storage_quota_state` row and checks active documents for the user and platform. Count and byte limits are per database, not per worker.
    - Both SQLite unit tests and the opt-in PostgreSQL concurrency suite verify admission serialization; the latter also covers cross-owner global byte limits.

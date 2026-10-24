@@ -11,6 +11,7 @@ from httpx import AsyncClient
 from sqlalchemy.orm import Session
 
 from backend.app.models.audit import AuditEvent, AuditOutcome
+from backend.app.models.document import Document
 from backend.app.models.user import UserRole
 from backend.tests.test_auth import VALID_PASSWORD, make_user
 
@@ -37,6 +38,48 @@ async def test_owner_can_upload_valid_pdf(async_client: AsyncClient, db_session:
     assert res_json["original_filename"] == "test_doc.pdf"
     assert res_json["file_size_bytes"] == len(pdf_content)
     assert "id" in res_json
+
+
+@pytest.mark.asyncio
+async def test_upload_idempotency_replays_original_result_and_rejects_payload_change(
+    async_client: AsyncClient,
+    db_session: Session,
+):
+    make_user(
+        db_session,
+        email="idempotent_upload@example.com",
+        password=VALID_PASSWORD,
+        role=UserRole.OWNER,
+    )
+    db_session.commit()
+    await async_client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "idempotent_upload@example.com",
+            "password": VALID_PASSWORD,
+        },
+    )
+
+    headers = {"Idempotency-Key": "document-upload-request-0001"}
+    payload = b"%PDF-1.4 idempotent upload content"
+
+    async def upload(title: str):
+        return await async_client.post(
+            "/api/v1/documents",
+            files={"file": ("idempotent.pdf", payload, "application/pdf")},
+            data={"title": title},
+            headers=headers,
+        )
+
+    first = await upload("Idempotent document")
+    replay = await upload("Idempotent document")
+    changed = await upload("Changed document")
+
+    assert first.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json() == first.json()
+    assert changed.status_code == 409
+    assert db_session.query(Document).count() == 1
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,7 @@ async def test_health_endpoint_healthy(async_client: AsyncClient):
     assert "components" in data
     assert data["components"]["database"]["status"] == "ok"
     assert data["components"]["storage"]["status"] == "ok"
+    assert "path" not in data["components"]["storage"]
 
 
 @pytest.mark.asyncio
@@ -122,4 +123,3 @@ def test_audit_service_detects_tampering(db_session: Session):
     assert is_valid is False
     assert error is not None
     assert "Record tampering detected at sequence 1" in error
-

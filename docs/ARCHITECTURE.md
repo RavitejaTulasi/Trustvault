@@ -95,7 +95,9 @@ Concurrent grant requests with no intervening revocation remain last-writer-wins
 +-------------------------------------------------------------------------+
 |                  Database Layer (SQLAlchemy 2.0 + Alembic)              |
 |                      Managed PostgreSQL / psycopg 3                     |
-|  - users, sessions, documents, document_grants, audit_events            |
+|  - users, sessions, documents, document_versions, document_grants        |
+|  - storage_objects (global key owner + lifecycle state)                  |
+|  - upload_requests (durable idempotency result)                           |
 |  - audit_chain_state (serialized append sequence and chain head)        |
 |  - login_rate_limit_buckets (shared, expiring login counters)           |
 |  - storage_quota_state (serialized upload admission)                    |
@@ -104,18 +106,22 @@ Concurrent grant requests with no intervening revocation remain last-writer-wins
        |
        v
 +-------------------------------------------------------------------------+
-|             Audit Checkpoint Anchor (CheckpointStore adapter)           |
-|  - HMAC-SHA256 protected checkpoints bound to stream + sequence         |
+|       Independent Audit Anchor (separate PostgreSQL service)            |
+|  - HMAC-SHA256 checkpoints bound to stream + sequence                    |
+|  - application role has SELECT/INSERT only on provisioned table          |
 |  - scheduled creation with observable state in /health                  |
-|  - local_file = same-host HMAC-protected checkpoints                      |
 +-------------------------------------------------------------------------+
 ```
 
 ### Storage and Request Boundaries
 
-Uploads are streamed to a private `.staging` directory on the same filesystem, validated against the extension/magic-byte policy, counted against `MAX_FILE_SIZE_BYTES`, fsynced, and atomically renamed to a 64-character lowercase hex storage key before the document row commits. If the transaction or finalization fails, both staged and final paths are removed. A crash between rename and commit can leave an unreferenced file.
+Uploads are streamed to a private `.staging` directory on the same filesystem, validated against the extension/magic-byte policy, counted against `MAX_FILE_SIZE_BYTES`, fsynced, and atomically renamed to a 64-character lowercase hex storage key before the document row commits for local storage. A crash between rename and commit can leave an unreferenced file.
 
-Startup reconciliation removes files belonging to soft-deleted documents immediately. It removes other unreferenced files and stale `.part` staging files only after `STORAGE_ORPHAN_GRACE_SECONDS`, so another worker's in-flight upload is not deleted. Active files are never removed, and missing active files are counted and logged rather than recreated. The filesystem and database do not share an atomic transaction; this is a recoverable-ordering design, not a distributed transaction.
+`storage_objects` is the canonical, durable owner and lifecycle record for each key. Insert triggers atomically claim a registry row for exactly one document or version and reject a second owner, a missing key, or a key outside the `active` state. Storage-key reassignment is rejected; owner metadata is retained as a tombstone even if a document row is later removed. Remote deletion first moves the registry row to `deleting` in the same transaction as the document soft-delete and durable delete intent. The worker verifies no active document or version reference exists, commits and releases database locks, then calls the provider. It only marks the registry key `deleted` in the same fenced transaction that completes the operation. Ambiguous or failed provider outcomes leave the key fenced for retry or review.
+
+The `upload_requests` table scopes required `Idempotency-Key` values to an owner and persists a digest of the exact file and metadata. The upload response is saved in the same commit as the document, audit event, active registry ownership, and `UPLOAD_COMMITTED` operation state. Retries with the same payload replay the original response; payload changes and unresolved requests return `409`. The browser keeps an unresolved key in `sessionStorage` so a page reload does not silently create a second document. Keys and idempotency records are retained as ownership tombstones; downgrades refuse to remove them when any such history exists.
+
+Startup reconciliation removes finalized files belonging to soft-deleted documents after the soft-delete is committed. It preserves unreferenced finalized files and `.part` staging files because local uploads have no durable lease for distinguishing an abandoned file from a slow in-flight upload; a grace period alone cannot prove that the request stopped. Active files are never removed, and missing active files are counted and logged rather than recreated. Orphaned-file cleanup requires a future durable ownership/lease mechanism. The filesystem and database do not share an atomic transaction; this is a recoverable-ordering design, not a distributed transaction.
 
 Upload admission updates the singleton `storage_quota_state` row at the start of the document transaction, then checks active per-user document count and bytes plus platform-wide bytes. PostgreSQL holds the row lock and SQLite holds its write lock until the caller commits or rolls back, so concurrent workers cannot both admit uploads against the same stale usage snapshot. Count-limit rejection returns `409`; byte-limit rejection returns `413`. The opt-in PostgreSQL suite verifies both per-user count admission and cross-owner global byte admission with four concurrent uploaders.
 
@@ -180,17 +186,20 @@ Administrators can invoke this verification through the read-only `GET /api/v1/a
 ### Verification Consistency and Limits
 The high-water mark prevents verification from chasing audit writes that are appended during the pass: only records at or below the maximum sequence observed at the start are examined. This is not a single repeatable-read database snapshot. A record modified between batch reads can cause a mixed read, and a modification made after a record was already examined is not re-checked until the next run. For a stronger point-in-time result, run verification during a quiet window or against a database snapshot/read replica. The rate limiter is process-local and is not shared across workers or instances; deployment-level or Redis-backed enforcement is required to bound aggregate concurrency. If the chain exceeds the configured record limit or the time budget expires, the endpoint returns an explicit `INCOMPLETE` result rather than a partial success.
 
-### Local Audit Checkpoints
-Hash chaining alone cannot detect a database-level attacker who rewrites the entire chain from an arbitrary sequence forward or truncates the current tail before a pass begins. TrustVault stores HMAC-protected checkpoints in a local directory configured by `AUDIT_ANCHOR_DIR`:
+### Audit Checkpoints
+
+Hash chaining alone cannot detect a database-level attacker who rewrites the entire chain from an arbitrary sequence forward or truncates the current tail before a pass begins. TrustVault stores HMAC-protected checkpoints in a separately administered PostgreSQL service configured by `AUDIT_ANCHOR_DATABASE_URL`. Its `trustvault_audit_anchor.checkpoints` table is provisioned separately by `backend/scripts/provision_audit_anchor.sql`; the runtime role receives only `SELECT` and `INSERT` permissions. It is not the owner of the schema or table.
 
 - A checkpoint records the audit stream identifier (`trustvault.audit`), the highest verified sequence number and record hash, a format version, a creation timestamp, and the previous checkpoint's HMAC tag. The document is protected by an HMAC-SHA256 integrity tag derived from `AUDIT_ANCHOR_HMAC_KEY`.
 - Creation (`POST /admin/audit/checkpoints`) verifies the bounded audit chain, refuses invalid or incomplete chains, and writes checkpoints monotonically. Repeating creation for the current chain head is idempotent; rollback and conflicting writes are rejected.
 - The checkpoint covers only the verified prefix. The `audit.checkpoint_created` event is appended afterward, so a checkpoint never binds its own creation event.
 - Verification (`GET /admin/audit/checkpoints/verify`) compares the bounded chain with the latest stored checkpoint. Invalid or mismatched history reports `INVALID`; a missing or genesis-only checkpoint reports `INCOMPLETE`; an unavailable store reports `UNAVAILABLE`.
-- The in-process scheduler creates a checkpoint at startup and every `AUDIT_CHECKPOINT_INTERVAL_SECONDS`. Scheduled and administrator-triggered writes share a PostgreSQL advisory lock. Scheduler health and checkpoint age are exposed through `GET /health`.
+- The in-process scheduler creates a checkpoint at startup and every `AUDIT_CHECKPOINT_INTERVAL_SECONDS`. Scheduled and administrator-triggered writes share a PostgreSQL advisory lock within the anchor database. Scheduler health and checkpoint age are exposed through `GET /health`.
 
-### Limitation & Production Anchoring
-Local checkpoint files share the application host and its filesystem failure domain. HMAC protection helps detect accidental or unauthorized checkpoint edits when the HMAC key remains protected, but it does not provide independent protection against an attacker who can compromise the application host or access both the database and checkpoint directory. Production health therefore remains degraded when local-file anchoring is selected. Keep the checkpoint directory on persistent storage and include it in the deployment's protected backup and recovery plan. External checkpoint adapters are not included in this build.
+### Independence Boundary
+Production configuration requires the anchor URL to use a host distinct from the application database host and rejects local-file anchoring. This is a configuration guard, not proof that DNS names identify separate physical clusters, providers, administrators, backups, or credentials. Operators must verify these boundaries and keep anchor administration outside the application deployment account. The HMAC key is available to the application, so a compromised application runtime can forge checkpoints. A privileged administrator of the anchor database can also rewrite its contents. The design therefore protects against an application-database-only rewrite, not compromise of every system holding the evidence. `GET /health` reports configured PostgreSQL anchoring but sets `independence_verified=false` pending operator verification.
+
+`local_file` remains available for development and is never considered independent. Production startup rejects it.
 
 ## 5. Administrative Audit API and Coverage
 

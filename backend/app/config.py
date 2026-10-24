@@ -5,12 +5,15 @@ Enforces defense-in-depth defaults.
 """
 
 import ipaddress
+import os
+import re
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -36,6 +39,29 @@ KNOWN_DEFAULT_DATABASE_PASSWORDS = frozenset(
 SUPPORTED_DATABASE_BACKENDS = frozenset({"postgres", "postgresql"})
 
 
+def _require_verified_postgresql_tls(
+    database_url: URL,
+    setting_name: str,
+) -> None:
+    sslmode = database_url.query.get("sslmode")
+    sslrootcert = database_url.query.get("sslrootcert")
+    if (
+        sslmode != "verify-full"
+        or not isinstance(sslrootcert, str)
+        or not sslrootcert.strip()
+    ):
+        raise ValueError(
+            f"{setting_name} must configure sslmode=verify-full and a non-empty "
+            "sslrootcert path in production."
+        )
+    ca_file = Path(sslrootcert)
+    if not ca_file.is_file() or not os.access(ca_file, os.R_OK):
+        raise ValueError(
+            f"{setting_name} sslrootcert must point to a readable CA "
+            "certificate file."
+        )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR / ".env"),
@@ -55,6 +81,7 @@ class Settings(BaseSettings):
     # Security & Cryptography
     SECRET_KEY: str = Field(
         default="trustvault_insecure_default_secret_key_change_in_production_32bytes",
+        repr=False,
         description="Key used for cryptographic signatures and session sealing",
     )
 
@@ -69,14 +96,26 @@ class Settings(BaseSettings):
     # Database Configuration
     DATABASE_URL: str = Field(
         default="sqlite:///./trustvault.db",
+        repr=False,
         description="PostgreSQL connection string (psycopg3 driver) or SQLite fallback",
     )
 
     # Storage Settings
+    STORAGE_BACKEND: Literal["local", "supabase"] = Field(
+        default="local",
+        description="Storage backend for private document bytes",
+    )
     STORAGE_DIR: str = Field(
         default="./private_storage",
-        description="Location for private persistent file storage (outside web root)",
+        description="Location for private local file storage (outside web root)",
     )
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_ROLE_KEY: str = Field(
+        default="",
+        repr=False,
+        description="Server-side Supabase credential; never expose to the frontend",
+    )
+    SUPABASE_STORAGE_BUCKET: str = "trustvault-bucket"
     MAX_FILE_SIZE_BYTES: int = Field(
         default=10 * 1024 * 1024,
         ge=1,
@@ -100,8 +139,8 @@ class Settings(BaseSettings):
         default=3600,
         ge=1,
         description=(
-            "Age before an unreferenced or stale staging file is eligible for "
-            "startup cleanup, which protects uploads in progress in other workers"
+            "Reserved for a future safe orphan-cleanup policy; currently unused "
+            "because file age cannot prove that an upload request has stopped"
         ),
     )
 
@@ -199,22 +238,30 @@ class Settings(BaseSettings):
     )
 
     # Audit Checkpoint Anchoring
-    # "local_file" is HMAC-protected but shares the application host and is not
-    # independent anchoring.
-    AUDIT_ANCHOR_MODE: Literal["disabled", "local_file"] = Field(
+    AUDIT_ANCHOR_MODE: Literal["disabled", "local_file", "postgresql"] = Field(
         default="disabled",
         description=(
-            "Checkpoint storage: 'disabled' or same-host 'local_file'"
+            "Checkpoint storage: disabled, same-host local_file, or an "
+            "independently administered PostgreSQL service"
         ),
     )
     AUDIT_ANCHOR_DIR: str = Field(
         default="./audit_checkpoints",
-        description="Directory used by the local checkpoint adapter",
+        description="Directory used by the development local-file checkpoint adapter",
     )
     AUDIT_ANCHOR_HMAC_KEY: str = Field(
         default="",
+        repr=False,
         description=(
             "HMAC key (>= 32 characters) used to integrity-protect local checkpoint files"
+        ),
+    )
+    AUDIT_ANCHOR_DATABASE_URL: str = Field(
+        default="",
+        repr=False,
+        description=(
+            "Connection URL for the separately administered PostgreSQL "
+            "checkpoint store"
         ),
     )
     AUDIT_CHECKPOINT_RATE_LIMIT_MAX_REQUESTS: int = Field(
@@ -249,11 +296,11 @@ class Settings(BaseSettings):
 
     # Seed Accounts
     SEED_ADMIN_EMAIL: str = "admin@trustvault.local"
-    SEED_ADMIN_PASSWORD: str = "AdminSecurePass123!"
+    SEED_ADMIN_PASSWORD: str = Field(default="AdminSecurePass123!", repr=False)
     SEED_OWNER_EMAIL: str = "owner@trustvault.local"
-    SEED_OWNER_PASSWORD: str = "OwnerSecurePass123!"
+    SEED_OWNER_PASSWORD: str = Field(default="OwnerSecurePass123!", repr=False)
     SEED_VIEWER_EMAIL: str = "viewer@trustvault.local"
-    SEED_VIEWER_PASSWORD: str = "ViewerSecurePass123!"
+    SEED_VIEWER_PASSWORD: str = Field(default="ViewerSecurePass123!", repr=False)
 
     @field_validator("CORS_ORIGINS", mode="after")
     @classmethod
@@ -283,6 +330,73 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
+    def validate_storage_settings(self) -> "Settings":
+        if self.STORAGE_BACKEND == "supabase":
+            supabase_url = self.SUPABASE_URL.strip()
+            if not supabase_url:
+                raise ValueError(
+                    "SUPABASE_URL is required when STORAGE_BACKEND is 'supabase'."
+                )
+
+            try:
+                parsed_url = urlsplit(supabase_url)
+                hostname = parsed_url.hostname
+                port = parsed_url.port
+            except ValueError as exc:
+                raise ValueError(
+                    "SUPABASE_URL must be a valid HTTPS project URL."
+                ) from exc
+
+            hostname_labels = hostname.split(".") if hostname else []
+            valid_hostname = bool(
+                hostname
+                and len(hostname) <= 253
+                and len(hostname_labels) >= 2
+                and all(
+                    re.fullmatch(
+                        r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                        label,
+                    )
+                    for label in hostname_labels
+                )
+            )
+            if (
+                parsed_url.scheme != "https"
+                or not parsed_url.netloc
+                or not valid_hostname
+                or parsed_url.username is not None
+                or parsed_url.password is not None
+                or parsed_url.path not in {"", "/"}
+                or parsed_url.query
+                or parsed_url.fragment
+                or port == 0
+            ):
+                raise ValueError(
+                    "SUPABASE_URL must be a valid HTTPS project URL without "
+                    "credentials, a path, query, or fragment."
+                )
+
+            if not self.SUPABASE_SERVICE_ROLE_KEY.strip():
+                raise ValueError(
+                    "SUPABASE_SERVICE_ROLE_KEY is required when "
+                    "STORAGE_BACKEND is 'supabase'."
+                )
+
+            bucket = self.SUPABASE_STORAGE_BUCKET.strip()
+            if not bucket:
+                raise ValueError("SUPABASE_STORAGE_BUCKET must not be empty.")
+            if bucket != self.SUPABASE_STORAGE_BUCKET or not re.fullmatch(
+                r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]",
+                bucket,
+            ):
+                raise ValueError(
+                    "SUPABASE_STORAGE_BUCKET must be 3-63 lowercase letters, "
+                    "numbers, or hyphens, and start and end with a letter or number."
+                )
+
+        return self
+
+    @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
         if self.ENVIRONMENT != "production":
             return self
@@ -291,6 +405,17 @@ class Settings(BaseSettings):
             raise ValueError(
                 "SESSION_COOKIE_SECURE must be true in production; "
                 "plaintext session cookies are not permitted."
+            )
+
+        if not self.SESSION_COOKIE_HTTPONLY:
+            raise ValueError(
+                "SESSION_COOKIE_HTTPONLY must be true in production."
+            )
+
+        if self.SESSION_COOKIE_SAMESITE not in {"lax", "strict", "none"}:
+            raise ValueError(
+                "SESSION_COOKIE_SAMESITE must be 'lax', 'strict', or 'none' "
+                "in production."
             )
 
         try:
@@ -318,6 +443,47 @@ class Settings(BaseSettings):
                 "DATABASE_URL must not use a known default database password "
                 "in production."
             )
+        if not database_url.host or not database_url.database:
+            raise ValueError(
+                "DATABASE_URL must identify a PostgreSQL host and database."
+            )
+
+        if self.AUDIT_ANCHOR_MODE != "postgresql":
+            raise ValueError(
+                "AUDIT_ANCHOR_MODE must be 'postgresql' in production; "
+                "local-file checkpoints are not independent."
+            )
+
+        try:
+            anchor_url = make_url(self.AUDIT_ANCHOR_DATABASE_URL)
+        except (ArgumentError, TypeError) as exc:
+            raise ValueError(
+                "AUDIT_ANCHOR_DATABASE_URL must be a valid PostgreSQL URL."
+            ) from exc
+        if anchor_url.get_backend_name() != "postgresql":
+            raise ValueError(
+                "AUDIT_ANCHOR_DATABASE_URL must use PostgreSQL."
+            )
+        if not (anchor_url.username or "").strip() or not (
+            anchor_url.password or ""
+        ).strip():
+            raise ValueError(
+                "AUDIT_ANCHOR_DATABASE_URL must include non-empty "
+                "credentials."
+            )
+        if not anchor_url.host or not anchor_url.database:
+            raise ValueError(
+                "AUDIT_ANCHOR_DATABASE_URL must identify a host and database."
+            )
+        if anchor_url.host.lower() == database_url.host.lower():
+            raise ValueError(
+                "AUDIT_ANCHOR_DATABASE_URL must use a separately administered "
+                "PostgreSQL host."
+            )
+        _require_verified_postgresql_tls(database_url, "DATABASE_URL")
+        _require_verified_postgresql_tls(
+            anchor_url, "AUDIT_ANCHOR_DATABASE_URL"
+        )
 
         return self
 
@@ -325,8 +491,8 @@ class Settings(BaseSettings):
     def validate_anchor_settings(self) -> "Settings":
         if self.ENVIRONMENT == "production" and self.AUDIT_ANCHOR_MODE == "disabled":
             raise ValueError(
-                "AUDIT_ANCHOR_MODE must be enabled in production; use 'local_file' "
-                "to store HMAC-protected checkpoints on persistent local storage."
+                "AUDIT_ANCHOR_MODE must be 'postgresql' in production; "
+                "local-file checkpoints are not independently administered."
             )
 
         if self.AUDIT_ANCHOR_MODE == "disabled":
@@ -341,11 +507,23 @@ class Settings(BaseSettings):
         if len(self.AUDIT_ANCHOR_HMAC_KEY) < 32:
             raise ValueError(
                 "AUDIT_ANCHOR_HMAC_KEY must be at least 32 characters when "
-                "AUDIT_ANCHOR_MODE is 'local_file'."
+                "audit checkpoint anchoring is enabled."
             )
 
         if self.AUDIT_ANCHOR_MODE == "local_file":
             return self
+
+        if self.AUDIT_ANCHOR_MODE == "postgresql":
+            try:
+                anchor_url = make_url(self.AUDIT_ANCHOR_DATABASE_URL)
+            except (ArgumentError, TypeError) as exc:
+                raise ValueError(
+                    "AUDIT_ANCHOR_DATABASE_URL must be a valid PostgreSQL URL."
+                ) from exc
+            if anchor_url.get_backend_name() != "postgresql":
+                raise ValueError(
+                    "AUDIT_ANCHOR_DATABASE_URL must use PostgreSQL."
+                )
 
         return self
 
@@ -379,3 +557,4 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+_APPLICATION_DATABASE_URL_AT_LOAD = settings.DATABASE_URL

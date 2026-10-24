@@ -478,20 +478,19 @@ def test_local_store_detects_tampered_checkpoint(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_local_anchor_is_accepted_in_production():
-    configured = Settings(
-        _env_file=None,
-        ENVIRONMENT="production",
-        SESSION_COOKIE_SECURE=True,
-        DATABASE_URL=(
-            "postgresql+psycopg://trustvault_app:test-only-db-password"
-            "@db:5432/trustvault"
-        ),
-        AUDIT_ANCHOR_MODE="local_file",
-        AUDIT_ANCHOR_HMAC_KEY="k" * 64,
-    )
-
-    assert configured.AUDIT_ANCHOR_MODE == "local_file"
+def test_production_rejects_local_anchor():
+    with pytest.raises(ValidationError, match="independent"):
+        Settings(
+            _env_file=None,
+            ENVIRONMENT="production",
+            SESSION_COOKIE_SECURE=True,
+            DATABASE_URL=(
+                "postgresql+psycopg://trustvault_app:test-only-db-password"
+                "@db:5432/trustvault"
+            ),
+            AUDIT_ANCHOR_MODE="local_file",
+            AUDIT_ANCHOR_HMAC_KEY="k" * 64,
+        )
 
 
 def test_local_anchor_requires_strong_hmac_key():

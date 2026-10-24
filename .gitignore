@@ -39,6 +39,7 @@ venv.bak/
 *.sqlite3
 *.db
 private_storage/
+private_storage_dev/
 storage/
 uploads/
 # Development-only audit checkpoint directory (never commit anchor data)
@@ -46,6 +47,7 @@ audit_checkpoints/
 
 # Testing and linters
 .pytest_cache/
+.pytest-tmp-*/
 .coverage
 htmlcov/
 .mypy_cache/
@@ -58,6 +60,9 @@ dist-ssr/
 *.local
 .npm
 .eslintcache
+# Frontend shared modules; the Python 'lib/' rule above must not hide them.
+!frontend/src/lib/
+!frontend/src/lib/**
 
 # IDE and OS
 .idea/
@@ -75,3 +80,5 @@ desktop.ini
 
 # Temporary recovery artifact
 /trustvault-recovery.patch
+
+migration-preview.sql

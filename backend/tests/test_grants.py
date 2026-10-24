@@ -81,6 +81,102 @@ async def test_owner_can_grant_read_and_edit(async_client: AsyncClient, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_email_recipient_lookup_grant_read_access_and_revoke(
+    async_client: AsyncClient,
+    db_session: Session,
+):
+    owner = make_user(
+        db_session,
+        email="owner_email_share@example.com",
+        password=VALID_PASSWORD,
+        role=UserRole.OWNER,
+    )
+    recipient = make_user(
+        db_session,
+        email="recipient_email_share@example.com",
+        password=VALID_PASSWORD,
+        role=UserRole.VIEWER,
+    )
+    db_session.commit()
+
+    await _login(async_client, owner.email)
+    doc_id = await _upload(async_client, "Email Recipient Share")
+
+    lookup = await async_client.post(
+        f"/api/v1/documents/{doc_id}/permissions/recipient",
+        json={"email": "Recipient_Email_Share@Example.com"},
+    )
+    assert lookup.status_code == 200, lookup.text
+    assert lookup.json() == {"user_id": recipient.id}
+
+    grant = await async_client.post(
+        f"/api/v1/documents/{doc_id}/permissions",
+        json={"user_id": lookup.json()["user_id"], "permission": "read"},
+    )
+    assert grant.status_code == 201, grant.text
+    assert grant.json()["permission"] == "read"
+
+    await _login(async_client, recipient.email)
+    shared_document = await async_client.get(f"/api/v1/documents/{doc_id}")
+    assert shared_document.status_code == 200
+
+    await _login(async_client, owner.email)
+    revoke = await async_client.delete(
+        f"/api/v1/documents/{doc_id}/permissions/{recipient.id}",
+    )
+    assert revoke.status_code == 200, revoke.text
+
+    await _login(async_client, recipient.email)
+    revoked_document = await async_client.get(f"/api/v1/documents/{doc_id}")
+    assert revoked_document.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_email_recipient_lookup_rejects_unknown_and_inactive_users(
+    async_client: AsyncClient,
+    db_session: Session,
+):
+    owner = make_user(
+        db_session,
+        email="owner_lookup_failures@example.com",
+        password=VALID_PASSWORD,
+        role=UserRole.OWNER,
+    )
+    make_user(
+        db_session,
+        email="inactive_lookup@example.com",
+        password=VALID_PASSWORD,
+        role=UserRole.VIEWER,
+        is_active=False,
+    )
+    db_session.commit()
+
+    await _login(async_client, owner.email)
+    doc_id = await _upload(async_client, "Unavailable Recipient Lookup")
+
+    for email in (
+        "unknown_lookup@example.com",
+        "inactive_lookup@example.com",
+    ):
+        response = await async_client.post(
+            f"/api/v1/documents/{doc_id}/permissions/recipient",
+            json={"email": email},
+        )
+        assert response.status_code == 404
+        assert response.json() == {
+            "detail": "Recipient user not found or inactive"
+        }
+
+    db_session.expire_all()
+    assert (
+        db_session.query(DocumentGrant)
+        .filter(DocumentGrant.document_id == doc_id)
+        .count()
+        == 0
+    )
+
+
+@pytest.mark.asyncio
 async def test_read_grant_permissions_enforced(async_client: AsyncClient, db_session: Session):
     """Read grant permits metadata access and download, but blocks edit and delete."""
     make_user(db_session, email="owner_r@example.com", password=VALID_PASSWORD, role=UserRole.OWNER)
@@ -413,9 +509,43 @@ async def test_cannot_grant_access_to_inactive_recipient(async_client: AsyncClie
         json={"user_id": inactive.id, "permission": "read"},
     )
     assert resp.status_code == 404
+    assert resp.json() == {"detail": "Recipient user not found or inactive"}
 
     db_session.expire_all()
     count = db_session.query(DocumentGrant).filter(DocumentGrant.document_id == doc_id).count()
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_cannot_grant_access_to_nonexistent_recipient(
+    async_client: AsyncClient,
+    db_session: Session,
+):
+    """Unknown recipient IDs receive the same safe response as inactive users."""
+    owner = make_user(
+        db_session,
+        email="owner_unknown_recipient@example.com",
+        password=VALID_PASSWORD,
+        role=UserRole.OWNER,
+    )
+    db_session.commit()
+
+    await _login(async_client, owner.email)
+    doc_id = await _upload(async_client, "Unknown Recipient Doc", "unknown.pdf")
+
+    resp = await async_client.post(
+        f"/api/v1/documents/{doc_id}/permissions",
+        json={"user_id": "nonexistent-recipient-id", "permission": "read"},
+    )
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Recipient user not found or inactive"}
+
+    db_session.expire_all()
+    count = (
+        db_session.query(DocumentGrant)
+        .filter(DocumentGrant.document_id == doc_id)
+        .count()
+    )
     assert count == 0
 
 

@@ -88,6 +88,10 @@ export interface GrantResponse {
   updated_at: string;
 }
 
+export interface GrantRecipientLookupResponse {
+  user_id: string;
+}
+
 export interface GrantListResponse {
   grants: GrantResponse[];
 }

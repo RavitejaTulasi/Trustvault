@@ -8,6 +8,7 @@ import {
   getDocument,
   listGrants,
   revokeGrant,
+  resolveGrantRecipient,
   updateDocument,
 } from '../auth';
 import { ApiError, listDocumentActivity } from '../api';
@@ -73,9 +74,11 @@ export default function DocumentDetail() {
 
   const [grants, setGrants] = useState<GrantResponse[]>([]);
   const [grantsError, setGrantsError] = useState<string | null>(null);
-  const [shareUserId, setShareUserId] = useState('');
+  const [shareEmail, setShareEmail] = useState('');
+  const [resolvedShareUserId, setResolvedShareUserId] = useState<string | null>(null);
   const [sharePermission, setSharePermission] = useState<'read' | 'edit'>('read');
   const [reviewingShare, setReviewingShare] = useState(false);
+  const [resolvingShare, setResolvingShare] = useState(false);
   const [sharing, setSharing] = useState(false);
   const [shareError, setShareError] = useState<string | null>(null);
   const [revokeArmedId, setRevokeArmedId] = useState<string | null>(null);
@@ -236,27 +239,39 @@ export default function DocumentDetail() {
     }
   };
 
-  const handleShareReview = (event: FormEvent<HTMLFormElement>) => {
+  const handleShareReview = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setShareError(null);
-    if (shareUserId.trim() === '') {
-      setShareError('A user ID is required.');
+    setResolvedShareUserId(null);
+    const email = shareEmail.trim();
+    if (email === '') {
+      setShareError('Enter the email address for an existing active TrustVault account.');
       return;
     }
-    setReviewingShare(true);
+    setResolvingShare(true);
+    try {
+      const recipient = await resolveGrantRecipient(id, email);
+      setResolvedShareUserId(recipient.user_id);
+      setReviewingShare(true);
+    } catch (err) {
+      setShareError(describeError(err, 'Could not find an active recipient account.'));
+    } finally {
+      setResolvingShare(false);
+    }
   };
 
   const handleConfirmShare = async () => {
     setShareError(null);
-    if (shareUserId.trim() === '') {
-      setShareError('A user ID is required.');
+    if (resolvedShareUserId === null) {
+      setShareError('Resolve an existing active recipient before granting access.');
       setReviewingShare(false);
       return;
     }
     setSharing(true);
     try {
-      await createGrant(id, shareUserId.trim(), sharePermission);
-      setShareUserId('');
+      await createGrant(id, resolvedShareUserId, sharePermission);
+      setShareEmail('');
+      setResolvedShareUserId(null);
       setReviewingShare(false);
       await loadGrants(true);
       pushToast({ title: 'Access granted', tone: 'success' });
@@ -558,7 +573,7 @@ export default function DocumentDetail() {
                       Sharing
                     </h2>
                     <p className="panel-description">
-                      Grants are read from and written to the server.
+                      Share with an existing, active TrustVault account by email.
                     </p>
                   </div>
                   <StatusPill />
@@ -572,15 +587,17 @@ export default function DocumentDetail() {
                   {!reviewingShare ? (
                     <form onSubmit={handleShareReview} className="share-form">
                       <div className="field">
-                        <label htmlFor="share-user">User ID</label>
+                        <label htmlFor="share-email">Recipient email</label>
                         <input
-                          id="share-user"
+                          id="share-email"
                           className="input"
-                          type="text"
-                          value={shareUserId}
-                          onChange={(e) => setShareUserId(e.target.value)}
-                          maxLength={64}
-                          placeholder="u_recipient_123"
+                          type="email"
+                          value={shareEmail}
+                          onChange={(e) => setShareEmail(e.target.value)}
+                          maxLength={254}
+                          autoComplete="off"
+                          required
+                          placeholder="recipient@example.com"
                         />
                       </div>
                       <div className="field">
@@ -597,16 +614,20 @@ export default function DocumentDetail() {
                           <option value="edit">edit</option>
                         </select>
                       </div>
-                      <button type="submit" className="btn btn-primary" disabled={sharing}>
+                      <button
+                        type="submit"
+                        className="btn btn-primary"
+                        disabled={resolvingShare || sharing}
+                      >
                         <ShareIcon width={15} height={15} />
-                        Review grant
+                        {resolvingShare ? 'Finding account…' : 'Review grant'}
                       </button>
                     </form>
                   ) : (
                     <div className="share-review" role="group" aria-label="Review grant">
                       <dl className="document-meta">
                         <dt>Recipient</dt>
-                        <dd className="mono">{shareUserId.trim()}</dd>
+                        <dd className="mono">{shareEmail.trim()}</dd>
                         <dt>Permission</dt>
                         <dd>
                           <PermissionBadge permission={sharePermission} />
@@ -625,7 +646,10 @@ export default function DocumentDetail() {
                         <button
                           type="button"
                           className="btn btn-ghost"
-                          onClick={() => setReviewingShare(false)}
+                          onClick={() => {
+                            setReviewingShare(false);
+                            setResolvedShareUserId(null);
+                          }}
                           disabled={sharing}
                         >
                           Back

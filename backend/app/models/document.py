@@ -32,7 +32,12 @@ class Document(Base, TimestampMixin):
     )
     
     # Internal random key used in private storage - physical paths are NEVER exposed to clients
-    storage_key: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    storage_key: Mapped[str] = mapped_column(
+        String(255),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
     file_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     mime_type: Mapped[str] = mapped_column(
         String(MAX_MIME_TYPE_LENGTH), nullable=False
@@ -77,7 +82,11 @@ class DocumentVersion(Base):
         String(36), ForeignKey("documents.id", ondelete="CASCADE"), index=True, nullable=False
     )
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    storage_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    storage_key: Mapped[str] = mapped_column(
+        String(255),
+        unique=True,
+        nullable=False,
+    )
     file_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     created_by_id: Mapped[str | None] = mapped_column(

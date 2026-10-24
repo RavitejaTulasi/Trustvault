@@ -63,10 +63,7 @@ def get_health(response: Response) -> HealthResponse:
         storage="available" if storage_ok else "unavailable",
         components={
             "database": {"status": "ok" if db_ok else "down"},
-            "storage": {
-                "status": "ok" if storage_ok else "down",
-                "path": str(storage_path),
-            },
+            "storage": {"status": "ok" if storage_ok else "down"},
             "audit_anchor": anchor.details,
         },
     )

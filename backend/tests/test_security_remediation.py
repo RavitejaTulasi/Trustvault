@@ -214,3 +214,35 @@ async def test_trusted_proxy_address_is_used_for_audit_and_limits(
     )
     assert event is not None
     assert event.ip_address == "203.0.113.77"
+
+
+@pytest.mark.asyncio
+async def test_csrf_rejects_origin_with_unapproved_port(
+    async_client: AsyncClient,
+    db_session: Session,
+):
+    """Reject an origin whose port differs from the configured allowed origin."""
+    make_user(
+        db_session,
+        email="csrfport@example.com",
+        password=VALID_PASSWORD,
+    )
+    db_session.commit()
+
+    login_resp = await async_client.post(
+        "/api/v1/auth/login",
+        json={
+            "email": "csrfport@example.com",
+            "password": VALID_PASSWORD,
+        },
+    )
+    assert login_resp.status_code == 200
+
+    resp = await async_client.patch(
+        "/api/v1/auth/me",
+        json={"full_name": "Origin Test"},
+        headers={"Origin": "http://localhost:9999"},
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "CSRF Origin validation failed"

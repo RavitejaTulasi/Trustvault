@@ -353,6 +353,45 @@ describe('Shared With Me (component)', () => {
     expect(screen.getByText('read')).toBeInTheDocument();
     expect(screen.getByText('edit')).toBeInTheDocument();
   }, 15000);
+
+  it('loads every page of the visible document set', async () => {
+    mockGetMe.mockResolvedValue(VIEWER);
+    mockListDocuments
+      .mockResolvedValueOnce({
+        documents: [makeDocument({ id: 'doc_1', title: 'First page report' })],
+        total: 2,
+        page: 1,
+        page_size: 100,
+      })
+      .mockResolvedValueOnce({
+        documents: [
+          makeDocument({
+            id: 'doc_2',
+            title: 'Second page report',
+            owner_id: 'usr_3',
+            effective_permission: 'edit',
+          }),
+        ],
+        total: 2,
+        page: 2,
+        page_size: 100,
+      });
+
+    renderRoute('/shared', <SharedWithMe />);
+
+    expect(await screen.findByText('First page report')).toBeInTheDocument();
+    expect(await screen.findByText('Second page report')).toBeInTheDocument();
+    expect(mockListDocuments).toHaveBeenNthCalledWith(1, {
+      page: 1,
+      page_size: 100,
+      owner_id: undefined,
+    });
+    expect(mockListDocuments).toHaveBeenNthCalledWith(2, {
+      page: 2,
+      page_size: 100,
+      owner_id: undefined,
+    });
+  }, 15000);
 });
 
 describe('Access & Sharing (component)', () => {

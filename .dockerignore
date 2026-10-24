@@ -14,6 +14,7 @@ opencode.json
 *.pem
 *.key
 *.crt
+!certs/prod-ca-2021.crt
 *.log
 
 # Local databases and private data

@@ -4,20 +4,28 @@ Sets up isolated in-memory test database, rate limiter resets, and HTTPX async t
 """
 
 import os
+import uuid
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, event, insert
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 # Force testing environment before loading app components
 os.environ["ENVIRONMENT"] = "testing"
+from backend.app.config import settings
+
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+settings.DATABASE_URL = os.environ["DATABASE_URL"]
 
 from backend.app.database import Base, get_db
 from backend.app.main import app
+from backend.app.models.document import Document, DocumentVersion
+from backend.app.models.storage_operation import StorageOperation
+from backend.app.models.storage_object import StorageObject
+from backend.app.models.base import utc_now
 from backend.app.security.rate_limiter import (
     audit_checkpoint_rate_limiter,
     audit_verification_rate_limiter,
@@ -26,12 +34,85 @@ from backend.app.security.rate_limiter import (
 from backend.app.services.checkpoint_runtime import checkpoint_scheduler
 
 
+@event.listens_for(Session, "before_flush")
+def _register_storage_objects_for_test_fixtures(session, _flush_context, _instances):
+    """Keep direct ORM document fixtures consistent with the storage registry."""
+    keys = {
+        row.storage_key
+        for row in (*session.new,)
+        if isinstance(row, (Document, DocumentVersion, StorageOperation))
+    }
+    pending_object_keys = {
+        row.storage_key
+        for row in session.new
+        if isinstance(row, StorageObject)
+    }
+    for storage_key in keys:
+        if storage_key in pending_object_keys:
+            continue
+        with session.no_autoflush:
+            exists = session.get(StorageObject, storage_key) is not None
+        if exists:
+            continue
+        document_reference = any(
+            isinstance(row, (Document, DocumentVersion))
+            and row.storage_key == storage_key
+            for row in session.new
+        )
+        operation = next(
+            (
+                row
+                for row in session.new
+                if isinstance(row, StorageOperation)
+                and row.storage_key == storage_key
+            ),
+            None,
+        )
+        if document_reference:
+            state = "active"
+        elif operation is not None and operation.operation_type == "delete":
+            state = (
+                "deleted"
+                if operation.status in {"completed", "cancelled"}
+                else "deleting"
+            )
+        elif operation is not None and operation.status == "uploading":
+            state = "uploading"
+        elif operation is not None:
+            state = "needs_review"
+        else:
+            state = "active"
+        session.connection().execute(
+            insert(StorageObject.__table__).values(
+                storage_key=storage_key,
+                backend="local",
+                state=state,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+        )
+
+
 def pytest_configure(config):
     """Register opt-in markers so unknown-mark warnings never fail strict runs."""
     config.addinivalue_line(
         "markers",
         "postgres_integration: opt-in tests that use an explicitly approved PostgreSQL test database",
     )
+    config.addinivalue_line(
+        "markers",
+        "postgres_migration_integration: opt-in Alembic tests using an isolated PostgreSQL schema",
+    )
+
+
+async def _inject_upload_idempotency_header_hook(request):
+    """Give legacy test requests a unique key unless a case supplies its own."""
+    if (
+        request.method.upper() == "POST"
+        and request.url.path == "/api/v1/documents"
+        and "Idempotency-Key" not in request.headers
+    ):
+        request.headers["Idempotency-Key"] = f"test-{uuid.uuid4().hex}"
 
 
 # In-memory test engine isolated to test suite
@@ -128,7 +209,12 @@ async def async_client(db_session):
     async with AsyncClient(
         transport=transport,
         base_url="http://testserver",
-        event_hooks={"request": [_inject_csrf_header_hook]},
+        event_hooks={
+            "request": [
+                _inject_csrf_header_hook,
+                _inject_upload_idempotency_header_hook,
+            ]
+        },
     ) as client:
         yield client
 

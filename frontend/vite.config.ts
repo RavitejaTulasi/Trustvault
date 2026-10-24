@@ -8,6 +8,34 @@ export default defineConfig({
   base: '/',
   build: {
     outDir: 'dist',
+    modulePreload: {
+      resolveDependencies: (_filename, dependencies, { hostType }) => {
+        if (hostType === 'html') {
+          return dependencies.filter(
+            (dependency) =>
+              !/(?:^|\/)(three-core|react-three)-[^/]+\.js$/.test(dependency),
+          );
+        }
+
+        return dependencies;
+      },
+    },
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: 'three-core',
+              test: /node_modules\/three\//,
+            },
+            {
+              name: 'react-three',
+              test: /node_modules\/(@react-three\/fiber|@react-three\/drei)\//,
+            },
+          ],
+        },
+      },
+    },
   },
   server: {
     proxy: {

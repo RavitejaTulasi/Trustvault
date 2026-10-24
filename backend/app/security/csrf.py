@@ -20,6 +20,29 @@ def generate_csrf_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _normalized_origin(value: str) -> tuple[str, str, int] | None:
+    """Return (scheme, hostname, effective_port) for a valid HTTP(S) origin."""
+    try:
+        parsed = urlparse(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+
+    if scheme not in {"http", "https"} or not hostname:
+        return None
+
+    # Origin values must not contain credentials.
+    if parsed.username is not None or parsed.password is not None:
+        return None
+
+    effective_port = port if port is not None else (
+        443 if scheme == "https" else 80
+    )
+    return scheme, hostname.lower(), effective_port
+
+
 class CSRFMiddleware(BaseHTTPMiddleware):
     """
     CSRF Middleware enforcing double-submit cookie verification on state-changing requests.
@@ -59,25 +82,27 @@ class CSRFMiddleware(BaseHTTPMiddleware):
                         content={"detail": "CSRF token missing or invalid"},
                     )
 
-            # Defense-in-depth: Origin / Referer validation if header present
+            # Defense-in-depth: validate the full origin, including scheme and port.
             origin = request.headers.get("Origin") or request.headers.get("Referer")
             if origin:
-                parsed_origin = urlparse(origin)
-                origin_host = parsed_origin.netloc or parsed_origin.path
                 request_host = request.headers.get("Host", "")
+                request_origin = _normalized_origin(
+                    f"{request.url.scheme}://{request_host}"
+                )
+                supplied_origin = _normalized_origin(origin)
 
-                allowed_hosts = {request_host}
-                for allowed in settings.CORS_ORIGINS:
-                    parsed_allowed = urlparse(allowed)
-                    if parsed_allowed.netloc:
-                        allowed_hosts.add(parsed_allowed.netloc)
-                    else:
-                        allowed_hosts.add(allowed)
+                allowed_origins = {
+                    normalized
+                    for configured in settings.CORS_ORIGINS
+                    if (normalized := _normalized_origin(configured)) is not None
+                }
 
-                # Strip port or match directly
-                if origin_host and not any(
-                    origin_host == h or origin_host.split(":")[0] == h.split(":")[0]
-                    for h in allowed_hosts if h
+                if request_origin is not None:
+                    allowed_origins.add(request_origin)
+
+                if (
+                    supplied_origin is None
+                    or supplied_origin not in allowed_origins
                 ):
                     return JSONResponse(
                         status_code=403,

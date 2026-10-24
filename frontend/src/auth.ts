@@ -12,6 +12,7 @@ import {
   deleteDocument as apiDeleteDocument,
   downloadDocument as apiDownloadDocument,
   listGrants as apiListGrants,
+  resolveGrantRecipient as apiResolveGrantRecipient,
   createGrant as apiCreateGrant,
   revokeGrant as apiRevokeGrant,
 } from './api';
@@ -21,6 +22,7 @@ import type {
   DocumentResponse,
   DocumentUpdateRequest,
   GrantListResponse,
+  GrantRecipientLookupResponse,
   GrantResponse,
   UserResponse,
   UserUpdateRequest,
@@ -70,9 +72,10 @@ export async function getDocument(id: string): Promise<DocumentResponse> {
 export async function uploadDocument(
   file: File,
   title: string,
+  idempotencyKey: string,
   category?: string,
 ): Promise<DocumentResponse> {
-  return apiUploadDocument(file, title, category);
+  return apiUploadDocument(file, title, idempotencyKey, category);
 }
 
 export async function updateDocument(
@@ -92,6 +95,13 @@ export async function downloadDocument(id: string, fallbackName?: string): Promi
 
 export async function listGrants(id: string): Promise<GrantListResponse> {
   return apiListGrants(id);
+}
+
+export async function resolveGrantRecipient(
+  id: string,
+  email: string,
+): Promise<GrantRecipientLookupResponse> {
+  return apiResolveGrantRecipient(id, email);
 }
 
 export async function createGrant(

@@ -3,6 +3,8 @@
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from sqlalchemy import create_engine
@@ -11,6 +13,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import backend.app.main as main_module
 import backend.app.services.checkpoint_runtime as runtime_module
+import backend.app.services.checkpoint_store as checkpoint_store_module
+import backend.app.services.checkpoint_store_factory as checkpoint_store_factory
 from backend.app.config import Settings
 from backend.app.database import Base
 from backend.app.models.audit import AuditEvent
@@ -22,15 +26,24 @@ from backend.app.services.checkpoint_runtime import (
     validate_checkpoint_runtime,
 )
 from backend.app.services.checkpoint_store import (
+    CheckpointStoreUnavailableError,
     LocalFileCheckpointStore,
     UnavailableCheckpointStore,
 )
 from backend.tests.test_audit_checkpoints import _add_event
 
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+TEST_CA_FILE = Path(__file__).resolve()
 PRODUCTION_DATABASE_URL = (
     "postgresql+psycopg://trustvault_app:unique-test-password@db:5432/trustvault"
 )
+
+
+_TLS_QUERY = (
+    "?sslmode=verify-full&sslrootcert="
+    f"{quote(str(TEST_CA_FILE), safe='/')}"
+)
+PRODUCTION_DATABASE_URL = f"{PRODUCTION_DATABASE_URL}{_TLS_QUERY}"
 
 
 def make_config(**overrides: object) -> Settings:
@@ -39,6 +52,10 @@ def make_config(**overrides: object) -> Settings:
         "ENVIRONMENT": "testing",
         "AUDIT_ANCHOR_MODE": "local_file",
         "AUDIT_ANCHOR_HMAC_KEY": "k" * 64,
+        "AUDIT_ANCHOR_DATABASE_URL": (
+            "postgresql+psycopg://anchor:test-only-anchor-password"
+            f"@audit-db:5432/trustvault_anchor{_TLS_QUERY}"
+        ),
         "AUDIT_CHECKPOINT_INTERVAL_SECONDS": 60,
         "AUDIT_CHECKPOINT_MAX_AGE_SECONDS": 120,
     }
@@ -52,8 +69,12 @@ def make_production_config(**overrides: object) -> Settings:
         "ENVIRONMENT": "production",
         "SESSION_COOKIE_SECURE": True,
         "DATABASE_URL": PRODUCTION_DATABASE_URL,
-        "AUDIT_ANCHOR_MODE": "local_file",
+        "AUDIT_ANCHOR_MODE": "postgresql",
         "AUDIT_ANCHOR_HMAC_KEY": "k" * 64,
+        "AUDIT_ANCHOR_DATABASE_URL": (
+            "postgresql+psycopg://anchor:test-only-anchor-password"
+            f"@audit-db:5432/trustvault_anchor{_TLS_QUERY}"
+        ),
         "AUDIT_CHECKPOINT_INTERVAL_SECONDS": 60,
         "AUDIT_CHECKPOINT_MAX_AGE_SECONDS": 120,
     }
@@ -272,11 +293,26 @@ def test_local_file_health_never_claims_independence():
     assert local.details["independence_verified"] is False
 
 
-def test_production_local_file_anchor_health_is_degraded():
+def test_postgresql_health_reports_external_adapter_but_not_operator_verification():
     health = build_audit_anchor_health(
-        make_production_config(
-            AUDIT_ANCHOR_MODE="local_file",
-        ),
+        make_config(AUDIT_ANCHOR_MODE="postgresql"),
+        FakeScheduler(snapshot()),
+        now=NOW,
+    )
+
+    assert health.status == "ok"
+    assert health.healthy is True
+    assert health.details["independent"] is True
+    assert health.details["external_adapter"] is True
+    assert health.details["independence_verified"] is False
+
+
+def test_production_local_file_anchor_health_is_degraded():
+    config = make_production_config().model_copy(
+        update={"AUDIT_ANCHOR_MODE": "local_file"}
+    )
+    health = build_audit_anchor_health(
+        config,
         FakeScheduler(snapshot()),
         now=NOW,
     )
@@ -303,7 +339,7 @@ def test_runtime_validation_rejects_disabled_production_anchor():
         update={"AUDIT_ANCHOR_MODE": "disabled"}
     )
 
-    with pytest.raises(RuntimeError, match="enabled in production"):
+    with pytest.raises(RuntimeError, match="independently administered PostgreSQL"):
         validate_checkpoint_runtime(config)
 
 
@@ -315,7 +351,8 @@ def test_runtime_validation_accepts_local_file_production_adapter(tmp_path):
         }
     )
 
-    assert validate_checkpoint_runtime(config) is True
+    with pytest.raises(RuntimeError, match="independently administered"):
+        validate_checkpoint_runtime(config)
 
 
 def test_runtime_validation_fails_when_production_adapter_cannot_initialize(
@@ -328,6 +365,67 @@ def test_runtime_validation_fails_when_production_adapter_cannot_initialize(
 
     with pytest.raises(RuntimeError, match="could not be initialized"):
         validate_checkpoint_runtime(make_production_config())
+
+
+def test_checkpoint_store_factory_closes_postgres_store_after_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FailingStore:
+        closed = False
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def read_latest(self):
+            raise CheckpointStoreUnavailableError("test failure")
+
+        def close(self):
+            type(self).closed = True
+
+    monkeypatch.setattr(
+        checkpoint_store_factory, "PostgresCheckpointStore", FailingStore
+    )
+
+    configured = checkpoint_store_factory.create_checkpoint_store(
+        make_config(AUDIT_ANCHOR_MODE="postgresql")
+    )
+
+    assert isinstance(configured, UnavailableCheckpointStore)
+    assert FailingStore.closed is True
+
+
+def test_postgres_checkpoint_store_bounds_connections_and_statements(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    def fake_create_engine(url, **options):
+        captured["url"] = url
+        captured.update(options)
+        return FakeEngine()
+
+    monkeypatch.setattr(
+        checkpoint_store_module, "create_engine", fake_create_engine
+    )
+
+    store = checkpoint_store_module.PostgresCheckpointStore(
+        "postgresql+psycopg://anchor:synthetic-password@anchor-db:5432/anchor",
+        b"k" * 64,
+    )
+
+    assert captured["pool_pre_ping"] is True
+    assert captured["pool_size"] == 1
+    assert captured["max_overflow"] == 0
+    assert captured["pool_timeout"] == 5
+    assert captured["connect_args"] == {
+        "connect_timeout": 5,
+        "options": "-c statement_timeout=10000",
+    }
+    store.close()
 
 
 @pytest.mark.asyncio
