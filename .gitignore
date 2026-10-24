@@ -47,6 +47,7 @@ audit_checkpoints/
 
 # Testing and linters
 .pytest_cache/
+.pytest-tmp-*/
 .coverage
 htmlcov/
 .mypy_cache/
