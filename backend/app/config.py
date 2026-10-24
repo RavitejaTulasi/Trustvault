@@ -70,9 +70,12 @@ class Settings(BaseSettings):
     )
 
     # Core Application Settings
-    ENVIRONMENT: Literal["development", "production", "testing"] = Field(
+    ENVIRONMENT: Literal["development", "staging", "production", "testing"] = Field(
         default="development",
-        description="Exact runtime environment: development, production, or testing",
+        description=(
+            "Exact runtime environment: development, staging, production, or testing. "
+            "Staging uses the same security guards as production."
+        ),
     )
     APP_NAME: str = "TrustVault"
     API_V1_PREFIX: str = "/api/v1"
@@ -294,13 +297,27 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: str | list[str] = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000"
 
-    # Seed Accounts
+    # Seed Accounts (reserved; no seed script ships with this repository).
     SEED_ADMIN_EMAIL: str = "admin@trustvault.local"
-    SEED_ADMIN_PASSWORD: str = Field(default="AdminSecurePass123!", repr=False)
+    SEED_ADMIN_PASSWORD: str = Field(default="", repr=False)
     SEED_OWNER_EMAIL: str = "owner@trustvault.local"
-    SEED_OWNER_PASSWORD: str = Field(default="OwnerSecurePass123!", repr=False)
+    SEED_OWNER_PASSWORD: str = Field(default="", repr=False)
     SEED_VIEWER_EMAIL: str = "viewer@trustvault.local"
-    SEED_VIEWER_PASSWORD: str = Field(default="ViewerSecurePass123!", repr=False)
+    SEED_VIEWER_PASSWORD: str = Field(default="", repr=False)
+
+    # Staging-only demo login accounts. The credentials are read from the
+    # server environment and returned only to the login page; they are never
+    # bundled into the frontend. DEMO_LOGIN_ENABLED is rejected in production.
+    DEMO_LOGIN_ENABLED: bool = Field(
+        default=False,
+        description="Expose demo account credentials to the login page (staging only)",
+    )
+    DEMO_ADMIN_EMAIL: str = ""
+    DEMO_ADMIN_PASSWORD: str = Field(default="", repr=False)
+    DEMO_OWNER_EMAIL: str = ""
+    DEMO_OWNER_PASSWORD: str = Field(default="", repr=False)
+    DEMO_VIEWER_EMAIL: str = ""
+    DEMO_VIEWER_PASSWORD: str = Field(default="", repr=False)
 
     @field_validator("CORS_ORIGINS", mode="after")
     @classmethod
@@ -398,36 +415,36 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
-        if self.ENVIRONMENT != "production":
+        if not self.is_deployed:
             return self
 
         if not self.SESSION_COOKIE_SECURE:
             raise ValueError(
-                "SESSION_COOKIE_SECURE must be true in production; "
+                "SESSION_COOKIE_SECURE must be true in production/staging; "
                 "plaintext session cookies are not permitted."
             )
 
         if not self.SESSION_COOKIE_HTTPONLY:
             raise ValueError(
-                "SESSION_COOKIE_HTTPONLY must be true in production."
+                "SESSION_COOKIE_HTTPONLY must be true in production/staging."
             )
 
         if self.SESSION_COOKIE_SAMESITE not in {"lax", "strict", "none"}:
             raise ValueError(
                 "SESSION_COOKIE_SAMESITE must be 'lax', 'strict', or 'none' "
-                "in production."
+                "in production/staging."
             )
 
         try:
             database_url = make_url(self.DATABASE_URL)
         except ArgumentError as exc:
             raise ValueError(
-                "DATABASE_URL must be a valid database URL in production."
+                "DATABASE_URL must be a valid database URL in production/staging."
             ) from exc
 
         if database_url.get_backend_name() not in SUPPORTED_DATABASE_BACKENDS:
             raise ValueError(
-                "DATABASE_URL must use PostgreSQL in production; "
+                "DATABASE_URL must use PostgreSQL in production/staging; "
                 "SQLite and other backends are not permitted."
             )
 
@@ -436,12 +453,12 @@ class Settings(BaseSettings):
         if not username.strip() or not password.strip():
             raise ValueError(
                 "DATABASE_URL must include non-empty database username and "
-                "password in production."
+                "password in production/staging."
             )
         if password.strip().lower() in KNOWN_DEFAULT_DATABASE_PASSWORDS:
             raise ValueError(
                 "DATABASE_URL must not use a known default database password "
-                "in production."
+                "in production/staging."
             )
         if not database_url.host or not database_url.database:
             raise ValueError(
@@ -450,7 +467,7 @@ class Settings(BaseSettings):
 
         if self.AUDIT_ANCHOR_MODE != "postgresql":
             raise ValueError(
-                "AUDIT_ANCHOR_MODE must be 'postgresql' in production; "
+                "AUDIT_ANCHOR_MODE must be 'postgresql' in production/staging; "
                 "local-file checkpoints are not independent."
             )
 
@@ -489,9 +506,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_anchor_settings(self) -> "Settings":
-        if self.ENVIRONMENT == "production" and self.AUDIT_ANCHOR_MODE == "disabled":
+        if self.is_deployed and self.AUDIT_ANCHOR_MODE == "disabled":
             raise ValueError(
-                "AUDIT_ANCHOR_MODE must be 'postgresql' in production; "
+                "AUDIT_ANCHOR_MODE must be 'postgresql' in production/staging; "
                 "local-file checkpoints are not independently administered."
             )
 
@@ -536,6 +553,51 @@ class Settings(BaseSettings):
                 "managed outside the application."
             )
         return self
+
+    @model_validator(mode="after")
+    def validate_demo_login_settings(self) -> "Settings":
+        if not self.DEMO_LOGIN_ENABLED:
+            return self
+
+        if self.ENVIRONMENT == "production":
+            raise ValueError(
+                "DEMO_LOGIN_ENABLED must be false in production; demo login is "
+                "restricted to development, staging, and testing."
+            )
+
+        accounts = {
+            "DEMO_ADMIN": (self.DEMO_ADMIN_EMAIL, self.DEMO_ADMIN_PASSWORD),
+            "DEMO_OWNER": (self.DEMO_OWNER_EMAIL, self.DEMO_OWNER_PASSWORD),
+            "DEMO_VIEWER": (self.DEMO_VIEWER_EMAIL, self.DEMO_VIEWER_PASSWORD),
+        }
+        incomplete = [
+            name
+            for name, (email, password) in accounts.items()
+            if not email.strip() or not password
+        ]
+        if incomplete:
+            raise ValueError(
+                f"{', '.join(incomplete)} email and password must be set when "
+                "DEMO_LOGIN_ENABLED is true."
+            )
+
+        emails = [email.strip().lower() for email, _ in accounts.values()]
+        passwords = [password for _, password in accounts.values()]
+        if len(set(emails)) != len(accounts):
+            raise ValueError("Demo account emails must be distinct.")
+        if len(set(passwords)) != len(accounts):
+            raise ValueError("Demo account passwords must be distinct.")
+        if any(len(password) < 12 for password in passwords):
+            raise ValueError(
+                "Demo account passwords must be at least 12 characters."
+            )
+
+        return self
+
+    @property
+    def is_deployed(self) -> bool:
+        """Return True when production-grade security guards must apply."""
+        return self.ENVIRONMENT in {"production", "staging"}
 
     @property
     def allowed_extensions_set(self) -> set[str]:

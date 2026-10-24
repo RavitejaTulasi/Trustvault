@@ -64,8 +64,8 @@ Visit:
 - PostgreSQL is not published on the host; only the backend container can reach it over the Compose network.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`, and `SECRET_KEY` must be set in `.env`. Compose refuses to start when any are missing.
 - The backend runs with `ENVIRONMENT=production`, `SESSION_COOKIE_SECURE=true`, `SESSION_COOKIE_HTTPONLY=true`, and a supported `SESSION_COOKIE_SAMESITE` value (`lax`, `strict`, or `none`).
-- Startup rejects SQLite, missing database credentials, known default database passwords, insecure session cookies, and environment values that are not exactly `development`, `production`, or `testing`.
-- Production requires HMAC-protected checkpoints in a separately administered PostgreSQL service (`AUDIT_ANCHOR_MODE=postgresql`). Provision its schema with `backend/scripts/provision_audit_anchor.sql` and grant the application role only `SELECT` and `INSERT`. The service must be in a separate database-server and administration failure domain; a distinct hostname alone is not proof. The scheduled checkpoint worker starts with the application and fails startup if the anchor endpoint/schema cannot be reached.
+- Startup rejects SQLite, missing database credentials, known default database passwords, insecure session cookies, and environment values that are not exactly `development`, `staging`, `production`, or `testing`.
+- Production and staging require HMAC-protected checkpoints in a separately administered PostgreSQL service (`AUDIT_ANCHOR_MODE=postgresql`). Provision its schema with `backend/scripts/provision_audit_anchor.sql` and grant the application role only `SELECT` and `INSERT`. The service must be in a separate database-server and administration failure domain; a distinct hostname alone is not proof. The scheduled checkpoint worker starts with the application and fails startup if the anchor endpoint/schema cannot be reached.
 - Login rate limits are stored in the shared database and survive restarts and multiple workers. The container entrypoint applies `alembic upgrade head` before Uvicorn starts when `TRUSTVAULT_MIGRATE_ON_START=true` (the default). Set it to `false` only when migrations are managed by an external deploy step. Take and verify a database backup before a release that runs migrations, and do not run multiple migration-enabled instances concurrently.
 - `TRUSTED_PROXY_IPS` is empty by default because the Compose backend port is published directly. Set it only to the specific CIDR(s) of a reverse proxy you control. `X-Forwarded-For` is ignored from every other peer.
 
@@ -143,15 +143,17 @@ The suite is skipped by default. In this build it was executed against a local P
 
 ---
 
-## Demo Credentials (Not Seeded)
+## Staging Demo Accounts
 
-No seed script ships in this repository, so these accounts are not created automatically. The values below are configuration defaults only. Do not use them in production.
+No seed script ships in this repository, so demo accounts are not created automatically. A staging deployment can enable a server-side credential discovery endpoint:
 
-| Role | Email | Password | Permissions Scope |
-|---|---|---|---|
-| **Administrator** |`you@example.com` | `Youexample@2`  | User management, audit trail inspection |
-| **Document Owner** | `local-owner@example.com` | `Localowner@123` | Upload, download, edit, delete own docs, grant/revoke sharing |
-| **Viewer** | `local-reader@example.com` | `Localviewer@123` | Read & download explicitly granted documents |
+1. Set `ENVIRONMENT=staging` (never `production`; staging applies the same security guards as production).
+2. Set `DEMO_LOGIN_ENABLED=true` and provide `DEMO_ADMIN_*`, `DEMO_OWNER_*`, and `DEMO_VIEWER_*` email/password pairs in the service's secret environment.
+3. Ensure each email belongs to an active user with the matching `admin`, `owner`, or `viewer` role.
+
+When enabled, the login page fetches `GET /api/v1/auth/demo-accounts` and offers role buttons that fill the normal sign-in form. The endpoint returns a credential only after verifying the user, role, active state, and Argon2id password hash. It returns `404` in production or when the flag is off, sets `Cache-Control: no-store`, and keeps credentials out of the frontend bundle and repository. The passwords are never displayed in the UI.
+
+Demo passwords must be distinct, at least 12 characters, and stored only in the staging service's secret configuration. Production configuration rejects `DEMO_LOGIN_ENABLED=true` at startup, and the production Render blueprint sets it to `false`.
 
 ---
 
@@ -159,18 +161,18 @@ No seed script ships in this repository, so these accounts are not created autom
 
 | Variable | Description | Default |
 |---|---|---|
-| `ENVIRONMENT` | Exact running mode: `development`, `production`, or `testing`. Invalid capitalization and typos are rejected at startup. | `development` |
-| `DATABASE_URL` | Development/testing SQLite URL, or a production PostgreSQL URL with non-empty credentials. Production rejects SQLite, missing credentials, and known default passwords. | `sqlite:///./trustvault.db` |
+| `ENVIRONMENT` | Exact running mode: `development`, `staging`, `production`, or `testing`. Staging applies the same security guards as production. Invalid capitalization and typos are rejected at startup. | `development` |
+| `DATABASE_URL` | Development/testing SQLite URL, or a PostgreSQL URL with non-empty credentials. Production and staging reject SQLite, missing credentials, and known default passwords. | `sqlite:///./trustvault.db` |
 | `SECRET_KEY` | Accepted by configuration and required by deployment templates, but not currently used by application runtime code. Do not rely on it for session signing or revocation. | Insecure development default |
 | `STORAGE_DIR` | Private document storage directory (outside web root) | `./private_storage` |
-| `SESSION_COOKIE_SECURE` | Must be `true` when `ENVIRONMENT=production`; startup fails otherwise. | `false` |
-| `SESSION_COOKIE_HTTPONLY` | Must be `true` when `ENVIRONMENT=production`; prevents JavaScript from reading the session cookie. | `true` |
-| `SESSION_COOKIE_SAMESITE` | Must be `lax`, `strict`, or `none` in production. `none` requires the secure cookie setting. | `lax` |
+| `SESSION_COOKIE_SECURE` | Must be `true` when `ENVIRONMENT` is `production` or `staging`; startup fails otherwise. | `false` |
+| `SESSION_COOKIE_HTTPONLY` | Must be `true` when `ENVIRONMENT` is `production` or `staging`; prevents JavaScript from reading the session cookie. | `true` |
+| `SESSION_COOKIE_SAMESITE` | Must be `lax`, `strict`, or `none` in production/staging. `none` requires the secure cookie setting. | `lax` |
 | `LOGIN_RATE_LIMIT_MAX_ATTEMPTS` | Failed login attempts allowed per IP and per IP+email in a window. | `5` |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | Fixed window duration for shared login rate limiting. | `300` |
 | `LOGIN_RATE_LIMIT_MAX_BUCKETS` | Maximum retained shared limiter buckets; new attempts fail closed when full. | `50000` |
 | `TRUSTED_PROXY_IPS` | Comma-separated proxy CIDRs allowed to supply `X-Forwarded-For`. Empty disables forwarding-header trust. Wildcards are rejected. | Empty |
-| `AUDIT_ANCHOR_MODE` | `disabled`, same-host `local_file` (development only), or separately administered `postgresql`. Production requires `postgresql`. | `disabled` |
+| `AUDIT_ANCHOR_MODE` | `disabled`, same-host `local_file` (development only), or separately administered `postgresql`. Production and staging require `postgresql`. | `disabled` |
 | `AUDIT_ANCHOR_DATABASE_URL` | Connection URL for independent PostgreSQL checkpoint storage. The application role should have only `SELECT` and `INSERT` on its provisioned table. | Empty |
 | `AUDIT_ANCHOR_HMAC_KEY` | HMAC key (at least 32 characters) protecting checkpoint documents; required when anchoring is enabled. | Empty |
 | `AUDIT_CHECKPOINT_INTERVAL_SECONDS` | Interval between scheduled checkpoint attempts when anchoring is enabled. | `3600` |
@@ -186,6 +188,10 @@ No seed script ships in this repository, so these accounts are not created autom
 | `AUDIT_RETENTION_DAYS` | Retention objective for independently held audit archives; the online chain is retained indefinitely | `2555` |
 | `AUDIT_RETENTION_AUTO_DELETE` | Destructive automatic deletion of online audit records; setting `true` fails startup | `false` |
 | `CORS_ORIGINS` | Permitted cross-origin origins | `http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000` |
+| `DEMO_LOGIN_ENABLED` | Enables the staging-only demo credential discovery endpoint. Startup rejects it when `ENVIRONMENT=production`. | `false` |
+| `DEMO_ADMIN_EMAIL` / `DEMO_ADMIN_PASSWORD` | Credentials for the admin demo button. Password must be at least 12 characters. | Empty |
+| `DEMO_OWNER_EMAIL` / `DEMO_OWNER_PASSWORD` | Credentials for the document-owner demo button. Password must be at least 12 characters. | Empty |
+| `DEMO_VIEWER_EMAIL` / `DEMO_VIEWER_PASSWORD` | Credentials for the viewer demo button. Password must be at least 12 characters. | Empty |
 
 ---
 

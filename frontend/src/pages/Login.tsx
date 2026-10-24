@@ -1,11 +1,13 @@
-﻿import { useEffect, useState } from 'react';
+﻿import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { login, getMe } from '../auth';
+import { login, getMe, getDemoAccounts } from '../auth';
 import { ApiError, NetworkError } from '../api';
 import { ChevronLeftIcon, ShieldIcon } from '../components/Icons';
+import DemoAccounts from '../components/DemoAccounts';
 import InteractiveSurface from '../components/motion/InteractiveSurface';
 import MagneticButton from '../components/motion/MagneticButton';
+import type { DemoAccount } from '../types';
 
 /**
  * Build the session-restoration banner text. HTTP 401 never reaches this:
@@ -30,6 +32,9 @@ export default function LoginPage() {
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [demoAccounts, setDemoAccounts] = useState<DemoAccount[]>([]);
+  const [demoNotice, setDemoNotice] = useState<string | null>(null);
+  const submitRef = useRef<HTMLButtonElement>(null);
   const navigate = useNavigate();
 
   // Restore session: an already-authenticated visitor skips the login form.
@@ -56,9 +61,39 @@ export default function LoginPage() {
     };
   }, [navigate]);
 
+  // Demo credentials are optional and staging-only. Any failure (404 in
+  // production, network error, or an unprovisioned account list) simply hides
+  // the section; it must never block the normal login form.
+  useEffect(() => {
+    let cancelled = false;
+    getDemoAccounts()
+      .then((accounts) => {
+        if (!cancelled) {
+          setDemoAccounts(accounts);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDemoAccounts([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleDemoSelect = (account: DemoAccount) => {
+    setEmail(account.email);
+    setPassword(account.password);
+    setError(null);
+    setDemoNotice('Demo credentials filled. Select Sign in to continue.');
+    submitRef.current?.focus();
+  };
+
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError(null);
+    setDemoNotice(null);
     setSubmitting(true);
     try {
       const user = await login(email, password);
@@ -110,6 +145,12 @@ export default function LoginPage() {
               </div>
             </div>
           </div>
+          <DemoAccounts
+            accounts={demoAccounts}
+            onSelect={handleDemoSelect}
+            className="demo-accounts--brand"
+            disabled={submitting}
+          />
         </div>
       </section>
 
@@ -161,7 +202,10 @@ export default function LoginPage() {
                 className="input"
                 type="email"
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  setDemoNotice(null);
+                }}
                 required
                 autoComplete="email"
                 placeholder="you@example.com"
@@ -174,13 +218,17 @@ export default function LoginPage() {
                 className="input"
                 type="password"
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  setDemoNotice(null);
+                }}
                 required
                 autoComplete="current-password"
                 placeholder="Your password"
               />
             </div>
             <MagneticButton
+              ref={submitRef}
               type="submit"
               className="btn btn-primary btn-block"
               disabled={submitting}
@@ -189,9 +237,22 @@ export default function LoginPage() {
             </MagneticButton>
           </form>
 
+          {demoNotice && (
+            <p className="demo-account-status" role="status">
+              {demoNotice}
+            </p>
+          )}
+
           <p className="auth-alt">
             New to TrustVault? <Link to="/register">Create an account</Link>
           </p>
+
+          <DemoAccounts
+            accounts={demoAccounts}
+            onSelect={handleDemoSelect}
+            className="demo-accounts--mobile"
+            disabled={submitting}
+          />
 
           <p className="auth-concept-note">
             Session cookies are HttpOnly and state-changing requests require a CSRF

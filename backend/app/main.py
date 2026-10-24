@@ -84,9 +84,9 @@ app = FastAPI(
     title=settings.APP_NAME,
     description="Secure Document Sharing with a Verifiable Audit Trail",
     version="0.1.0",
-    docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
-    redoc_url="/redoc" if settings.ENVIRONMENT != "production" else None,
-    openapi_url="/openapi.json" if settings.ENVIRONMENT != "production" else None,
+    docs_url="/docs" if not settings.is_deployed else None,
+    redoc_url="/redoc" if not settings.is_deployed else None,
+    openapi_url="/openapi.json" if not settings.is_deployed else None,
     lifespan=lifespan,
 )
 
@@ -108,7 +108,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
 
-        if settings.ENVIRONMENT == "production":
+        if settings.is_deployed:
             response.headers["Strict-Transport-Security"] = (
                 "max-age=31536000; includeSubDomains; preload"
             )

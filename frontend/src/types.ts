@@ -46,6 +46,12 @@ export interface AdminPasswordResetResponse {
 
 export type Role = 'admin' | 'owner' | 'viewer';
 
+export interface DemoAccount {
+  role: Role;
+  email: string;
+  password: string;
+}
+
 export type EffectivePermission = 'owner' | 'edit' | 'read';
 
 export interface DocumentResponse {

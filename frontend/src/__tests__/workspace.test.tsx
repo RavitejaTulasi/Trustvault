@@ -24,6 +24,7 @@ import type {
 
 vi.mock('../auth', () => ({
   getMe: vi.fn(),
+  getDemoAccounts: vi.fn(() => Promise.resolve([])),
   logout: vi.fn(),
   register: vi.fn(),
   updateMe: vi.fn(),

@@ -15,6 +15,7 @@ import type { UserResponse } from '../types';
 vi.mock('../auth', () => ({
   login: vi.fn(),
   getMe: vi.fn(),
+  getDemoAccounts: vi.fn(),
   logout: vi.fn(),
 }));
 
@@ -22,6 +23,7 @@ import * as auth from '../auth';
 
 const mockLogin = vi.mocked(auth.login);
 const mockGetMe = vi.mocked(auth.getMe);
+const mockGetDemoAccounts = vi.mocked(auth.getDemoAccounts);
 const mockLogout = vi.mocked(auth.logout);
 
 const SAMPLE_USER: UserResponse = {
@@ -63,10 +65,12 @@ function renderDashboardRoutes(initialEntry: string) {
 beforeEach(() => {
   mockLogin.mockReset();
   mockGetMe.mockReset();
+  mockGetDemoAccounts.mockReset();
   mockLogout.mockReset();
   // Login./(Dashboard) components call getMe() on mount; give every test a
   // sane default (unauthenticated) unless it overrides this explicitly.
   mockGetMe.mockResolvedValue(null);
+  mockGetDemoAccounts.mockResolvedValue([]);
 });
 
 describe('LoginPage (component)', () => {

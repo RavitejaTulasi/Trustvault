@@ -147,6 +147,111 @@
     line-height: 1.55;
   }
 
+  .demo-accounts {
+    max-width: 470px;
+    margin-top: clamp(26px, 5vh, 48px);
+  }
+
+  .demo-accounts--mobile {
+    display: none;
+    margin-top: 18px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .demo-accounts-kicker {
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 8px;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+
+  .demo-accounts-title {
+    margin-top: 5px;
+    color: var(--text-primary);
+    font-size: 14px;
+    font-weight: 590;
+    letter-spacing: -0.02em;
+  }
+
+  .demo-accounts-copy {
+    max-width: 430px;
+    margin-top: 5px;
+    color: var(--text-tertiary);
+    font-size: 10.5px;
+    line-height: 1.55;
+  }
+
+  .demo-account-list {
+    display: grid;
+    gap: 7px;
+    margin-top: 12px;
+  }
+
+  .demo-account {
+    display: grid;
+    gap: 2px;
+    width: 100%;
+    min-height: 44px;
+    padding: 9px 12px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-xs);
+    background: rgba(13, 23, 18, 0.5);
+    color: var(--text-primary);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition:
+      border-color 160ms ease,
+      background 160ms ease,
+      color 160ms ease;
+  }
+
+  .demo-account:hover {
+    border-color: var(--accent-line);
+    background: var(--accent-soft);
+  }
+
+  .demo-account:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .demo-account:disabled {
+    cursor: wait;
+    opacity: 0.55;
+  }
+
+  .demo-account-role {
+    font-size: 11px;
+    font-weight: 590;
+    line-height: 1.4;
+  }
+
+  .demo-account-email {
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: 9.3px;
+    line-height: 1.45;
+  }
+
+  .demo-accounts-note {
+    margin-top: 8px;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: 7.8px;
+    line-height: 1.5;
+  }
+
+  .demo-account-status {
+    margin-top: 13px;
+    color: var(--accent);
+    font-size: 10.5px;
+    line-height: 1.5;
+  }
+
   .auth-panel {
     display: grid;
     min-width: 0;
@@ -319,6 +424,10 @@
     }
 
     .auth-card-brand {
+      display: block;
+    }
+
+    .demo-accounts--mobile {
       display: block;
     }
   }

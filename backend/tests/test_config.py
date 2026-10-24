@@ -44,7 +44,10 @@ def make_settings(**overrides: Any) -> Settings:
     return Settings(**values)
 
 
-@pytest.mark.parametrize("environment", ["development", "production", "testing"])
+@pytest.mark.parametrize(
+    "environment",
+    ["development", "staging", "production", "testing"],
+)
 def test_supported_environments_are_accepted(environment: str):
     configured = make_settings(ENVIRONMENT=environment)
 
@@ -53,11 +56,104 @@ def test_supported_environments_are_accepted(environment: str):
 
 @pytest.mark.parametrize(
     "environment",
-    ["", "Production", "PRODUCTION", "prod", "staging", "production "],
+    ["", "Production", "PRODUCTION", "prod", "production "],
 )
 def test_invalid_environment_values_are_rejected(environment: str):
     with pytest.raises(ValidationError):
         make_settings(ENVIRONMENT=environment)
+
+
+def test_is_deployed_is_true_for_production_and_staging():
+    assert make_settings(ENVIRONMENT="production").is_deployed is True
+    assert make_settings(ENVIRONMENT="staging").is_deployed is True
+    assert make_settings(ENVIRONMENT="development").is_deployed is False
+    assert make_settings(ENVIRONMENT="testing").is_deployed is False
+
+
+def test_staging_applies_production_security_guards():
+    with pytest.raises(ValidationError, match="SESSION_COOKIE_SECURE"):
+        make_settings(ENVIRONMENT="staging", SESSION_COOKIE_SECURE=False)
+
+    with pytest.raises(ValidationError, match="must use PostgreSQL"):
+        make_settings(
+            ENVIRONMENT="staging",
+            DATABASE_URL="sqlite:///:memory:",
+        )
+
+    with pytest.raises(ValidationError, match="AUDIT_ANCHOR_MODE"):
+        make_settings(ENVIRONMENT="staging", AUDIT_ANCHOR_MODE="disabled")
+
+
+DEMO_CREDENTIALS = {
+    "DEMO_LOGIN_ENABLED": True,
+    "DEMO_ADMIN_EMAIL": "demo.admin@example.com",
+    "DEMO_ADMIN_PASSWORD": "DemoAdminPassword123!",
+    "DEMO_OWNER_EMAIL": "demo.owner@example.com",
+    "DEMO_OWNER_PASSWORD": "DemoOwnerPassword123!",
+    "DEMO_VIEWER_EMAIL": "demo.viewer@example.com",
+    "DEMO_VIEWER_PASSWORD": "DemoViewerPassword123!",
+}
+
+
+def test_demo_login_is_disabled_by_default():
+    configured = make_settings(ENVIRONMENT="production")
+
+    assert configured.DEMO_LOGIN_ENABLED is False
+
+
+def test_production_rejects_enabled_demo_login():
+    with pytest.raises(ValidationError, match="DEMO_LOGIN_ENABLED"):
+        make_settings(**DEMO_CREDENTIALS)
+
+
+@pytest.mark.parametrize("environment", ["development", "staging", "testing"])
+def test_demo_login_is_allowed_outside_production(environment: str):
+    configured = make_settings(ENVIRONMENT=environment, **DEMO_CREDENTIALS)
+
+    assert configured.DEMO_LOGIN_ENABLED is True
+
+
+@pytest.mark.parametrize(
+    "setting_name",
+    [
+        "DEMO_ADMIN_EMAIL",
+        "DEMO_ADMIN_PASSWORD",
+        "DEMO_OWNER_EMAIL",
+        "DEMO_OWNER_PASSWORD",
+        "DEMO_VIEWER_EMAIL",
+        "DEMO_VIEWER_PASSWORD",
+    ],
+)
+def test_demo_login_requires_complete_credentials(setting_name: str):
+    values = dict(DEMO_CREDENTIALS)
+    values[setting_name] = ""
+
+    with pytest.raises(ValidationError, match=setting_name.rsplit("_", 1)[0]):
+        make_settings(ENVIRONMENT="development", **values)
+
+
+def test_demo_login_requires_distinct_emails():
+    values = dict(DEMO_CREDENTIALS)
+    values["DEMO_OWNER_EMAIL"] = "DEMO.ADMIN@example.com"
+
+    with pytest.raises(ValidationError, match="emails must be distinct"):
+        make_settings(ENVIRONMENT="development", **values)
+
+
+def test_demo_login_requires_distinct_passwords():
+    values = dict(DEMO_CREDENTIALS)
+    values["DEMO_VIEWER_PASSWORD"] = values["DEMO_ADMIN_PASSWORD"]
+
+    with pytest.raises(ValidationError, match="passwords must be distinct"):
+        make_settings(ENVIRONMENT="development", **values)
+
+
+def test_demo_login_requires_long_passwords():
+    values = dict(DEMO_CREDENTIALS)
+    values["DEMO_VIEWER_PASSWORD"] = "short"
+
+    with pytest.raises(ValidationError, match="at least 12 characters"):
+        make_settings(ENVIRONMENT="development", **values)
 
 
 def test_local_storage_does_not_require_supabase_credentials():
@@ -86,6 +182,9 @@ def test_settings_repr_does_not_expose_credentials_or_seed_passwords():
         SEED_ADMIN_PASSWORD="synthetic-admin-password",
         SEED_OWNER_PASSWORD="synthetic-owner-password",
         SEED_VIEWER_PASSWORD="synthetic-viewer-password",
+        DEMO_ADMIN_PASSWORD="synthetic-demo-admin-password",
+        DEMO_OWNER_PASSWORD="synthetic-demo-owner-password",
+        DEMO_VIEWER_PASSWORD="synthetic-demo-viewer-password",
     )
 
     representation = repr(configured)
@@ -98,6 +197,9 @@ def test_settings_repr_does_not_expose_credentials_or_seed_passwords():
         "synthetic-admin-password",
         "synthetic-owner-password",
         "synthetic-viewer-password",
+        "synthetic-demo-admin-password",
+        "synthetic-demo-owner-password",
+        "synthetic-demo-viewer-password",
     ):
         assert sensitive_value not in representation
 

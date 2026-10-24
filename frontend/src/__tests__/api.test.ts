@@ -11,6 +11,7 @@ import {
   apiFetch,
   changePassword,
   getCookie,
+  getDemoAccounts,
   getMe,
   login,
   logout,
@@ -279,6 +280,33 @@ describe('getMe', () => {
   it('throws on server errors so they stay distinguishable from 401', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(503, { detail: 'Database unavailable' }));
     await expect(getMe()).rejects.toMatchObject({ status: 503 });
+  });
+});
+
+describe('getDemoAccounts', () => {
+  it('returns parsed demo accounts on success', async () => {
+    const accounts = [
+      { role: 'admin', email: 'demo.admin@example.com', password: 'secret' },
+    ];
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, accounts));
+
+    await expect(getDemoAccounts()).resolves.toEqual(accounts);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/auth/demo-accounts'),
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
+
+  it('returns an empty list on 404 (production or disabled)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(404, { detail: 'Not Found' }));
+
+    await expect(getDemoAccounts()).resolves.toEqual([]);
+  });
+
+  it('surfaces other API errors', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(500, { detail: 'boom' }));
+
+    await expect(getDemoAccounts()).rejects.toBeInstanceOf(ApiError);
   });
 });
 

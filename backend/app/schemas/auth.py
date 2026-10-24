@@ -3,6 +3,7 @@ Pydantic Schemas for User Authentication and Account Management
 """
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
@@ -54,6 +55,17 @@ class UserLoginRequest(BaseModel):
         min_length=1,
         max_length=128,
         description="Account password",
+    )
+
+
+class DemoAccountResponse(BaseModel):
+    """Staging-only credential pair for a provisioned demo account."""
+
+    role: Literal["admin", "owner", "viewer"]
+    email: str
+    password: str = Field(
+        repr=False,
+        description="Demo password supplied from server-side configuration",
     )
 
 

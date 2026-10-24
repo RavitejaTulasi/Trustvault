@@ -23,6 +23,7 @@ from backend.app.database import get_db
 from backend.app.models.audit import AuditOutcome
 from backend.app.models.user import User, UserRole
 from backend.app.schemas.auth import (
+    DemoAccountResponse,
     PasswordChangeRequest,
     UserLoginRequest,
     UserRegisterRequest,
@@ -314,6 +315,59 @@ def login(
 
     _set_session_cookie(response, raw_token)
     return UserResponse.model_validate(user)
+
+
+@router.get(
+    "/demo-accounts",
+    response_model=list[DemoAccountResponse],
+    include_in_schema=False,
+)
+def get_demo_accounts(
+    response: Response,
+    db: Session = Depends(get_db),
+) -> list[DemoAccountResponse]:
+    """
+    Return staging-only demo credentials after verifying the backing accounts.
+
+    The endpoint is disabled in production and whenever the explicit flag is
+    off. It only returns a credential when the configured email maps to an
+    active user with the expected role and the configured password verifies.
+    """
+    if not settings.DEMO_LOGIN_ENABLED or settings.ENVIRONMENT == "production":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+    configured_accounts = (
+        (UserRole.ADMIN, settings.DEMO_ADMIN_EMAIL, settings.DEMO_ADMIN_PASSWORD),
+        (UserRole.OWNER, settings.DEMO_OWNER_EMAIL, settings.DEMO_OWNER_PASSWORD),
+        (UserRole.VIEWER, settings.DEMO_VIEWER_EMAIL, settings.DEMO_VIEWER_PASSWORD),
+    )
+
+    accounts: list[DemoAccountResponse] = []
+    for role, email, password in configured_accounts:
+        normalized_email = email.strip().lower()
+        if not normalized_email or not password:
+            continue
+        user = db.query(User).filter(User.email == normalized_email).first()
+        if (
+            user is None
+            or not user.is_active
+            or user.role != role
+            or not verify_password(password, user.hashed_password)
+        ):
+            continue
+        accounts.append(
+            DemoAccountResponse(role=role, email=user.email, password=password)
+        )
+
+    if not accounts:
+        logger.warning(
+            "Demo login is enabled but no configured account matched an active "
+            "user with the expected role."
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return accounts
 
 
 @router.post(

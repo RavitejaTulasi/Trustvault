@@ -8,7 +8,10 @@ import { render, screen } from '@testing-library/react';
 import Root from '../router';
 import type { UserResponse } from '../types';
 
-vi.mock('../auth', () => ({ getMe: vi.fn() }));
+vi.mock('../auth', () => ({
+  getMe: vi.fn(),
+  getDemoAccounts: vi.fn(() => Promise.resolve([])),
+}));
 
 import * as auth from '../auth';
 

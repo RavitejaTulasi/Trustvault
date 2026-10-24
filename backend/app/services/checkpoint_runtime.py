@@ -342,12 +342,9 @@ def validate_checkpoint_runtime(config: Settings = settings) -> bool:
     Production must have an initialized checkpoint store. A local-file store
     that becomes unavailable after startup is reported by the scheduler.
     """
-    if (
-        config.ENVIRONMENT == "production"
-        and config.AUDIT_ANCHOR_MODE != "postgresql"
-    ):
+    if config.is_deployed and config.AUDIT_ANCHOR_MODE != "postgresql":
         raise RuntimeError(
-            "Production requires independently administered PostgreSQL "
+            "Production/staging requires independently administered PostgreSQL "
             "audit anchoring."
         )
 
@@ -356,7 +353,7 @@ def validate_checkpoint_runtime(config: Settings = settings) -> bool:
 
     store = create_checkpoint_store(config)
     if isinstance(store, UnavailableCheckpointStore):
-        if config.ENVIRONMENT == "production":
+        if config.is_deployed:
             raise RuntimeError(
                 "Audit checkpoint anchoring is configured but its adapter could "
                 "not be initialized."
@@ -397,13 +394,13 @@ def build_audit_anchor_health(
 
     if mode == "disabled":
         status = "not_configured"
-        healthy = config.ENVIRONMENT != "production"
+        healthy = not config.is_deployed
     elif active_failure:
         status = _failure_status(snapshot.last_failure_reason or "internal_error")
         healthy = False
     elif mode == "local_file":
         status = "overdue" if overdue else "local_only"
-        healthy = config.ENVIRONMENT != "production" and not overdue
+        healthy = not config.is_deployed and not overdue
     elif not snapshot.running:
         status = "scheduler_stopped"
         healthy = False

@@ -3,6 +3,7 @@ import {
   changePassword as apiChangePassword,
   updateMe as apiUpdateMe,
   login as apiLogin,
+  getDemoAccounts as apiGetDemoAccounts,
   getMe as apiGetMe,
   logout as apiLogout,
   listDocuments as apiListDocuments,
@@ -17,6 +18,7 @@ import {
   revokeGrant as apiRevokeGrant,
 } from './api';
 import type {
+  DemoAccount,
   DocumentListParams,
   DocumentListResponse,
   DocumentResponse,
@@ -49,6 +51,10 @@ export async function changePassword(
 
 export async function login(email: string, password: string): Promise<UserResponse> {
   return apiLogin(email, password);
+}
+
+export async function getDemoAccounts(): Promise<DemoAccount[]> {
+  return apiGetDemoAccounts();
 }
 
 export async function getMe(): Promise<UserResponse | null> {

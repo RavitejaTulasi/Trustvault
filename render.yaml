@@ -13,6 +13,9 @@ services:
     envVars:
       - key: ENVIRONMENT
         value: production
+      # Demo login is staging-only and must remain disabled in this blueprint.
+      - key: DEMO_LOGIN_ENABLED
+        value: "false"
       # Supabase Session Pooler (IPv4) URL for the application database:
       # postgresql+psycopg://postgres.<APP_PROJECT_REF>:<password>@<APP_POOLER_HOST>:5432/postgres?sslmode=verify-full&sslrootcert=/app/certs/prod-ca-2021.crt
       - key: DATABASE_URL

@@ -50,6 +50,10 @@ production recovery.
   them under a documented process, and never place them in logs or repo files.
 - [ ] Configure production environment variables from the names below. Keep
   secrets in the hosting provider's secret manager; do not commit them.
+- [ ] Confirm `DEMO_LOGIN_ENABLED` is unset or `false` in production. Startup
+  rejects `true` when `ENVIRONMENT=production`, and the demo credential
+  endpoint returns `404` there even if the flag is misconfigured. Never place
+  demo credentials in the production service or frontend bundle.
 - [ ] Confirm the actual provider's PostgreSQL, private-storage, and anchor
   backup mechanisms and retention from provider documentation/account
   settings. They are not configured or proven by this repository. Take a
@@ -165,7 +169,8 @@ ownership, infrastructure, or administrator separation.
 
 Required/configured for the Supabase + Render production blueprint:
 
-- `ENVIRONMENT`
+- `ENVIRONMENT` - must be `production` for this deployment.
+- `DEMO_LOGIN_ENABLED` - must be `false` in production.
 - `TRUSTVAULT_MIGRATE_ON_START` — `true` by default so container startup applies
   pending Alembic migrations; set `false` only when a pre-deploy or external
   operator step owns migrations.

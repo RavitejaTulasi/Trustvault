@@ -9,6 +9,7 @@ import type {
   AuditEventListParams,
   AuditEventListResponse,
   AuditVerificationResponse,
+  DemoAccount,
   DocumentListParams,
   DocumentListResponse,
   DocumentResponse,
@@ -206,6 +207,21 @@ export async function login(email: string, password: string): Promise<UserRespon
     throw await toApiError(response);
   }
   return parseJsonResponse<UserResponse>(response);
+}
+
+/**
+ * Fetch staging-only demo credentials. A 404 means the feature is disabled or
+ * this is production; the login page simply omits the demo section.
+ */
+export async function getDemoAccounts(): Promise<DemoAccount[]> {
+  const response = await apiFetch('/api/v1/auth/demo-accounts');
+  if (response.status === 404) {
+    return [];
+  }
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<DemoAccount[]>(response);
 }
 
 /**
