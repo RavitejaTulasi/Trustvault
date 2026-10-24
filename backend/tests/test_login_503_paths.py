@@ -34,7 +34,7 @@ import sqlite3
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -63,6 +63,35 @@ def _file_engine(tmp_path, name: str, timeout: float = 0.3):
     )
     Base.metadata.create_all(engine)
     return engine, db_path
+
+
+def test_reserve_fails_closed_when_rate_limit_table_is_missing(tmp_path):
+    """Pin the staging failure mode: if the shared bucket table is absent,
+    reserve() raises LoginRateLimitUnavailable and never permits a local
+    fallback. SQLite reproduces the missing-relation path without touching a
+    real PostgreSQL database."""
+    engine, _ = _file_engine(tmp_path, "missing-rate-limit-table.sqlite")
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE login_rate_limit_buckets"))
+
+    session = Session(engine)
+    limiter = LoginRateLimiter(
+        max_attempts=5, window_seconds=60, time_func=lambda: 1_000_000
+    )
+    try:
+        with pytest.raises(LoginRateLimitUnavailable) as excinfo:
+            limiter.reserve(
+                session,
+                "203.0.113.10",
+                "missing-table@example.com",
+            )
+
+        cause = excinfo.value.__cause__
+        assert cause is not None, "the unavailable error must wrap the real failure"
+        assert "login_rate_limit_buckets" in str(cause).lower()
+    finally:
+        session.close()
+        engine.dispose()
 
 
 def test_reserve_fails_closed_on_real_sqlite_writer_lock(tmp_path):

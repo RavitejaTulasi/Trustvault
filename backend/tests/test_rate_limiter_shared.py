@@ -55,6 +55,26 @@ def test_limiter_state_is_shared_between_instances(db_session: Session):
     assert denied.retry_after > 0
 
 
+def test_successful_reservation_creates_ip_and_account_buckets(db_session: Session):
+    clock = MutableClock(1_000_000)
+    limiter = make_limiter(clock, max_attempts=3)
+
+    decision = limiter.reserve(
+        db_session,
+        "203.0.113.10",
+        "user@example.com",
+    )
+
+    assert decision.allowed
+    assert decision.reservation is not None
+    buckets = db_session.scalars(
+        select(LoginRateLimitBucket).order_by(LoginRateLimitBucket.scope)
+    ).all()
+    assert {bucket.scope for bucket in buckets} == {"ip", "ip_email"}
+    assert {bucket.attempt_count for bucket in buckets} == {1}
+    assert {bucket.window_started_at for bucket in buckets} == {1_000_000}
+
+
 def test_success_releases_only_its_ip_slot_and_clears_account(
     db_session: Session,
 ):
