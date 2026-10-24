@@ -15,6 +15,8 @@ from sqlalchemy.pool import StaticPool
 
 # Force testing environment before loading app components
 os.environ["ENVIRONMENT"] = "testing"
+os.environ["STORAGE_BACKEND"] = "local"
+os.environ["AUDIT_ANCHOR_MODE"] = "disabled"
 from backend.app.config import settings
 
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"

@@ -77,6 +77,8 @@ services:
       # verified. The app safely ignores X-Forwarded-For while this is empty.
       - key: TRUSTED_PROXY_IPS
         value: ""
+      - key: TRUSTVAULT_MIGRATE_ON_START
+        value: "true"
     # Upload staging only; documents are stored in Supabase Storage.
     disk:
       name: private-storage

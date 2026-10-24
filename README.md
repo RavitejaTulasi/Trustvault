@@ -66,7 +66,7 @@ Visit:
 - The backend runs with `ENVIRONMENT=production`, `SESSION_COOKIE_SECURE=true`, `SESSION_COOKIE_HTTPONLY=true`, and a supported `SESSION_COOKIE_SAMESITE` value (`lax`, `strict`, or `none`).
 - Startup rejects SQLite, missing database credentials, known default database passwords, insecure session cookies, and environment values that are not exactly `development`, `production`, or `testing`.
 - Production requires HMAC-protected checkpoints in a separately administered PostgreSQL service (`AUDIT_ANCHOR_MODE=postgresql`). Provision its schema with `backend/scripts/provision_audit_anchor.sql` and grant the application role only `SELECT` and `INSERT`. The service must be in a separate database-server and administration failure domain; a distinct hostname alone is not proof. The scheduled checkpoint worker starts with the application and fails startup if the anchor endpoint/schema cannot be reached.
-- Login rate limits are stored in the shared database and survive restarts and multiple workers. Render runs `alembic upgrade head` as a one-shot pre-deploy command, not on each web-service restart. Take and verify a database backup before a release that runs migrations.
+- Login rate limits are stored in the shared database and survive restarts and multiple workers. The container entrypoint applies `alembic upgrade head` before Uvicorn starts when `TRUSTVAULT_MIGRATE_ON_START=true` (the default). Set it to `false` only when migrations are managed by an external deploy step. Take and verify a database backup before a release that runs migrations, and do not run multiple migration-enabled instances concurrently.
 - `TRUSTED_PROXY_IPS` is empty by default because the Compose backend port is published directly. Set it only to the specific CIDR(s) of a reverse proxy you control. `X-Forwarded-For` is ignored from every other peer.
 
 Create a local `.env` with strong, unique values (never commit it):
@@ -86,17 +86,16 @@ AUDIT_ANCHOR_DATABASE_URL=postgresql+psycopg://trustvault_anchor:<url-encoded-se
 
 `GET /health` exposes `components.audit_anchor` with the scheduler's last attempt/success/failure and an `overdue` flag. PostgreSQL anchoring reports `ok` after a successful checkpoint. `independence_verified` remains false because provider-level administrative and failure-domain separation must be verified by the operator. Local-file anchoring is reported as `local_only` and is not accepted for production. Alert on any top-level status other than `healthy`.
 
-For Render, configure the Supabase application database URL, the independent anchor database URL, and Supabase Storage values in the dashboard. The blueprint generates `SECRET_KEY` and `AUDIT_ANCHOR_HMAC_KEY`, and the Docker image includes the Supabase root CA at `/app/certs/prod-ca-2021.crt` for `sslmode=verify-full`. Take a recoverable database backup before a release that runs migrations. Render executes the blueprint `preDeployCommand` once before switching the web service; a failed migration blocks the deploy but does not automatically restore a database backup. Verify the migration logs and health endpoint after release.
+For Render, configure the Supabase application database URL, the independent anchor database URL, and Supabase Storage values in the dashboard. The blueprint generates `SECRET_KEY` and `AUDIT_ANCHOR_HMAC_KEY`, and the Docker image includes the Supabase root CA at `/app/certs/prod-ca-2021.crt` for `sslmode=verify-full`. Take a recoverable database backup before a release that runs migrations. The blueprint also declares `preDeployCommand`; the container startup migration is a fallback for services whose dashboard has no pre-deploy command. Running both is idempotent because `alembic upgrade head` is a no-op at head. A failed migration stops startup and does not automatically restore a database backup. Verify the migration logs and health endpoint after release.
 
 For Compose, provision the application database and independent anchor database separately, then:
 
 ```bash
 docker compose config
-docker compose run --rm backend alembic -c /app/alembic.ini upgrade head
 docker compose up --build -d
 ```
 
-The Compose migration command is an explicit operator action: back up PostgreSQL first, inspect the migration/release, run the command once, and only then start or update the backend. Neither deployment path automatically backs up data.
+Startup applies pending migrations by default. Back up PostgreSQL first and inspect the migration/release before starting or updating the backend. To keep migrations as an explicit operator action instead, set `TRUSTVAULT_MIGRATE_ON_START=false` and run `docker compose run --rm backend alembic -c /app/alembic.ini upgrade head` once before `docker compose up`. Neither deployment path automatically backs up data.
 
 ### Isolated SQLite Backup and Restore
 
