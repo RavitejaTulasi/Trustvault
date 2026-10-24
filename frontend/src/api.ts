@@ -540,6 +540,14 @@ export async function listDocumentActivity(params: {
   return parseJsonResponse<AuditEventListResponse>(response);
 }
 
+export async function getUserRoleCounts(): Promise<Record<string, number>> {
+  const response = await apiFetch('/api/v1/admin/users/role-counts');
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<Record<string, number>>(response);
+}
+
 export async function listUsers(params: {
   page?: number;
   page_size?: number;

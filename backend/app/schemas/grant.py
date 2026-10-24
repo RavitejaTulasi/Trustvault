@@ -38,6 +38,7 @@ class GrantResponse(BaseModel):
     id: str
     document_id: str
     user_id: str
+    user_email: str | None = None
     permission: str
     granted_by_id: str | None
     is_revoked: bool

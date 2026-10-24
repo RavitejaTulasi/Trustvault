@@ -385,11 +385,6 @@ export default function DocumentDetail() {
   return (
     <AppShell user={user}>
       <div className="document-detail">
-        <Link to="/documents" className="back-link">
-          <ChevronLeftIcon width={14} height={14} />
-          Back to documents
-        </Link>
-
         <PageHeader
           eyebrow={isOwner ? 'Owned document' : `${effectivePermission ?? 'Shared'} access`}
           title={doc.title}

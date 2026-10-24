@@ -1218,8 +1218,18 @@ def list_document_permissions(
         db.commit()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    grants = db.query(DocumentGrant).filter(DocumentGrant.document_id == document.id).all()
-    return GrantListResponse(grants=[GrantResponse.model_validate(g) for g in grants])
+    results = (
+        db.query(DocumentGrant, User.email)
+        .join(User, DocumentGrant.user_id == User.id)
+        .filter(DocumentGrant.document_id == document.id)
+        .all()
+    )
+    grant_responses = []
+    for grant, user_email in results:
+        resp = GrantResponse.model_validate(grant)
+        resp.user_email = user_email
+        grant_responses.append(resp)
+    return GrantListResponse(grants=grant_responses)
 
 
 @router.post(

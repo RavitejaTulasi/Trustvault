@@ -70,6 +70,24 @@ def list_users(
     )
 
 
+@router.get(
+    "/role-counts",
+    summary="Get user counts by role",
+    description="Admin only. Returns the count of users assigned to each supported role.",
+)
+def get_user_role_counts(
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, int]:
+    from sqlalchemy import func
+    results = db.query(User.role, func.count(User.id)).group_by(User.role).all()
+    counts = {"admin": 0, "owner": 0, "viewer": 0}
+    for role, count in results:
+        if role in counts:
+            counts[role] = count
+    return counts
+
+
 @router.post(
     "",
     response_model=UserResponse,

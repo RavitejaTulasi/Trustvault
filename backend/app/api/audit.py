@@ -11,6 +11,8 @@ Security controls:
 - Document activity is authorization independent and never returns document bytes.
 """
 
+import csv
+import io
 import json
 import logging
 import re
@@ -18,6 +20,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Query as SQLAlchemyQuery
@@ -237,6 +240,7 @@ def _paginate(
     query: SQLAlchemyQuery[AuditEvent],
     page: int,
     page_size: int,
+    db: Session | None = None,
 ) -> AuditEventListResponse:
     """Apply deterministic ordering and pagination to an audit-event query."""
     total = query.count()
@@ -246,8 +250,22 @@ def _paginate(
         .limit(page_size)
         .all()
     )
+    actor_emails = {}
+    if db is not None:
+        actor_ids = {e.actor_id for e in events if e.actor_id}
+        if actor_ids:
+            users = db.query(User.id, User.email).filter(User.id.in_(actor_ids)).all()
+            actor_emails = {uid: email for uid, email in users}
+
+    event_responses = []
+    for event in events:
+        resp = AuditEventResponse.model_validate(event)
+        if event.actor_id and actor_emails:
+            resp.actor_email = actor_emails.get(event.actor_id)
+        event_responses.append(resp)
+
     return AuditEventListResponse(
-        events=[AuditEventResponse.model_validate(event) for event in events],
+        events=event_responses,
         total=total,
         page=page,
         page_size=page_size,
@@ -301,7 +319,7 @@ def list_audit_events(
     if timestamp_to is not None:
         query = query.filter(AuditEvent.timestamp <= timestamp_to)
 
-    result = _paginate(query, page, page_size)
+    result = _paginate(query, page, page_size, db=db)
     _record_admin_audit_read(
         db, action="audit.read", actor_id=current_user.id, request=request
     )
@@ -581,8 +599,105 @@ def list_document_activity(
     if timestamp_to is not None:
         query = query.filter(AuditEvent.timestamp <= timestamp_to)
 
-    result = _paginate(query, page, page_size)
+    result = _paginate(query, page, page_size, db=db)
     _record_admin_audit_read(
         db, action="audit.activity_read", actor_id=current_user.id, request=request
     )
     return result
+
+
+@router.get(
+    "/documents/activity/export",
+    summary="Export document activity",
+    description="Admin only. Exports matching document and document-grant audit activity as CSV.",
+)
+def export_document_activity(
+    request: Request,
+    response: Response,
+    current_user: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    document_id: Annotated[str | None, Query(max_length=100)] = None,
+    actor_id: Annotated[str | None, Query(max_length=36)] = None,
+    action: Annotated[str | None, Query(max_length=100)] = None,
+    outcome: AuditOutcomeFilter | None = None,
+    timestamp_from: datetime | None = None,
+    timestamp_to: datetime | None = None,
+) -> StreamingResponse:
+    _disable_caching(response)
+    document_id = _clean_filter(document_id, "document_id", 100)
+    actor_id = _clean_filter(actor_id, "actor_id", 36)
+    action = _clean_filter(action, "action", 100)
+    timestamp_from, timestamp_to = _normalize_range(timestamp_from, timestamp_to)
+
+    query = db.query(AuditEvent).filter(
+        AuditEvent.resource_type.in_(("document", "document_grant"))
+    )
+    if document_id is not None:
+        details_fragment = f'"document_id": {json.dumps(document_id)}'
+        details_pattern = f"%{_escape_like(details_fragment)}%"
+        query = query.filter(
+            or_(
+                AuditEvent.resource_id == document_id,
+                AuditEvent.details.like(details_pattern, escape="\\"),
+            )
+        )
+    if actor_id is not None:
+        query = query.filter(AuditEvent.actor_id == actor_id)
+    if action is not None:
+        query = query.filter(AuditEvent.action == action)
+    if outcome is not None:
+        query = query.filter(AuditEvent.outcome == outcome)
+    if timestamp_from is not None:
+        query = query.filter(AuditEvent.timestamp >= timestamp_from)
+    if timestamp_to is not None:
+        query = query.filter(AuditEvent.timestamp <= timestamp_to)
+
+    events = query.order_by(AuditEvent.sequence_number.desc()).all()
+    actor_ids = {e.actor_id for e in events if e.actor_id}
+    email_map = {}
+    if actor_ids:
+        users = db.query(User.id, User.email).filter(User.id.in_(actor_ids)).all()
+        email_map = {uid: email for uid, email in users}
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Sequence",
+        "Timestamp",
+        "Action",
+        "Outcome",
+        "Actor Email",
+        "Resource Type",
+        "Resource ID",
+        "IP Address",
+    ])
+    for e in events:
+        actor_email = email_map.get(e.actor_id, e.actor_id or "System")
+
+        def sanitize_csv(val: Any) -> str:
+            s = str(val or "")
+            if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+                return "'" + s
+            return s
+
+        writer.writerow([
+            e.sequence_number,
+            e.timestamp.isoformat(),
+            sanitize_csv(e.action),
+            sanitize_csv(e.outcome),
+            sanitize_csv(actor_email),
+            sanitize_csv(e.resource_type),
+            sanitize_csv(e.resource_id),
+            sanitize_csv(e.ip_address),
+        ])
+
+    _record_admin_audit_read(
+        db, action="audit.activity_export", actor_id=current_user.id, request=request
+    )
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=trustvault-activity-export.csv"},
+    )

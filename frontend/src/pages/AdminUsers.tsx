@@ -20,6 +20,7 @@ import {
 import { useSession } from '../hooks/useSession';
 import {
   createUser,
+  getUserRoleCounts,
   listUsers,
   resetUserPassword,
   revokeUserSessions,
