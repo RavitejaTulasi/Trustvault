@@ -59,6 +59,9 @@ dist-ssr/
 *.local
 .npm
 .eslintcache
+# Frontend shared modules; the Python 'lib/' rule above must not hide them.
+!frontend/src/lib/
+!frontend/src/lib/**
 
 # IDE and OS
 .idea/
