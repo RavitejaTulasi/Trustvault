@@ -2,14 +2,20 @@ services:
   - type: web
     name: trustvault-backend
     runtime: docker
+    plan: starter
     dockerfilePath: ./Dockerfile
     dockerContext: .
+    # The image contains the public Supabase root CA at
+    # /app/certs/prod-ca-2021.crt, so both this pre-deploy instance and the
+    # running service can read the same sslrootcert path.
     preDeployCommand: alembic -c /app/alembic.ini upgrade head
     startCommand: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: ENVIRONMENT
         value: production
+      # Supabase Session Pooler (IPv4) URL for the application database:
+      # postgresql+psycopg://postgres.<APP_PROJECT_REF>:<password>@<APP_POOLER_HOST>:5432/postgres?sslmode=verify-full&sslrootcert=/app/certs/prod-ca-2021.crt
       - key: DATABASE_URL
         sync: false
       - key: SECRET_KEY
@@ -48,14 +54,22 @@ services:
         value: "true"
       - key: SESSION_COOKIE_SAMESITE
         value: lax
+      # Same-origin by default. Update if the service URL changes or a custom
+      # domain is added.
       - key: CORS_ORIGINS
         value: https://trustvault-backend.onrender.com
       - key: AUDIT_ANCHOR_MODE
         value: postgresql
+      # A separately administered PostgreSQL host for the audit anchor. A
+      # second Supabase project in a different region works; same-region
+      # projects can share a pooler host and are rejected at startup.
+      # postgresql+psycopg://trustvault_anchor_app.<ANCHOR_PROJECT_REF>:<password>@<ANCHOR_POOLER_HOST>:5432/postgres?sslmode=verify-full&sslrootcert=/app/certs/prod-ca-2021.crt
       - key: AUDIT_ANCHOR_DATABASE_URL
         sync: false
+      # Generated once and persisted. If migrating an existing deployment,
+      # enter its current key manually instead so old checkpoints stay valid.
       - key: AUDIT_ANCHOR_HMAC_KEY
-        sync: false
+        generateValue: true
       - key: AUDIT_CHECKPOINT_INTERVAL_SECONDS
         value: "3600"
       - key: AUDIT_CHECKPOINT_MAX_AGE_SECONDS
@@ -64,13 +78,16 @@ services:
       # verified. The app safely ignores X-Forwarded-For while this is empty.
       - key: TRUSTED_PROXY_IPS
         value: ""
+    # Upload staging only; documents are stored in Supabase Storage.
     disk:
       name: private-storage
       mountPath: /var/data/private_storage
-      sizeGB: 10
+      sizeGB: 1
 
 databases:
-  # Retained until the operator explicitly confirms the resource is safe to remove.
+  # Unused when DATABASE_URL points at Supabase. Retained until the operator
+  # explicitly confirms the resource is safe to remove; it can be deleted from
+  # the Render dashboard after the Supabase-backed deployment is verified.
   - name: trustvault-postgres
     databaseName: trustvault_db
     user: trustvault_user

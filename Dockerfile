@@ -34,8 +34,13 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application code and Alembic migrations
 COPY backend /app/backend
 COPY alembic.ini /app/alembic.ini
+# Public Supabase root CA so sslmode=verify-full works for both the
+# pre-deploy migration instance and the running web service.
+COPY certs /app/certs
 COPY .env.example /app/.env.example
 COPY --from=frontend-build /frontend/dist /app/frontend_dist
+
+RUN chmod 644 /app/certs/prod-ca-2021.crt
 
 # Create directory for private persistent document storage
 RUN mkdir -p /app/private_storage && chmod 700 /app/private_storage

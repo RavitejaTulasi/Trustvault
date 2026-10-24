@@ -86,7 +86,7 @@ AUDIT_ANCHOR_DATABASE_URL=postgresql+psycopg://trustvault_anchor:<url-encoded-se
 
 `GET /health` exposes `components.audit_anchor` with the scheduler's last attempt/success/failure and an `overdue` flag. PostgreSQL anchoring reports `ok` after a successful checkpoint. `independence_verified` remains false because provider-level administrative and failure-domain separation must be verified by the operator. Local-file anchoring is reported as `local_only` and is not accepted for production. Alert on any top-level status other than `healthy`.
 
-For Render, configure the independent anchor database and HMAC key in the dashboard, then take a recoverable database backup before a release that runs migrations. Render executes the blueprint `preDeployCommand` once before switching the web service; a failed migration blocks the deploy but does not automatically restore a database backup. Verify the migration logs and health endpoint after release.
+For Render, configure the Supabase application database URL, the independent anchor database URL, and Supabase Storage values in the dashboard. The blueprint generates `SECRET_KEY` and `AUDIT_ANCHOR_HMAC_KEY`, and the Docker image includes the Supabase root CA at `/app/certs/prod-ca-2021.crt` for `sslmode=verify-full`. Take a recoverable database backup before a release that runs migrations. Render executes the blueprint `preDeployCommand` once before switching the web service; a failed migration blocks the deploy but does not automatically restore a database backup. Verify the migration logs and health endpoint after release.
 
 For Compose, provision the application database and independent anchor database separately, then:
 
@@ -117,7 +117,7 @@ Use a new destination path. The SQLite database snapshot is consistent, but the 
 
 The local SQLite configuration in `.env.example` is for development only and is rejected when `ENVIRONMENT=production`.
 
-The Render blueprint deploys the API, PostgreSQL, and frontend together in one Docker web service. The API serves the built frontend at `/` and serves API routes on the same origin, preserving the existing `SameSite=Lax` session and CSRF cookie behavior. This avoids split-origin authentication problems with Render's shared `onrender.com` domains. If you rename the web service or attach a custom domain, update `CORS_ORIGINS` to that exact origin.
+The Render blueprint deploys the API and built frontend in one Docker web service, with PostgreSQL and document storage in Supabase. The API serves the frontend at `/` and serves API routes on the same origin, preserving the existing `SameSite=Lax` session and CSRF cookie behavior. This avoids split-origin authentication problems with Render's shared `onrender.com` domains. If you rename the web service or attach a custom domain, update `CORS_ORIGINS` to that exact origin. Deploy the `feat/trustvault-release-clean` branch, or merge it to `main` first; the current `render.yaml` and deployment changes are not on `main`.
 
 `TRUSTED_PROXY_IPS` is empty by default. Until you configure exact trusted proxy CIDRs, the app safely ignores `X-Forwarded-For` and uses the immediate peer address; if that peer is a shared proxy, clients may share the same login limit.
 
