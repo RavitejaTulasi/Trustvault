@@ -3,16 +3,27 @@ import type { FormEvent } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   createGrant,
+  createPermissionRequest,
   deleteDocument,
   downloadDocument,
+  exportDocumentActivity,
   getDocument,
+  getDocumentActivity,
+  getPermissionRequestStatus,
   listGrants,
-  revokeGrant,
+  listPendingPermissionRequests,
   resolveGrantRecipient,
+  revokeGrant,
   updateDocument,
+  updatePermissionRequestStatus,
 } from '../auth';
 import { ApiError, listDocumentActivity } from '../api';
-import type { AuditEventResponse, DocumentResponse, GrantResponse } from '../types';
+import type {
+  AuditEventResponse,
+  DocumentResponse,
+  GrantResponse,
+  PermissionRequestResponse,
+} from '../types';
 import AppShell from '../components/AppShell';
 import PageHeader from '../components/PageHeader';
 import Tabs from '../components/Tabs';
@@ -20,7 +31,6 @@ import { OutcomeBadge, PermissionBadge, StatusBadge } from '../components/Badges
 import Skeleton from '../components/Skeleton';
 import { useToast } from '../components/useToast';
 import {
-  ChevronLeftIcon,
   DownloadIcon,
   FileIcon,
   KeyIcon,
@@ -91,6 +101,14 @@ export default function DocumentDetail() {
   const [activityError, setActivityError] = useState<string | null>(null);
   const activityRequestRef = useRef(0);
 
+  // Permission request state for downloading document activity
+  const [permRequest, setPermRequest] = useState<PermissionRequestResponse | null>(null);
+  const [requestingPerm, setRequestingPerm] = useState(false);
+  const [exportingFormat, setExportingFormat] = useState<'csv' | 'excel' | null>(null);
+  const [pendingRequests, setPendingRequests] = useState<PermissionRequestResponse[]>([]);
+  const [updatingRequestId, setUpdatingRequestId] = useState<number | null>(null);
+  const canExportActivity = isAdmin || isOwner || permRequest?.status === 'approved';
+
   const loadGrants = useCallback(
     async (grantsForOwner: boolean) => {
       if (!grantsForOwner) {
@@ -151,11 +169,13 @@ export default function DocumentDetail() {
       setActivityLoading(true);
       setActivityError(null);
       try {
-        const result = await listDocumentActivity({
-          document_id: id,
-          page: targetPage,
-          page_size: ACTIVITY_PAGE_SIZE,
-        });
+        const result = isAdmin
+          ? await listDocumentActivity({
+              document_id: id,
+              page: targetPage,
+              page_size: ACTIVITY_PAGE_SIZE,
+            })
+          : await getDocumentActivity(id, targetPage, ACTIVITY_PAGE_SIZE);
         if (request !== activityRequestRef.current) {
           return;
         }
@@ -171,20 +191,105 @@ export default function DocumentDetail() {
         setActivityError(describeError(err, 'Could not load document activity'));
       }
     },
-    [id],
+    [id, isAdmin],
   );
 
+  const loadPermissionRequestStatus = useCallback(async () => {
+    try {
+      const status = await getPermissionRequestStatus(id);
+      setPermRequest(status);
+    } catch {
+      // non-critical
+    }
+  }, [id]);
+
+  const loadPendingRequests = useCallback(async () => {
+    if (!isAdmin) return;
+    try {
+      const reqs = await listPendingPermissionRequests(id);
+      setPendingRequests(reqs);
+    } catch {
+      // non-critical
+    }
+  }, [id, isAdmin]);
+
   useEffect(() => {
-    if (!isAdmin || tab !== 'activity') {
+    if (tab !== 'activity') {
       return;
     }
     // eslint-disable-next-line react/set-state-in-effect -- lazy tab fetch reflects server state
     void loadActivity(1);
-  }, [isAdmin, loadActivity, tab]);
+    if (!isAdmin && !isOwner) {
+      void loadPermissionRequestStatus();
+    } else if (isAdmin) {
+      void loadPendingRequests();
+    }
+  }, [isAdmin, isOwner, loadActivity, tab, loadPermissionRequestStatus, loadPendingRequests]);
 
   const handleTabChange = (next: string) => {
-    if (next === 'overview' || next === 'access' || (next === 'activity' && isAdmin)) {
+    if (next === 'overview' || next === 'access' || next === 'activity') {
       setTab(next);
+    }
+  };
+
+  const handleRequestPermission = async () => {
+    setRequestingPerm(true);
+    try {
+      const req = await createPermissionRequest(id, 'download_activity');
+      setPermRequest(req);
+      pushToast({
+        title: 'Permission requested',
+        description: 'A download permission request has been submitted to Admin.',
+        tone: 'success',
+      });
+    } catch (err) {
+      pushToast({
+        title: 'Request failed',
+        description: describeError(err, 'Could not submit download request'),
+        tone: 'error',
+      });
+    } finally {
+      setRequestingPerm(false);
+    }
+  };
+
+  const handleExportActivity = async (format: 'csv' | 'excel') => {
+    setExportingFormat(format);
+    try {
+      await exportDocumentActivity(id, format);
+      pushToast({
+        title: `Export downloaded (${format.toUpperCase()})`,
+        tone: 'success',
+      });
+    } catch (err) {
+      pushToast({
+        title: 'Export failed',
+        description: describeError(err, 'Could not download activity'),
+        tone: 'error',
+      });
+    } finally {
+      setExportingFormat(null);
+    }
+  };
+
+  const handleAdminDecision = async (requestId: number, newStatus: 'approved' | 'rejected') => {
+    setUpdatingRequestId(requestId);
+    try {
+      await updatePermissionRequestStatus(requestId, newStatus);
+      pushToast({
+        title: `Request ${newStatus}`,
+        description: `Permission request was marked as ${newStatus}.`,
+        tone: 'success',
+      });
+      await loadPendingRequests();
+    } catch (err) {
+      pushToast({
+        title: 'Action failed',
+        description: describeError(err, 'Could not update request'),
+        tone: 'error',
+      });
+    } finally {
+      setUpdatingRequestId(null);
     }
   };
 
@@ -376,7 +481,7 @@ export default function DocumentDetail() {
   const tabs = [
     { id: 'overview', label: 'Overview' },
     { id: 'access', label: 'Access' },
-    ...(isAdmin ? [{ id: 'activity', label: 'Activity' }] : []),
+    { id: 'activity', label: 'Activity' },
   ];
   const activityTotalPages = Math.max(1, Math.ceil(activityTotal / ACTIVITY_PAGE_SIZE));
   const hasActivityPrev = activityPage > 1 && !activityLoading;
@@ -671,7 +776,7 @@ export default function DocumentDetail() {
                         <caption>Permission grants</caption>
                         <thead>
                           <tr>
-                            <th scope="col">User ID</th>
+                            <th scope="col">User</th>
                             <th scope="col">Permission</th>
                             <th scope="col">Status</th>
                             <th scope="col">Actions</th>
@@ -680,7 +785,7 @@ export default function DocumentDetail() {
                         <tbody>
                           {grants.map((grant) => (
                             <tr key={grant.id}>
-                              <td className="mono">{grant.user_id}</td>
+                              <td className="mono">{grant.user_email || grant.user_id}</td>
                               <td>
                                 <PermissionBadge permission={grant.permission} />
                               </td>
@@ -735,10 +840,10 @@ export default function DocumentDetail() {
           </div>
         )}
 
-        {isAdmin && tab === 'activity' && (
+        {tab === 'activity' && (
           <div role="tabpanel" aria-label="Activity" className="tab-panel">
             <section className="panel" aria-labelledby="document-activity-title">
-              <div className="panel-header">
+              <div className="panel-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
                 <div>
                   <h2 id="document-activity-title" className="panel-title">
                     Document activity
@@ -747,8 +852,128 @@ export default function DocumentDetail() {
                     Audit events tied to this document, newest first.
                   </p>
                 </div>
+                <div className="panel-actions" style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                  {canExportActivity ? (
+                    <>
+                      {permRequest?.status === 'approved' && !isAdmin && !isOwner && (
+                        <span className="badge" style={{ background: 'rgba(34, 197, 94, 0.15)', color: '#22c55e', border: '1px solid rgba(34, 197, 94, 0.3)', padding: '4px 10px', borderRadius: '6px', fontSize: '12px', fontWeight: 500 }}>
+                          ✓ Download permission granted
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => void handleExportActivity('csv')}
+                        disabled={exportingFormat !== null}
+                        title="Download activity table as CSV"
+                      >
+                        <DownloadIcon width={14} height={14} />
+                        {exportingFormat === 'csv' ? 'Exporting…' : 'Export CSV'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => void handleExportActivity('excel')}
+                        disabled={exportingFormat !== null}
+                        title="Download activity table formatted for Microsoft Excel"
+                      >
+                        <DownloadIcon width={14} height={14} />
+                        {exportingFormat === 'excel' ? 'Exporting…' : 'Export Excel'}
+                      </button>
+                    </>
+                  ) : permRequest?.status === 'pending' ? (
+                    <span className="badge" style={{ background: 'rgba(234, 179, 8, 0.15)', color: '#eab308', border: '1px solid rgba(234, 179, 8, 0.3)', padding: '6px 12px', borderRadius: '6px', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <RefreshIcon width={13} height={13} />
+                      Request pending admin approval
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      onClick={() => void handleRequestPermission()}
+                      disabled={requestingPerm}
+                      title="Request admin permission to export activity"
+                    >
+                      <KeyIcon width={14} height={14} />
+                      {requestingPerm
+                        ? 'Submitting request…'
+                        : permRequest?.status === 'rejected'
+                          ? 'Re-request Download Permission'
+                          : 'Request Download Permission'}
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="panel-body">
+                {isAdmin && pendingRequests.length > 0 && (
+                  <div
+                    role="region"
+                    aria-label="Pending permission requests"
+                    style={{
+                      background: 'rgba(59, 130, 246, 0.08)',
+                      border: '1px solid rgba(59, 130, 246, 0.25)',
+                      borderRadius: '8px',
+                      padding: '14px 16px',
+                      marginBottom: '16px',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                      <strong style={{ color: '#60a5fa', fontSize: '14px' }}>
+                        Pending Download Requests ({pendingRequests.length})
+                      </strong>
+                      <span style={{ fontSize: '12px', color: '#94a3b8' }}>Admin review required</span>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      {pendingRequests.map((req) => (
+                        <div
+                          key={req.id}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            background: 'rgba(15, 23, 42, 0.6)',
+                            padding: '8px 12px',
+                            borderRadius: '6px',
+                            fontSize: '13px',
+                          }}
+                        >
+                          <div>
+                            <span style={{ fontWeight: 600 }}>{req.requester_email || shortId(req.requester_id)}</span>
+                            <span style={{ color: '#94a3b8', marginLeft: '8px' }}>
+                              requested activity export ({formatDateTime(req.created_at)})
+                            </span>
+                          </div>
+                          <div style={{ display: 'flex', gap: '6px' }}>
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              style={{ padding: '4px 10px', fontSize: '12px' }}
+                              onClick={() => void handleAdminDecision(req.id, 'approved')}
+                              disabled={updatingRequestId === req.id}
+                            >
+                              {updatingRequestId === req.id ? 'Updating…' : 'Approve'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-danger btn-sm"
+                              style={{ padding: '4px 10px', fontSize: '12px' }}
+                              onClick={() => void handleAdminDecision(req.id, 'rejected')}
+                              disabled={updatingRequestId === req.id}
+                            >
+                              Reject
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {permRequest?.status === 'rejected' && !isAdmin && (
+                  <div role="alert" className="alert alert-error" style={{ marginBottom: '16px' }}>
+                    Your previous request for activity export was rejected by an administrator. You may re-request permission using the button above.
+                  </div>
+                )}
                 {activityError && (
                   <div role="alert" className="alert alert-error">
                     {activityError}
@@ -787,7 +1012,7 @@ export default function DocumentDetail() {
                               <td>
                                 <span className="cell-title-link">{event.action}</span>
                               </td>
-                              <td className="mono">{shortId(event.actor_id)}</td>
+                              <td className="mono">{event.actor_email || shortId(event.actor_id)}</td>
                               <td>
                                 <OutcomeBadge outcome={event.outcome} />
                               </td>

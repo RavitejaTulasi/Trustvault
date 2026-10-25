@@ -41,7 +41,7 @@ export default function OverviewVault() {
       return;
     }
 
-    const query = window.matchMedia('(min-width: 900px) and (pointer: fine)');
+    const query = window.matchMedia('(min-width: 600px) and (pointer: fine)');
     const sceneSupported = !reduceMotion && supportsWebGL();
     const update = () => setEligible(sceneSupported && query.matches);
     update();

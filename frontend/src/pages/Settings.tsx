@@ -12,7 +12,7 @@ import {
   ShieldIcon,
 } from '../components/Icons';
 import { useSession } from '../hooks/useSession';
-import { updateMe } from '../auth';
+import { changePassword, updateMe } from '../auth';
 import { describeError, formatDateTime, getInitials, roleLabel } from '../lib/format';
 
 const PASSWORD_RULES = [
@@ -36,6 +36,7 @@ export default function Settings() {
   const [nameError, setNameError] = useState<string | null>(null);
   const [nameNotice, setNameNotice] = useState<string | null>(null);
 
+  const [currentPassword, setCurrentPassword] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -79,6 +80,10 @@ export default function Settings() {
   const handlePassword = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setPasswordError(null);
+    if (!currentPassword) {
+      setPasswordError('Enter your current password.');
+      return;
+    }
     if (!passwordValid) {
       setPasswordError('Choose a password that meets every requirement.');
       return;
@@ -87,10 +92,17 @@ export default function Settings() {
       setPasswordError('The passwords do not match.');
       return;
     }
+    if (password === currentPassword) {
+      setPasswordError('Choose a password different from your current password.');
+      return;
+    }
     setSavingPassword(true);
     try {
-      await updateMe({ password });
-      // The backend revokes every session, including this one, on password change.
+      await changePassword(currentPassword, password);
+      // The backend keeps this session active and signs out every other one.
+      setCurrentPassword('');
+      setPassword('');
+      setConfirmPassword('');
       setPasswordChanged(true);
     } catch (err) {
       setPasswordError(describeError(err, 'Could not change your password'));
@@ -238,7 +250,8 @@ export default function Settings() {
                 Security
               </h2>
               <p className="panel-description">
-                Change your password and review controls enforced by the server.
+                Changing your password requires your current password. Review the
+                controls enforced by the server.
               </p>
             </div>
           </div>
@@ -251,8 +264,8 @@ export default function Settings() {
                 <div>
                   <h3 className="section-title">Password updated</h3>
                   <p className="section-copy">
-                    For your security, every session — including this one — has been revoked.
-                    Sign in again with your new password.
+                    Your other sessions have been signed out. This session stays active
+                    with the new password.
                   </p>
                 </div>
               </div>
@@ -263,6 +276,19 @@ export default function Settings() {
                     {passwordError}
                   </div>
                 )}
+                <div className="field">
+                  <label htmlFor="settings-current-password">Current password</label>
+                  <input
+                    id="settings-current-password"
+                    className="input"
+                    type={showPassword ? 'text' : 'password'}
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    autoComplete="current-password"
+                    maxLength={128}
+                    required
+                  />
+                </div>
                 <div className="field">
                   <label htmlFor="settings-password">New password</label>
                   <div className="input-wrap">
@@ -325,8 +351,8 @@ export default function Settings() {
 
             {passwordChanged && (
               <div className="form-actions">
-                <Link to="/login" className="btn btn-primary">
-                  Go to sign in
+                <Link to="/" className="btn btn-primary">
+                  Back to overview
                 </Link>
               </div>
             )}

@@ -12,6 +12,7 @@ const ChangePasswordPage = lazy(() => import('./pages/ChangePassword'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const DocumentDetail = lazy(() => import('./pages/DocumentDetail'));
 const Documents = lazy(() => import('./pages/Documents'));
+const ForgotPasswordPage = lazy(() => import('./pages/ForgotPassword'));
 const LandingPage = lazy(() => import('./pages/Landing'));
 const LoginPage = lazy(() => import('./pages/Login'));
 const NotFoundPage = lazy(() => import('./pages/NotFound'));
@@ -70,6 +71,7 @@ function RoutedContent() {
           <Route path="/" element={<HomeRoute />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
+          <Route path="/forgot-password" element={<ForgotPasswordPage />} />
           <Route path="/change-password" element={<ChangePasswordPage />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/documents" element={<Documents />} />

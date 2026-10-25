@@ -187,7 +187,7 @@ function VaultArtifact() {
       return;
     }
 
-    const query = window.matchMedia('(min-width: 900px) and (pointer: fine)');
+    const query = window.matchMedia('(min-width: 600px) and (pointer: fine)');
     const update = () => setSceneEligible(query.matches);
     update();
     query.addEventListener('change', update);

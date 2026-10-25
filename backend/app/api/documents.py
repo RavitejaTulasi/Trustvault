@@ -11,13 +11,16 @@ Security controls implemented:
 - Immediate revocation enforcement on every request without caching
 """
 
-import logging
+import csv
 import hashlib
+import io
 import json
+import logging
 import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import (
@@ -27,11 +30,12 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -40,13 +44,18 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import settings
 from backend.app.database import get_db
-from backend.app.models.audit import AuditOutcome
+from backend.app.models.audit import AuditEvent, AuditOutcome
 from backend.app.models.base import utc_now
 from backend.app.models.document import Document, DocumentVersion
 from backend.app.models.grant import DocumentGrant, PermissionLevel
-from backend.app.models.storage_operation import StorageOperation
+from backend.app.models.permission_request import (
+    PermissionRequest,
+    PermissionRequestStatus,
+)
 from backend.app.models.storage_object import StorageObject, UploadRequest
+from backend.app.models.storage_operation import StorageOperation
 from backend.app.models.user import User, UserRole
+from backend.app.schemas.audit import AuditEventListResponse, AuditEventResponse
 from backend.app.schemas.document import (
     DocumentListItem,
     DocumentListResponse,
@@ -61,6 +70,10 @@ from backend.app.schemas.grant import (
     GrantResponse,
 )
 from backend.app.security.auth import get_current_user
+from backend.app.security.rate_limiter import (
+    LoginRateLimitUnavailable,
+    activity_export_rate_limiter,
+)
 from backend.app.security.request_validation import (
     RequestMetadataValidationError,
     validate_mime_type,
@@ -68,17 +81,82 @@ from backend.app.security.request_validation import (
 )
 from backend.app.services.audit_service import AuditService
 from backend.app.services.authorization import AuthorizationService, DocumentAction
+from backend.app.services.storage_objects import transition_storage_object
 from backend.app.services.storage_quota import (
     StorageQuotaExceeded,
     StorageQuotaService,
 )
 from backend.app.services.storage_recovery import StorageRecoveryService
-from backend.app.services.storage_objects import transition_storage_object
 from backend.app.services.storage_service import StorageService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["Documents & Storage"])
+
+
+def _enforce_activity_export_rate_limit(
+    db: Session,
+    request: Request,
+    current_user: User,
+    document_id: str,
+) -> None:
+    """Reserve one activity-export attempt or return a safe 429/503."""
+    email = current_user.email
+    try:
+        decision = activity_export_rate_limiter.reserve(
+            db,
+            request.state.client_ip,
+            email,
+        )
+    except LoginRateLimitUnavailable:
+        logger.exception("Shared activity-export rate limiter unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Activity export temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from None
+
+    if decision.allowed:
+        return
+
+    try:
+        should_audit = activity_export_rate_limiter.claim_denial_audit(
+            db,
+            request.state.client_ip,
+            email,
+        )
+        if should_audit:
+            AuditService.log_event(
+                db,
+                action="audit.activity_export_rate_limited",
+                outcome=AuditOutcome.DENIED,
+                actor_id=current_user.id,
+                resource_type="document",
+                resource_id=document_id,
+                ip_address=request.state.client_ip,
+                user_agent=request.state.user_agent,
+                request_id=request.state.request_id,
+                details={
+                    "document_id": document_id,
+                    "reason": "rate_limit_exceeded",
+                    "aggregated": True,
+                },
+            )
+            db.commit()
+    except (LoginRateLimitUnavailable, SQLAlchemyError):
+        db.rollback()
+        logger.exception("Failed to record activity-export rate-limit denial")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Activity export temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from None
+
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="Too many activity exports. Please try again later.",
+        headers={"Retry-After": str(decision.retry_after)},
+    )
 
 
 def _upload_request_digest(
@@ -1377,7 +1455,9 @@ def create_document_permission(
     db.commit()
     db.refresh(grant)
 
-    return GrantResponse.model_validate(grant)
+    resp = GrantResponse.model_validate(grant)
+    resp.user_email = recipient.email
+    return resp
 
 
 @router.post(
@@ -1542,3 +1622,257 @@ def revoke_document_permission(
     db.commit()
 
     return {"detail": "Permission successfully revoked"}
+
+
+@router.get(
+    "/{document_id}/activity",
+    response_model=AuditEventListResponse,
+    summary="List activity for a specific document",
+)
+def get_document_activity(
+    document_id: str,
+    request: Request,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+) -> AuditEventListResponse:
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    document = db.get(Document, document_id)
+    if document is None or document.is_deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    # Authorize: user must have read access or be admin
+    is_admin = current_user.role == UserRole.ADMIN
+    if not is_admin:
+        active_grant = _get_active_grant(db, document.id, current_user.id)
+        authorized = AuthorizationService.authorize_document_access(
+            user=current_user,
+            document=document,
+            action=DocumentAction.READ,
+            active_grant=active_grant,
+        )
+        if not authorized:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    details_fragment = f'"document_id": {json.dumps(document_id)}'
+    query = db.query(AuditEvent).filter(
+        AuditEvent.resource_type.in_(("document", "document_grant")),
+        or_(
+            AuditEvent.resource_id == document_id,
+            AuditEvent.details.like(f"%{details_fragment}%"),
+        ),
+    )
+
+    total = query.count()
+    events = (
+        query.order_by(AuditEvent.sequence_number.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    actor_ids = {e.actor_id for e in events if e.actor_id}
+    email_map: dict[str, str] = {}
+    if actor_ids:
+        users = db.query(User.id, User.email).filter(User.id.in_(actor_ids)).all()
+        email_map = {uid: email for uid, email in users}
+
+    event_responses = []
+    for event in events:
+        resp = AuditEventResponse.model_validate(event)
+        if event.actor_id:
+            resp.actor_email = email_map.get(event.actor_id)
+        if not is_admin:
+            resp.ip_address = None
+            resp.user_agent = None
+            resp.request_id = None
+        event_responses.append(resp)
+
+    return AuditEventListResponse(
+        events=event_responses,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get(
+    "/{document_id}/activity/export",
+    summary="Export activity for a specific document as CSV or Excel",
+)
+def export_document_activity(
+    document_id: str,
+    request: Request,
+    response: Response,
+    format: str = Query("csv", pattern="^(csv|excel)$"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    document = db.get(Document, document_id)
+    if document is None or document.is_deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    # Authorize read
+    is_admin = current_user.role == UserRole.ADMIN
+    if not is_admin:
+        active_grant = _get_active_grant(db, document.id, current_user.id)
+        authorized = AuthorizationService.authorize_document_access(
+            user=current_user,
+            document=document,
+            action=DocumentAction.READ,
+            active_grant=active_grant,
+        )
+        if not authorized:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+        # Owners may export their own document's activity without an admin
+        # approval; other readers need an approved download request.
+        if document.owner_id != current_user.id:
+            approved_request = (
+                db.query(PermissionRequest)
+                .filter(
+                    PermissionRequest.requester_id == current_user.id,
+                    PermissionRequest.document_id == document_id,
+                    PermissionRequest.requested_role.in_(("download_activity", "export_activity")),
+                    PermissionRequest.status == PermissionRequestStatus.APPROVED,
+                )
+                .first()
+            )
+            if not approved_request:
+                AuditService.log_event(
+                    db,
+                    action="audit.activity_export",
+                    outcome=AuditOutcome.DENIED,
+                    actor_id=current_user.id,
+                    resource_type="document",
+                    resource_id=document_id,
+                    ip_address=request.state.client_ip,
+                    user_agent=request.state.user_agent,
+                    request_id=request.state.request_id,
+                    details={
+                        "document_id": document_id,
+                        "reason": "download_permission_required",
+                    },
+                )
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Download permission required. Please request permission from the admin.",
+                )
+
+    _enforce_activity_export_rate_limit(db, request, current_user, document_id)
+
+    details_fragment = f'"document_id": {json.dumps(document_id)}'
+    max_rows = settings.DOCUMENT_ACTIVITY_EXPORT_MAX_ROWS
+    events = (
+        db.query(AuditEvent)
+        .filter(
+            AuditEvent.resource_type.in_(("document", "document_grant")),
+            or_(
+                AuditEvent.resource_id == document_id,
+                AuditEvent.details.like(f"%{details_fragment}%"),
+            ),
+        )
+        .order_by(AuditEvent.sequence_number.desc())
+        .limit(max_rows + 1)
+        .all()
+    )
+    if len(events) > max_rows:
+        AuditService.log_event(
+            db,
+            action="audit.activity_export",
+            outcome=AuditOutcome.DENIED,
+            actor_id=current_user.id,
+            resource_type="document",
+            resource_id=document_id,
+            ip_address=request.state.client_ip,
+            user_agent=request.state.user_agent,
+            request_id=request.state.request_id,
+            details={
+                "document_id": document_id,
+                "reason": "export_row_limit_exceeded",
+                "max_rows": max_rows,
+            },
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=(
+                "Activity export exceeds the configured row limit. "
+                "Contact an administrator to export a narrower range."
+            ),
+        )
+
+    actor_ids = {e.actor_id for e in events if e.actor_id}
+    email_map: dict[str, str] = {}
+    if actor_ids:
+        users = db.query(User.id, User.email).filter(User.id.in_(actor_ids)).all()
+        email_map = {uid: email for uid, email in users}
+
+    output = io.StringIO()
+    # Excel compatibility: UTF-8 BOM so Excel opens it with proper UTF-8 and formatting
+    if format == "excel":
+        output.write("\ufeff")
+
+    writer = csv.writer(output, delimiter="," if format == "csv" else "\t")
+    writer.writerow([
+        "Sequence",
+        "Timestamp",
+        "Action",
+        "Outcome",
+        "Actor Email",
+        "Resource Type",
+        "Resource ID",
+        "IP Address",
+    ])
+
+    for e in events:
+        actor_email = email_map.get(e.actor_id, e.actor_id or "System")
+
+        def sanitize_val(val: Any) -> str:
+            s = str(val or "")
+            if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+                return "'" + s
+            return s
+
+        writer.writerow([
+            e.sequence_number,
+            e.timestamp.isoformat(),
+            sanitize_val(e.action),
+            sanitize_val(e.outcome),
+            sanitize_val(actor_email),
+            sanitize_val(e.resource_type),
+            sanitize_val(e.resource_id),
+            sanitize_val(e.ip_address) if is_admin else "",
+        ])
+
+    AuditService.log_event(
+        db,
+        action="audit.activity_export",
+        outcome=AuditOutcome.SUCCESS,
+        actor_id=current_user.id,
+        resource_type="document",
+        resource_id=document_id,
+        ip_address=request.state.client_ip,
+        user_agent=request.state.user_agent,
+        request_id=request.state.request_id,
+        details={"format": format, "export_type": "document_activity"},
+    )
+    db.commit()
+
+    output.seek(0)
+    ext = "csv" if format == "csv" else "xls"
+    media_type = "text/csv" if format == "csv" else "application/vnd.ms-excel"
+    filename = f"trustvault-document-{document_id[:8]}-activity.{ext}"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type=media_type,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )

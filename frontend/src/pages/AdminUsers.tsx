@@ -69,6 +69,7 @@ export default function AdminUsers() {
 
   const [users, setUsers] = useState<UserResponse[]>([]);
   const [total, setTotal] = useState(0);
+  const [roleCounts, setRoleCounts] = useState<Record<string, number>>({});
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -101,13 +102,17 @@ export default function AdminUsers() {
       setLoadError(null);
       setPending(null);
       try {
-        const result = await listUsers({ page: targetPage, page_size: PAGE_SIZE });
+        const [result, counts] = await Promise.all([
+          listUsers({ page: targetPage, page_size: PAGE_SIZE }),
+          getUserRoleCounts(),
+        ]);
         if (request !== requestRef.current) {
           return;
         }
         setUsers(result.users);
         setTotal(result.total);
         setPage(result.page);
+        setRoleCounts(counts);
       } catch (err) {
         if (request !== requestRef.current) {
           return;
@@ -421,6 +426,26 @@ export default function AdminUsers() {
           </button>
         }
       />
+
+      <div className="panel" style={{ marginBottom: '24px', padding: '16px 20px' }}>
+        <h2 className="panel-title" style={{ fontSize: '13px', marginBottom: '12px', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+          Role distribution ({total} total accounts)
+        </h2>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '12px' }}>
+          <div style={{ background: 'var(--bg-canvas)', padding: '12px', borderRadius: 'var(--radius-xs)', border: '1px solid var(--border-subtle)' }}>
+            <span style={{ color: 'var(--text-tertiary)', fontSize: '11px', display: 'block' }}>Administrators</span>
+            <span style={{ color: 'var(--text-primary)', fontSize: '20px', fontWeight: 600 }}>{roleCounts.admin ?? 0}</span>
+          </div>
+          <div style={{ background: 'var(--bg-canvas)', padding: '12px', borderRadius: 'var(--radius-xs)', border: '1px solid var(--border-subtle)' }}>
+            <span style={{ color: 'var(--text-tertiary)', fontSize: '11px', display: 'block' }}>Document Owners</span>
+            <span style={{ color: 'var(--text-primary)', fontSize: '20px', fontWeight: 600 }}>{roleCounts.owner ?? 0}</span>
+          </div>
+          <div style={{ background: 'var(--bg-canvas)', padding: '12px', borderRadius: 'var(--radius-xs)', border: '1px solid var(--border-subtle)' }}>
+            <span style={{ color: 'var(--text-tertiary)', fontSize: '11px', display: 'block' }}>Viewers</span>
+            <span style={{ color: 'var(--text-primary)', fontSize: '20px', fontWeight: 600 }}>{roleCounts.viewer ?? 0}</span>
+          </div>
+        </div>
+      </div>
 
       {actionError && (
         <div role="alert" className="alert alert-error">

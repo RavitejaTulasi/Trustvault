@@ -9,7 +9,6 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
-from backend.app.database import get_db
 from backend.app.main import app
 from backend.app.models.audit import AuditEvent
 from backend.app.models.user import User, UserRole

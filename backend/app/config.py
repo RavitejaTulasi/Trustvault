@@ -202,6 +202,56 @@ class Settings(BaseSettings):
             "refused when the bounded table is full"
         ),
     )
+    OTP_REQUEST_RATE_LIMIT_MAX_ATTEMPTS: int = Field(
+        default=5,
+        ge=1,
+        description="Maximum password reset code requests per IP and per IP+email window",
+    )
+    OTP_REQUEST_RATE_LIMIT_WINDOW_SECONDS: int = Field(
+        default=900,
+        ge=1,
+        description="Shared fixed-window duration for password reset requests",
+    )
+    OTP_VERIFY_RATE_LIMIT_MAX_ATTEMPTS: int = Field(
+        default=10,
+        ge=1,
+        description="Maximum OTP verification attempts per IP and per IP+email window",
+    )
+    OTP_VERIFY_RATE_LIMIT_WINDOW_SECONDS: int = Field(
+        default=900,
+        ge=1,
+        description="Shared fixed-window duration for OTP verification attempts",
+    )
+    PERMISSION_REQUEST_RATE_LIMIT_MAX_ATTEMPTS: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "Maximum permission-request creations per IP and per IP+email window"
+        ),
+    )
+    PERMISSION_REQUEST_RATE_LIMIT_WINDOW_SECONDS: int = Field(
+        default=3600,
+        ge=1,
+        description="Shared fixed-window duration for permission-request creation",
+    )
+    ACTIVITY_EXPORT_RATE_LIMIT_MAX_ATTEMPTS: int = Field(
+        default=20,
+        ge=1,
+        description="Maximum activity exports per IP and per IP+email window",
+    )
+    ACTIVITY_EXPORT_RATE_LIMIT_WINDOW_SECONDS: int = Field(
+        default=3600,
+        ge=1,
+        description="Shared fixed-window duration for activity exports",
+    )
+    DOCUMENT_ACTIVITY_EXPORT_MAX_ROWS: int = Field(
+        default=10_000,
+        ge=1,
+        le=100_000,
+        description=(
+            "Maximum audit events returned in a single document activity export"
+        ),
+    )
 
     # Reverse-Proxy Client IP Resolution
     TRUSTED_PROXY_IPS: str = Field(
@@ -297,6 +347,18 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: str | list[str] = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000"
 
+    # Password reset email delivery. When SMTP_HOST is empty, reset codes are
+    # written to the application log only in development/testing. Staging and
+    # production require SMTP so security codes never appear in logs.
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = Field(default=587, ge=1, le=65535)
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = Field(default="", repr=False)
+    SMTP_FROM_EMAIL: str = "no-reply@trustvault.local"
+    SMTP_USE_TLS: bool = True
+    SMTP_USE_SSL: bool = False
+    SMTP_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
+
     # Seed Accounts (reserved; no seed script ships with this repository).
     SEED_ADMIN_EMAIL: str = "admin@trustvault.local"
     SEED_ADMIN_PASSWORD: str = Field(default="", repr=False)
@@ -345,6 +407,15 @@ class Settings(BaseSettings):
                     "the specific proxy networks instead."
                 )
         return value
+
+    @model_validator(mode="after")
+    def validate_smtp_settings(self) -> "Settings":
+        if self.SMTP_USE_TLS and self.SMTP_USE_SSL:
+            raise ValueError(
+                "SMTP_USE_TLS and SMTP_USE_SSL cannot both be true; use STARTTLS "
+                "or implicit TLS, not both."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_storage_settings(self) -> "Settings":

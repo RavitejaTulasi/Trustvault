@@ -341,6 +341,42 @@
     margin-top: 0;
   }
 
+  .auth-form-note {
+    display: flex;
+    justify-content: flex-end;
+    color: var(--text-tertiary);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+
+  .auth-form-note a {
+    color: var(--accent);
+    font-weight: 580;
+  }
+
+  .auth-form-note a:hover {
+    color: var(--accent-strong);
+  }
+
+  .auth-link-button {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-weight: 580;
+    cursor: pointer;
+  }
+
+  .auth-link-button:hover {
+    color: var(--accent-strong);
+  }
+
+  .auth-link-button:disabled {
+    color: var(--text-tertiary);
+    cursor: default;
+  }
+
   .auth-alt {
     margin-top: 20px;
     color: var(--text-tertiary);

@@ -14,6 +14,9 @@ TrustVault is a production-minded secure document sharing web application engine
 - **Private Persistent Storage**: Document byte streams reside outside the web root under 256-bit cryptographically random hex keys.
 - **Immediate Revocation**: Revoking a grant takes effect on the next request.
 - **Tamper-Evident Audit Trail**: Versioned SHA-256 hash chaining with actor identity binding and HMAC-protected, externally anchorable checkpoints.
+- **Self-Service Password Reset**: Expiring six-digit OTPs stored as keyed HMAC-SHA256 digests, with per-IP/per-account limits, a five-attempt ceiling, atomic single-use consumption, and full session revocation on success.
+- **Permission Requests and Notifications**: Rate-limited in-app approval workflow for document-activity export, with an authenticated notification inbox and audited mark-read actions for requesters and administrators.
+- **Document Activity and Export**: Paginated, redacted activity history plus bounded CSV/Excel export, gated by owner/admin access or an approved export request.
 - **Premium Interaction Layer**: Website-wide pointer-responsive spotlight, speed-sensitive 3D cinematic vault, and consistent, high-visibility card hover interactions (lift, border, glow).
 
 ---
@@ -171,6 +174,11 @@ Demo passwords must be distinct, at least 12 characters, and stored only in the 
 | `LOGIN_RATE_LIMIT_MAX_ATTEMPTS` | Failed login attempts allowed per IP and per IP+email in a window. | `5` |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | Fixed window duration for shared login rate limiting. | `300` |
 | `LOGIN_RATE_LIMIT_MAX_BUCKETS` | Maximum retained shared limiter buckets; new attempts fail closed when full. | `50000` |
+| `OTP_REQUEST_RATE_LIMIT_MAX_ATTEMPTS` / `OTP_REQUEST_RATE_LIMIT_WINDOW_SECONDS` | Password reset code requests allowed per IP and per IP+email window. | `5` / `900` |
+| `OTP_VERIFY_RATE_LIMIT_MAX_ATTEMPTS` / `OTP_VERIFY_RATE_LIMIT_WINDOW_SECONDS` | OTP verification and confirmation attempts allowed per IP and per IP+email window. | `10` / `900` |
+| `PERMISSION_REQUEST_RATE_LIMIT_MAX_ATTEMPTS` / `PERMISSION_REQUEST_RATE_LIMIT_WINDOW_SECONDS` | Permission-request creation attempts allowed per IP and per requester window. | `20` / `3600` |
+| `ACTIVITY_EXPORT_RATE_LIMIT_MAX_ATTEMPTS` / `ACTIVITY_EXPORT_RATE_LIMIT_WINDOW_SECONDS` | Activity export attempts allowed per IP and per user window. | `20` / `3600` |
+| `DOCUMENT_ACTIVITY_EXPORT_MAX_ROWS` | Maximum activity rows returned in one export; larger requests fail with `413` and an audited denial. | `10000` |
 | `TRUSTED_PROXY_IPS` | Comma-separated proxy CIDRs allowed to supply `X-Forwarded-For`. Empty disables forwarding-header trust. Wildcards are rejected. | Empty |
 | `AUDIT_ANCHOR_MODE` | `disabled`, same-host `local_file` (development only), or separately administered `postgresql`. Production and staging require `postgresql`. | `disabled` |
 | `AUDIT_ANCHOR_DATABASE_URL` | Connection URL for independent PostgreSQL checkpoint storage. The application role should have only `SELECT` and `INSERT` on its provisioned table. | Empty |
@@ -188,6 +196,11 @@ Demo passwords must be distinct, at least 12 characters, and stored only in the 
 | `AUDIT_RETENTION_DAYS` | Retention objective for independently held audit archives; the online chain is retained indefinitely | `2555` |
 | `AUDIT_RETENTION_AUTO_DELETE` | Destructive automatic deletion of online audit records; setting `true` fails startup | `false` |
 | `CORS_ORIGINS` | Permitted cross-origin origins | `http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000` |
+| `SMTP_HOST` / `SMTP_PORT` | SMTP server used to email password reset codes. Empty logs codes only in development/testing; staging and production require SMTP. | Empty / `587` |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | Optional SMTP authentication credentials. | Empty |
+| `SMTP_FROM_EMAIL` | Sender address for security emails. | `no-reply@trustvault.local` |
+| `SMTP_USE_TLS` / `SMTP_USE_SSL` | STARTTLS (port 587) or implicit TLS (port 465). Only one may be enabled. | `true` / `false` |
+| `SMTP_TIMEOUT_SECONDS` | SMTP connection and delivery timeout. | `10` |
 | `DEMO_LOGIN_ENABLED` | Enables the staging-only demo credential discovery endpoint. Startup rejects it when `ENVIRONMENT=production`. | `false` |
 | `DEMO_ADMIN_EMAIL` / `DEMO_ADMIN_PASSWORD` | Credentials for the admin demo button. Password must be at least 12 characters. | Empty |
 | `DEMO_OWNER_EMAIL` / `DEMO_OWNER_PASSWORD` | Credentials for the document-owner demo button. Password must be at least 12 characters. | Empty |
@@ -229,3 +242,7 @@ Demo passwords must be distinct, at least 12 characters, and stored only in the 
    - Forward migrations are supported. Downgrading below `c3d4e5f6a7b8` is refused once any version 2 audit record exists, because the legacy schema cannot represent the per-record hash version; a downgrade/re-upgrade cycle would relabel V2 evidence as V1 and verification would report tampering.
    - Back up the database before any migration. Recover from a failed release by restoring a snapshot taken before V2 records were written, or by remaining on the current schema; never delete or rewrite audit rows to force a downgrade. V1-only chains downgrade and re-upgrade normally.
    - Revision `e5f6a7b8c9d0` adds the internal grant `revocation_version`; its upgrade/downgrade/re-upgrade path was exercised on PostgreSQL 16. The V2 audit downgrade refusal remains intentionally unexercised against a populated production database.
+11. **Password Reset, Notifications, and Activity Export**:
+   - OTP codes are stored as keyed HMAC-SHA256 digests and expire after 15 minutes. A database-read compromise cannot recover a code without `SECRET_KEY`; an attacker who also obtains the application secret can brute-force the six-digit space offline. Rotating `SECRET_KEY` invalidates all outstanding reset codes. Request and verification limits are shared per IP and per IP+email, but distributed multi-IP attacks still require edge/WAF controls.
+   - Permission-request creation is authenticated and rate-limited to 20 attempts per hour per IP and per requester, but it still generates administrator notifications. Notification mark-read and read-all actions are audited only when state changes; notification list reads are not audited.
+   - Document activity export is capped at 10,000 rows and rate-limited to 20 attempts per hour per IP and per user. Non-owner readers need an approved `download_activity`/`export_activity` request in addition to existing read access; approval does not create a document grant. Non-administrator exports omit IP addresses, and spreadsheet formula prefixes are neutralized. The row cap is a fixed application guard; larger exports need an asynchronous pipeline.

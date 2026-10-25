@@ -320,3 +320,45 @@ When collaborating with AI on TrustVault, the following engineering prompts and 
   - `python -m ruff check . --statistics`: 41 findings, unchanged from the `5156f38` baseline (38 `B008`, 1 `I001`, 1 `F401`, 1 `F841`), with no new rules or categories.
   - `git diff --check`: no whitespace errors; only Git's expected CRLF conversion warnings.
 - **Git Status**: The Day 9 code, tests, and documentation updates are staged as one change set. Nothing was committed, amended, or pushed to a remote. The PostgreSQL results above come from a local PostgreSQL 16 container with isolated schemas; no production deployment, production load test, or live AWS checkpoint provider is claimed.
+
+---
+
+### Entry 13 (Day 10 - 2026-10-25): OTP-at-Rest Hashing and Abuse Controls for Permissions, Notifications, and Export
+- **Category**: Security Hardening / Credential Protection / Abuse Controls / Documentation
+- **Prompt Summary** (abridged from the Day 10 task):
+  "Complete the remaining TrustVault hardening items: stop storing password-reset OTPs in recoverable plaintext, rate-limit permission-request creation and document activity export, bound export size, audit notification mark-read actions, add regression coverage, reconcile the local migration drift, and update the threat model, README, API/architecture documentation, and AI usage log honestly. Do not commit."
+- **Baseline Inspected Before Changes**:
+  - The password-reset flow generated a six-digit OTP, stored it directly in `password_reset_otps.otp_code`, and compared it with `secrets.compare_digest`. A database-read compromise during the 15-minute validity window was equivalent to reset-token compromise.
+  - Permission-request creation had no application-level rate limit and could generate administrator notifications indefinitely. Notification mark-one-read and mark-all-read operations were not audited.
+  - Document activity export loaded every matching event, had no rate limit, and returned `200` for arbitrarily large result sets. The threat model and README described these as known residual risks.
+  - The local database was at `d5e6f7a8b9c0`; `1b2bd10ec660` had been applied before its index/timezone edits, leaving local schema drift. The OTP migration and reconciliation had not yet been authored or tested.
+- **What the AI Produced**:
+  - `backend/app/security/otp.py`: `hash_otp_code()` and `verify_otp_code()` using HMAC-SHA256 keyed by `SECRET_KEY`, with constant-time digest comparison.
+  - `backend/app/models/otp.py`: widened `otp_code` to `String(64)`; `backend/app/api/auth.py` now stores only the digest and verifies submitted codes against it.
+  - `backend/migrations/versions/f7a8b9c0d1e2_hash_password_reset_otps.py`: batch-altered the OTP column to `String(64)`, replaced legacy plaintext values with 64 zero characters, and marked legacy rows used so they cannot be replayed. Downgrade restores `String(10)` and invalidates outstanding rows.
+  - `backend/migrations/versions/a8b9c0d1e2f3_reconcile_permission_request_schema.py`: creates missing permission-request indexes on SQLite/PostgreSQL and converts naive PostgreSQL timestamps to timezone-aware columns only when the old type is present. Downgrade is intentionally a no-op because the indexes may have been created by the original revision.
+  - `backend/app/config.py`: added `PERMISSION_REQUEST_RATE_LIMIT_MAX_ATTEMPTS`/`_WINDOW_SECONDS` (20/3600), `ACTIVITY_EXPORT_RATE_LIMIT_MAX_ATTEMPTS`/`_WINDOW_SECONDS` (20/3600), and `DOCUMENT_ACTIVITY_EXPORT_MAX_ROWS` (10,000, range 1-100,000).
+  - `backend/app/security/rate_limiter.py`: added `permission_request_rate_limiter` and `activity_export_rate_limiter` using separate shared-database namespaces.
+  - `backend/app/api/permission_requests.py`: reserves a permission-request attempt before document lookup, returns `429`/`503` with `Retry-After`, and appends an aggregated `permission_request.rate_limited` denial event.
+  - `backend/app/api/notifications.py`: mark-one-read appends `notification.read` only when an unread row changes; read-all appends `notification.read_all` with `details.updated` only when at least one row changes.
+  - `backend/app/api/documents.py`: enforces the export limiter after authorization, queries at most `max_rows + 1` events, returns `413` for oversized exports, and appends `audit.activity_export` with `reason=export_row_limit_exceeded` or an aggregated `audit.activity_export_rate_limited` denial.
+  - Tests: OTP digest-length/digest-difference/verification assertions; email-body code extraction; permission 429, export 413, export 429, and seeded-bucket denial-audit tests; notification read/read-all audit assertions.
+  - Documentation: refreshed `THREATS.md` TV-07/TV-24, `README.md` feature/config/limitations text, `docs/API.md` status codes and endpoint behavior, `docs/ARCHITECTURE.md` storage/limits/audit actions, and `.env.example`.
+- **Issues Discovered and Corrections Made**:
+  - A plain hash would not resist offline brute force of a six-digit code. HMAC-SHA256 with `SECRET_KEY` was used instead; the tradeoff is that compromise of both the database and application secret permits offline enumeration. Rotating the secret invalidates all outstanding codes.
+  - The OTP migration had to preserve the existing schema contract while invalidating legacy values. It scrubs to a fixed 64-character sentinel and sets `is_used = TRUE`; downgrade similarly invalidates rows before shrinking the column.
+  - The new migration was tested on a scratch SQLite database through upgrade, downgrade, insertion of a legacy plaintext row, and re-upgrade. The legacy row became `0000...0000` with `is_used = 1`, confirming the scrub path.
+  - Local migration drift was real: the permission-request table existed without the indexes added to the already-applied revision. The reconciliation migration repaired the local indexes; the local database is now at `a8b9c0d1e2f3`. PostgreSQL timezone conversion is conditional on the actual column type so a fresh or already-correct database is not shifted twice.
+  - The permission limiter reserves before document lookup, so invalid document IDs also consume an attempt; this favors abuse resistance over minimal counting. The export limiter runs after authorization, so unauthorized callers do not consume export capacity.
+  - The test `db_session` uses `join_transaction_mode="rollback_only"`. A real-limiter denial rolls back the transaction and can erase the seeded bucket/audit rows, so the denial-audit tests seed the bucket and monkeypatch `reserve()` to return a denied decision while leaving the transaction intact. The real-limiter tests separately verify the actual `429` behavior.
+  - The export query uses `limit(max_rows + 1)` so the endpoint can distinguish an exactly-full export from an oversized one without loading the full result set.
+  - Full `pytest -W error` still cannot collect `backend/tests/test_frontend_serving.py` because the environment lacks `httpx2` and Starlette emits a deprecation warning for `httpx`. The suite was run with that module excluded; this remains an environment/tooling gap, not an application failure.
+- **What was Changed and How Verified**:
+  - `.venv\Scripts\python.exe -m pytest backend/tests/test_otp_reset.py backend/tests/test_password_reset_email.py backend/tests/test_notifications.py backend/tests/test_permission_requests_and_export.py -q -W error`: 18 passed.
+  - `.venv\Scripts\python.exe -m pytest backend/tests/ -q`: 483 passed, 24 skipped, 1 Starlette deprecation warning.
+  - `.venv\Scripts\python.exe -m pytest backend/tests/ -q -W error --ignore=backend/tests/test_frontend_serving.py`: 482 passed, 24 skipped.
+  - `npm run test`: 180 passed across 17 files. `npm run typecheck` and `npm run lint`: clean.
+  - Alembic scratch SQLite upgrade to head, downgrade to `d5e6f7a8b9c0`, legacy-row insert, and re-upgrade: passed with the scrub verified. Local `alembic upgrade head`: `a8b9c0d1e2f3 (head)`.
+  - Scoped Ruff `F401,F841,I001` checks on touched Python files: passed. Full-project Ruff reports 107 existing-style findings (75 `B008`, 12 `I001`, 6 `SIM117`, 4 `BLE001`, and one-off rules); no new unused-import/unused-variable/import-order findings were introduced in the touched files.
+  - `git diff --check`: run after this entry is written; expected only CRLF conversion notices.
+- **Git Status**: All Day 10 code, migrations, tests, and documentation remain **uncommitted and unpushed**. No commit, amend, push, or remote change was performed. The local SQLite database was migrated to the new head; no production database, live SMTP provider, or deployment was exercised.

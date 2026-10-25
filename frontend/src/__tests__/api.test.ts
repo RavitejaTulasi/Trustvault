@@ -10,13 +10,16 @@ import {
   NetworkError,
   apiFetch,
   changePassword,
+  confirmPasswordReset,
   getCookie,
   getDemoAccounts,
   getMe,
   login,
   logout,
   register,
+  requestPasswordReset,
   updateMe,
+  verifyPasswordResetOtp,
 } from '../api';
 import type { UserResponse } from '../types';
 
@@ -252,6 +255,46 @@ describe('register / updateMe', () => {
       JSON.stringify({
         current_password: 'Temporary!Pass1',
         new_password: 'Changed!Pass2',
+      }),
+    );
+  });
+
+  it('drives the OTP reset flow through request, verify, and confirm', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse(200, { message: 'If an account exists, a code has been sent.' }),
+      )
+      .mockResolvedValueOnce(jsonResponse(200, { valid: true }))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { message: 'Password successfully reset.' }),
+      );
+
+    const sent = await requestPasswordReset('ada@example.com');
+    await verifyPasswordResetOtp('ada@example.com', '123456');
+    const confirmed = await confirmPasswordReset(
+      'ada@example.com',
+      '123456',
+      'New!SecurePass99',
+    );
+
+    expect(sent).toContain('code has been sent');
+    expect(confirmed).toContain('successfully reset');
+
+    const calls = fetchMock.mock.calls as [string, RequestInit][];
+    expect(calls.map(([url]) => url)).toEqual([
+      '/api/v1/auth/request-reset',
+      '/api/v1/auth/verify-otp',
+      '/api/v1/auth/confirm-reset',
+    ]);
+    expect(calls[0][1].body).toBe(JSON.stringify({ email: 'ada@example.com' }));
+    expect(calls[1][1].body).toBe(
+      JSON.stringify({ email: 'ada@example.com', otp_code: '123456' }),
+    );
+    expect(calls[2][1].body).toBe(
+      JSON.stringify({
+        email: 'ada@example.com',
+        otp_code: '123456',
+        new_password: 'New!SecurePass99',
       }),
     );
   });

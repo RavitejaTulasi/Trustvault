@@ -494,7 +494,7 @@ function DocumentRowGroup({
                           <KeyIcon width={16} height={16} />
                         </span>
                         <div className="grant-copy">
-                          <p className="grant-user">{grant.user_id}</p>
+                          <p className="grant-user">{grant.user_email || grant.user_id}</p>
                           <p className="grant-meta">
                             {grant.is_revoked
                               ? 'Revoked grant'

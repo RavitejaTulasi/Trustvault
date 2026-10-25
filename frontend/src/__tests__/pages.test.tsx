@@ -78,6 +78,7 @@ describe('LoginPage (component)', () => {
     renderLoginRoutes('/login');
     expect(screen.getByLabelText('Email')).toBeInTheDocument();
     expect(screen.getByLabelText('Password')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Forgot password?' })).toBeInTheDocument();
   });
 
   it('submits credentials and navigates to the dashboard on success', async () => {

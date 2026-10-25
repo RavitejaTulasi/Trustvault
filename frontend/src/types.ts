@@ -11,7 +11,6 @@ export interface UserResponse {
 
 export interface UserUpdateRequest {
   full_name?: string;
-  password?: string;
 }
 
 export interface AdminUserCreateRequest {
@@ -52,6 +51,20 @@ export interface DemoAccount {
   password: string;
 }
 
+export interface NotificationResponse {
+  id: string;
+  title: string;
+  message: string;
+  link: string | null;
+  is_read: boolean;
+  created_at: string;
+}
+
+export interface NotificationListResponse {
+  notifications: NotificationResponse[];
+  unread_count: number;
+}
+
 export type EffectivePermission = 'owner' | 'edit' | 'read';
 
 export interface DocumentResponse {
@@ -87,6 +100,7 @@ export interface GrantResponse {
   id: string;
   document_id: string;
   user_id: string;
+  user_email?: string | null;
   permission: 'read' | 'edit';
   granted_by_id: string | null;
   is_revoked: boolean;
@@ -151,6 +165,7 @@ export interface AuditEventResponse {
   sequence_number: number;
   timestamp: string;
   actor_id: string | null;
+  actor_email?: string | null;
   action: string;
   resource_type: string | null;
   resource_id: string | null;
@@ -222,4 +237,18 @@ export interface AuditCheckpointVerificationResponse {
   chain_head_sequence: number | null;
   failure_reason: string | null;
   anchor_mode: string;
+}
+
+export type PermissionRequestStatus = 'pending' | 'approved' | 'rejected' | 'canceled';
+
+export interface PermissionRequestResponse {
+  id: number;
+  requester_id: string;
+  document_id: string;
+  requested_role: string;
+  status: PermissionRequestStatus;
+  created_at: string;
+  updated_at: string;
+  requester_email?: string | null;
+  document_title?: string | null;
 }

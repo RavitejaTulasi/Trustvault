@@ -17,11 +17,11 @@ from storage3.exceptions import StorageApiError
 from backend.app.config import settings
 from backend.app.database import Base, get_db
 from backend.app.main import app
-from backend.app.models.document import Document, DocumentVersion
 from backend.app.models.audit import AuditEvent
 from backend.app.models.base import generate_uuid
-from backend.app.models.storage_operation import StorageOperation
+from backend.app.models.document import Document, DocumentVersion
 from backend.app.models.storage_object import StorageObject
+from backend.app.models.storage_operation import StorageOperation
 from backend.app.models.user import UserRole
 from backend.app.services import storage_recovery
 from backend.app.services.storage_recovery import (
@@ -32,17 +32,17 @@ from backend.app.services.storage_recovery import (
     NEEDS_REVIEW,
     RETRY_WAIT,
     UPLOAD_COMMITTED,
-    UPLOAD_UNCERTAIN,
     UPLOAD_IN_PROGRESS,
+    UPLOAD_UNCERTAIN,
     StorageRecoveryService,
 )
 from backend.app.services.storage_service import StagedUpload, StorageService
-from backend.tests.test_auth import VALID_PASSWORD, make_user
-from backend.tests.test_supabase_storage import _install_mock_bucket
 from backend.tests.conftest import (
     _inject_csrf_header_hook,
     _inject_upload_idempotency_header_hook,
 )
+from backend.tests.test_auth import VALID_PASSWORD, make_user
+from backend.tests.test_supabase_storage import _install_mock_bucket
 
 
 @contextmanager
@@ -634,7 +634,7 @@ async def test_upload_commit_failure_leaves_durable_recovery_intent(
     monkeypatch.setattr(Session, "commit", fail_commit_after_upload)
     async with _isolated_client(tmp_path) as (client, factory):
         with factory() as db:
-            owner = make_user(
+            make_user(
                 db,
                 email="upload-commit-failure@example.com",
                 password=VALID_PASSWORD,

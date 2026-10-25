@@ -24,6 +24,12 @@ vi.mock('../auth', () => ({
   resolveGrantRecipient: vi.fn(),
   createGrant: vi.fn(),
   revokeGrant: vi.fn(),
+  createPermissionRequest: vi.fn(),
+  exportDocumentActivity: vi.fn(),
+  getDocumentActivity: vi.fn(),
+  getPermissionRequestStatus: vi.fn(),
+  listPendingPermissionRequests: vi.fn(),
+  updatePermissionRequestStatus: vi.fn(),
 }));
 
 import * as auth from '../auth';
@@ -38,6 +44,9 @@ const mockListGrants = vi.mocked(auth.listGrants);
 const mockResolveGrantRecipient = vi.mocked(auth.resolveGrantRecipient);
 const mockCreateGrant = vi.mocked(auth.createGrant);
 const mockRevokeGrant = vi.mocked(auth.revokeGrant);
+const mockExportDocumentActivity = vi.mocked(auth.exportDocumentActivity);
+const mockGetDocumentActivity = vi.mocked(auth.getDocumentActivity);
+const mockGetPermissionRequestStatus = vi.mocked(auth.getPermissionRequestStatus);
 
 const OWNER: UserResponse = {
   id: 'usr_1',
@@ -617,6 +626,34 @@ describe('DocumentDetail page (component)', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'No active grant for that recipient',
+    );
+  });
+
+  it('lets owners export activity without requesting permission', async () => {
+    const user = userEvent.setup();
+    mockGetMe.mockResolvedValue(OWNER);
+    mockGetDocument.mockResolvedValue(DOC_A);
+    mockListGrants.mockResolvedValue({ grants: [] });
+    mockGetDocumentActivity.mockResolvedValue({
+      events: [],
+      total: 0,
+      page: 1,
+      page_size: 10,
+    });
+    mockExportDocumentActivity.mockResolvedValue(undefined);
+
+    renderDetail();
+    await user.click(await screen.findByRole('tab', { name: 'Activity' }));
+
+    expect(await screen.findByRole('button', { name: 'Export CSV' })).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Request Download Permission' }),
+    ).not.toBeInTheDocument();
+    expect(mockGetPermissionRequestStatus).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: 'Export CSV' }));
+    await waitFor(() =>
+      expect(mockExportDocumentActivity).toHaveBeenCalledWith('doc_1', 'csv'),
     );
   });
 

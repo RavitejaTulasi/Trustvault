@@ -1,6 +1,9 @@
 import {
   register as apiRegister,
   changePassword as apiChangePassword,
+  requestPasswordReset as apiRequestPasswordReset,
+  verifyPasswordResetOtp as apiVerifyPasswordResetOtp,
+  confirmPasswordReset as apiConfirmPasswordReset,
   updateMe as apiUpdateMe,
   login as apiLogin,
   getDemoAccounts as apiGetDemoAccounts,
@@ -16,8 +19,15 @@ import {
   resolveGrantRecipient as apiResolveGrantRecipient,
   createGrant as apiCreateGrant,
   revokeGrant as apiRevokeGrant,
+  getPermissionRequestStatus as apiGetPermissionRequestStatus,
+  createPermissionRequest as apiCreatePermissionRequest,
+  listPendingPermissionRequests as apiListPendingPermissionRequests,
+  updatePermissionRequestStatus as apiUpdatePermissionRequestStatus,
+  getDocumentActivity as apiGetDocumentActivity,
+  exportDocumentActivity as apiExportDocumentActivity,
 } from './api';
 import type {
+  AuditEventListResponse,
   DemoAccount,
   DocumentListParams,
   DocumentListResponse,
@@ -26,6 +36,7 @@ import type {
   GrantListResponse,
   GrantRecipientLookupResponse,
   GrantResponse,
+  PermissionRequestResponse,
   UserResponse,
   UserUpdateRequest,
 } from './types';
@@ -47,6 +58,25 @@ export async function changePassword(
   newPassword: string,
 ): Promise<UserResponse> {
   return apiChangePassword(currentPassword, newPassword);
+}
+
+export async function requestPasswordReset(email: string): Promise<string> {
+  return apiRequestPasswordReset(email);
+}
+
+export async function verifyPasswordResetOtp(
+  email: string,
+  otpCode: string,
+): Promise<void> {
+  return apiVerifyPasswordResetOtp(email, otpCode);
+}
+
+export async function confirmPasswordReset(
+  email: string,
+  otpCode: string,
+  newPassword: string,
+): Promise<string> {
+  return apiConfirmPasswordReset(email, otpCode, newPassword);
 }
 
 export async function login(email: string, password: string): Promise<UserResponse> {
@@ -120,4 +150,45 @@ export async function createGrant(
 
 export async function revokeGrant(id: string, userId: string): Promise<void> {
   return apiRevokeGrant(id, userId);
+}
+
+export async function getPermissionRequestStatus(
+  documentId: string,
+): Promise<PermissionRequestResponse | null> {
+  return apiGetPermissionRequestStatus(documentId);
+}
+
+export async function createPermissionRequest(
+  documentId: string,
+  requestedRole: string = 'download_activity',
+): Promise<PermissionRequestResponse> {
+  return apiCreatePermissionRequest(documentId, requestedRole);
+}
+
+export async function listPendingPermissionRequests(
+  documentId?: string,
+): Promise<PermissionRequestResponse[]> {
+  return apiListPendingPermissionRequests(documentId);
+}
+
+export async function updatePermissionRequestStatus(
+  requestId: number,
+  status: 'approved' | 'rejected' | 'canceled',
+): Promise<PermissionRequestResponse> {
+  return apiUpdatePermissionRequestStatus(requestId, status);
+}
+
+export async function getDocumentActivity(
+  documentId: string,
+  page: number = 1,
+  pageSize: number = 25,
+): Promise<AuditEventListResponse> {
+  return apiGetDocumentActivity(documentId, page, pageSize);
+}
+
+export async function exportDocumentActivity(
+  documentId: string,
+  format: 'csv' | 'excel' = 'csv',
+): Promise<void> {
+  return apiExportDocumentActivity(documentId, format);
 }

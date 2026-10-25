@@ -737,7 +737,7 @@ export default function Activity() {
                     <td>
                       <span className="cell-title-link">{event.action}</span>
                     </td>
-                    <td className="hide-sm mono">{shortId(event.actor_id)}</td>
+                    <td className="hide-sm mono">{event.actor_email || shortId(event.actor_id)}</td>
                     <td className="hide-sm">
                       <div className="cell-title">
                         <span className="cell-sub">

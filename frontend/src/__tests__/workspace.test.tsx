@@ -28,6 +28,7 @@ vi.mock('../auth', () => ({
   logout: vi.fn(),
   register: vi.fn(),
   updateMe: vi.fn(),
+  changePassword: vi.fn(),
   listDocuments: vi.fn(),
   listGrants: vi.fn(),
   revokeGrant: vi.fn(),
@@ -54,6 +55,7 @@ import * as api from '../api';
 const mockGetMe = vi.mocked(auth.getMe);
 const mockRegister = vi.mocked(auth.register);
 const mockUpdateMe = vi.mocked(auth.updateMe);
+const mockChangePassword = vi.mocked(auth.changePassword);
 const mockListDocuments = vi.mocked(auth.listDocuments);
 const mockListAuditEvents = vi.mocked(api.listAuditEvents);
 const mockListDocumentActivity = vi.mocked(api.listDocumentActivity);
@@ -299,10 +301,10 @@ describe('Settings (component)', () => {
     expect(await screen.findByText('Profile updated.')).toBeInTheDocument();
   }, 15000);
 
-  it('explains that a password change revokes every session', async () => {
+  it('requires the current password before replacing it', async () => {
     const user = userEvent.setup();
     mockGetMe.mockResolvedValue(OWNER);
-    mockUpdateMe.mockResolvedValue(OWNER);
+    mockChangePassword.mockResolvedValue(OWNER);
 
     renderRoute('/settings', <Settings />);
 
@@ -311,13 +313,16 @@ describe('Settings (component)', () => {
     expect(screen.getByRole('heading', { name: 'Security' })).toBeInTheDocument();
     expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
 
-    await user.type(await screen.findByLabelText('New password'), 'NewSecurePass1!');
+    await user.type(await screen.findByLabelText('Current password'), 'OldSecurePass1!');
+    await user.type(screen.getByLabelText('New password'), 'NewSecurePass1!');
     await user.type(screen.getByLabelText('Confirm new password'), 'NewSecurePass1!');
     await user.click(screen.getByRole('button', { name: 'Change password' }));
 
-    expect(mockUpdateMe).toHaveBeenCalledWith({ password: 'NewSecurePass1!' });
+    expect(mockChangePassword).toHaveBeenCalledWith('OldSecurePass1!', 'NewSecurePass1!');
+    expect(mockUpdateMe).not.toHaveBeenCalled();
     expect(await screen.findByText('Password updated')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'Go to sign in' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Back to overview' })).toBeInTheDocument();
+    expect(screen.getByText(/This session stays active/)).toBeInTheDocument();
     expect(screen.getByText(/managed by the deployment environment/)).toBeInTheDocument();
   }, 15000);
 });

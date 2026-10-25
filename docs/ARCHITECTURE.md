@@ -49,10 +49,18 @@ TrustVault enforces three distinct roles, with fine-grained document-level permi
 | **Revoke Access (`DELETE /documents/{id}/permissions/{user_id}`)** | Own only | **Yes** (Owner only) | No (404 Deliberate) | No (404 Deliberate) | No (401/404 Deliberate) |
 | **View Document Permissions (`GET /documents/{id}/permissions`)** | Own only | **Yes** (Owner only) | No (404 Deliberate) | No (404 Deliberate) | No (401/404 Deliberate) |
 | **Search/Filter Documents (`GET /documents?q=...`)** | Own/granted only | **Yes** (own docs) | **Yes** (granted docs) | **Yes** (granted docs) | No (401 Unauthorized) |
+| **Self-Service Password Reset (`POST /auth/request-reset`, `verify-otp`, `confirm-reset`)** | Yes (public, rate-limited) | Yes (public, rate-limited) | Yes (public, rate-limited) | Yes (public, rate-limited) | Yes (public, rate-limited; generic responses) |
+| **In-App Notifications (`GET /notifications`, mark read)** | Own only, audited writes | Own only, audited writes | Own only, audited writes | Own only, audited writes | No (401 Unauthorized) |
+| **Create Permission Request (`POST /permission-requests`)** | **Yes** (existing docs, rate-limited) | **Yes** (existing docs, rate-limited) | **Yes** (existing docs, rate-limited) | **Yes** (existing docs, rate-limited) | No (401 Unauthorized) |
+| **Review Permission Requests (`GET /permission-requests/pending`, `PATCH /{id}`)** | **Yes** | No (403 Forbidden) | No (403 Forbidden) | No (403 Forbidden) | No (401 Unauthorized) |
+| **View Document Activity (`GET /documents/{id}/activity`)** | **Yes** (read-only; redacted for non-admins) | **Yes** | **Yes** (granted docs) | **Yes** (granted docs) | No (401/404 Deliberate) |
+| **Export Document Activity (`GET /documents/{id}/activity/export`)** | **Yes** (sees IP) | **Yes** | Only with approved `download_activity`/`export_activity` request | Only with approved `download_activity`/`export_activity` request | No (401/404 Deliberate) |
 
 Search, category, owner, and created-date filters are AND-combined and are applied only after the ownership/active-grant visibility condition. A filter can narrow the result set but cannot widen document access. Each list item includes a server-derived `effective_permission` of `owner`, `edit`, or `read`; revoked grants do not confer access or permission.
 
-**Note on Administrative Access**: If an administrator needs access to a document for legal discovery, an explicitly logged owner grant is currently required. A dedicated administrative delegation/reassignment workflow is not implemented in the current build. Administrators cannot silently browse or download user documents through the admin role.
+Permission-request approval is an export-workflow decision only: it does not create a `DocumentGrant`, does not change `effective_permission`, and does not grant document metadata, read, or download access. A non-owner reader still needs an existing read/edit grant to reach the activity export route, plus an approved request to receive the export.
+
+**Note on Administrative Access**: If an administrator needs access to a document for legal discovery, an explicitly logged owner grant is currently required. A dedicated administrative delegation/reassignment workflow is not implemented in the current build. Administrators cannot silently browse or download user documents through the admin role. Administrators may view and export audit-derived document activity for an existing document, but those routes do not return document bytes or metadata values.
 
 ### Sharing and Revocation Semantics
 
@@ -96,10 +104,11 @@ Concurrent grant requests with no intervening revocation remain last-writer-wins
 |                  Database Layer (SQLAlchemy 2.0 + Alembic)              |
 |                      Managed PostgreSQL / psycopg 3                     |
 |  - users, sessions, documents, document_versions, document_grants        |
+|  - password_reset_otps, notifications, permission_requests               |
 |  - storage_objects (global key owner + lifecycle state)                  |
 |  - upload_requests (durable idempotency result)                           |
 |  - audit_chain_state (serialized append sequence and chain head)        |
-|  - login_rate_limit_buckets (shared, expiring login counters)           |
+|  - login_rate_limit_buckets (shared, expiring auth/workflow/export counters) |
 |  - storage_quota_state (serialized upload admission)                    |
 |  - Versioned SHA-256 hash chain; actor identity locked by RESTRICT      |
 +-------------------------------------------------------------------------+
@@ -128,6 +137,24 @@ Upload admission updates the singleton `storage_quota_state` row at the start of
 A pure-ASGI middleware enforces request-body limits before multipart/JSON parsing. Declared `Content-Length` values above `MAX_FILE_SIZE_BYTES + MAX_MULTIPART_OVERHEAD_BYTES` for multipart requests, or above `MAX_JSON_BODY_BYTES` for other requests, are rejected immediately. Bodies without a trusted length are counted as they stream. Request IDs, user agents, client IPs, filenames, and MIME types are validated against their database column bounds before persistence; overlong values are rejected rather than truncated.
 
 The online audit hash chain is retained indefinitely because checkpoint and chain verification require it. `AUDIT_RETENTION_DAYS` is an objective for independently held archive copies, not an online-deletion schedule, and `AUDIT_RETENTION_AUTO_DELETE=true` is rejected at startup.
+
+### Self-Service Password Reset
+
+`POST /auth/request-reset` is public and returns the same generic message whether or not the address exists. For an active account it invalidates earlier unused codes, creates a six-digit OTP valid for 15 minutes, stores only its keyed HMAC-SHA256 digest, commits the OTP and request audit event, then delivers the code by SMTP (or logs it in development/testing). A delivery failure marks the OTP used and records a `FAILURE` audit event without changing the public response.
+
+`verify-otp` and `confirm-reset` share a database-backed fixed-window limiter (10 attempts per 15 minutes per IP and per IP+email). Each OTP has a five-attempt ceiling. Confirmation consumes the OTP with a conditional `UPDATE ... WHERE is_used = false AND expires_at > now`, so concurrent or repeated confirmations cannot both reset the password. A successful reset revokes every existing session and records `auth.password_reset_confirm` with the number of sessions revoked. OTP codes are stored as keyed HMAC-SHA256 digests and compared in constant time; database-read compromise cannot recover a code without `SECRET_KEY`. The migration invalidates legacy plaintext rows, and rotating `SECRET_KEY` invalidates all outstanding reset codes.
+
+### Notifications and Permission Requests
+
+`notifications` rows are addressed to one user and every read/mutation route is scoped by `user_id`. Creating a permission request notifies active administrators (excluding the requester); an administrator decision notifies the requester. Mark-one-read and read-all operations append `notification.read`/`notification.read_all` only when a row changes state. Permission-request creation is limited to 20 attempts per hour per IP and per requester; denials append an aggregated `permission_request.rate_limited` event.
+
+`permission_requests` records the requester, document, requested role, status (`pending`, `approved`, `rejected`, `canceled`), and timestamps. Requesters see their own status without private document/title metadata; administrators see requester email and document title in the pending/review views. Status changes are restricted to non-pending transitions, notify the requester, and append an audit event. The workflow authorizes activity export only; it is not a general access-grant mechanism.
+
+### Document Activity and Export
+
+`GET /documents/{id}/activity` returns paginated document and grant audit events to administrators, the owner, or a caller with an active read/edit grant. Non-administrators receive `null` IP address, user agent, and request ID; audit `details` remain default-deny redacted. The route sets no-store cache headers but does not itself append a read-audit event.
+
+`GET /documents/{id}/activity/export` requires the same read authorization plus, for a non-owner reader, an approved `download_activity` or `export_activity` permission request. It is limited to 20 attempts per hour per IP and per user, caps results at `DOCUMENT_ACTIVITY_EXPORT_MAX_ROWS` (default 10,000), excludes audit `details`, blanks the IP column for non-administrators, prefixes spreadsheet formula characters, and sets no-store cache headers. Success and permission denials append `audit.activity_export`; a row-cap denial uses `details.reason = export_row_limit_exceeded`, while rate-limit denials append an aggregated `audit.activity_export_rate_limited`.
 
 ---
 
@@ -223,18 +250,22 @@ Each successful administrative read appends its own audit event with `resource_t
 ### Recorded Audit Actions
 The current build records the following events:
 
-- Authentication and self-service: `user.register`, `user.login`, `user.login_failed`, `user.login_rate_limited`, `user.logout`, `user.update`.
+- Authentication and self-service: `user.register`, `user.login`, `user.login_failed`, `user.login_rate_limited`, `user.logout`, `user.update`, `auth.password_reset_request`, `auth.password_reset_delivery`, `auth.password_reset_rate_limited`, `auth.otp_verify_rate_limited`, `auth.password_reset_confirm`.
 - Administrative user management: `user.role_change`, `user.deactivate`, `user.reactivate`, `user.sessions_revoked`.
 - Administrative audit inspection and anchoring: `audit.read`, `audit.verify`, `audit.activity_read`, `audit.checkpoint_read`, `audit.checkpoint_verify`, `audit.checkpoint_created`, `audit.checkpoint_scheduled`.
 - Documents: `document.upload`, `document.read`, `document.download`, `document.edit`, `document.delete`, including success and authorization-denial outcomes. Rejected uploads are recorded as `document.upload` with `DENIED` and an allowlisted `details.reason` (`insufficient_role`, `missing_filename`, `invalid_upload`, or `size_limit_exceeded`).
-- Sharing: `permission.grant`, `permission.revoke`, and `permission.list_denied`.
+- Sharing and workflow: `permission.grant`, `permission.revoke`, `permission.list_denied`, `permission_request.create`, `permission_request.update_status`, `permission_request.rate_limited`, `notification.read`, `notification.read_all`, `audit.activity_export` (success or denial), and `audit.activity_export_rate_limited`.
 
 ### Known Coverage Gaps
 The following operations are not currently recorded as audit events:
 
 - Document list/search/read-metadata enumeration through `GET /documents`.
 - Successful `GET /documents/{id}/permissions` reads (denied attempts are recorded as `permission.list_denied`).
-- Administrative user-list/profile reads.
+- Administrative user-list/profile reads and role-count reads.
+- Notification list reads (mark-one-read and mark-all-read are audited).
+- Permission-request status reads and pending-list reads.
+- The document-scoped `GET /documents/{id}/activity` read (the administrative activity read is audited as `audit.activity_read`).
+- Successful `verify-otp` calls and failed OTP validation attempts; only rate-limit denials are audited.
 - Request-validation failures that occur before an audit call (for example, malformed multipart uploads or invalid pagination parameters); a syntactically valid but rejected upload is audited as described above.
 
 These gaps mean the architecture does not claim that every read or every administrative query is audited. State-changing administrative actions and the document access paths listed above are audited; expanding read coverage would require a separate, explicit event-volume and privacy decision.

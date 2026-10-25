@@ -72,6 +72,7 @@ class LoginRateLimiter:
         window_seconds: int | None = None,
         max_buckets: int | None = None,
         time_func: Callable[[], float] = time.time,
+        namespace: str = "",
     ):
         self.max_attempts = (
             max_attempts if max_attempts is not None else settings.LOGIN_RATE_LIMIT_MAX_ATTEMPTS
@@ -83,6 +84,7 @@ class LoginRateLimiter:
             max_buckets if max_buckets is not None else settings.LOGIN_RATE_LIMIT_MAX_BUCKETS
         )
         self.time_func = time_func
+        self.namespace = namespace.strip()
 
     @staticmethod
     def _normalize_ip(ip: str) -> str:
@@ -96,9 +98,9 @@ class LoginRateLimiter:
     def _normalize_email(email: str) -> str:
         return (email or "").strip().lower() or "unknown"
 
-    @staticmethod
-    def _key_hash(scope: str, value: str) -> str:
-        return hashlib.sha256(f"{scope}:{value}".encode()).hexdigest()
+    def _key_hash(self, scope: str, value: str) -> str:
+        prefix = f"{self.namespace}:" if self.namespace else ""
+        return hashlib.sha256(f"{prefix}{scope}:{value}".encode()).hexdigest()
 
     def _build_keys(self, ip: str, email: str) -> list[tuple[str, str]]:
         normalized_ip = self._normalize_ip(ip)
@@ -447,6 +449,32 @@ class SlidingWindowRateLimiter:
 
 # Global singleton instance for app-wide shared login rate limiting
 login_rate_limiter = LoginRateLimiter()
+
+# Shared OTP limiters use separate namespaces so password reset traffic cannot
+# consume or reset login buckets (and vice versa).
+otp_request_rate_limiter = LoginRateLimiter(
+    max_attempts=settings.OTP_REQUEST_RATE_LIMIT_MAX_ATTEMPTS,
+    window_seconds=settings.OTP_REQUEST_RATE_LIMIT_WINDOW_SECONDS,
+    namespace="otp_request",
+)
+otp_verify_rate_limiter = LoginRateLimiter(
+    max_attempts=settings.OTP_VERIFY_RATE_LIMIT_MAX_ATTEMPTS,
+    window_seconds=settings.OTP_VERIFY_RATE_LIMIT_WINDOW_SECONDS,
+    namespace="otp_verify",
+)
+
+# Workflow limiters are namespaced separately so permission-request and export
+# traffic cannot consume login or OTP buckets.
+permission_request_rate_limiter = LoginRateLimiter(
+    max_attempts=settings.PERMISSION_REQUEST_RATE_LIMIT_MAX_ATTEMPTS,
+    window_seconds=settings.PERMISSION_REQUEST_RATE_LIMIT_WINDOW_SECONDS,
+    namespace="permission_request_create",
+)
+activity_export_rate_limiter = LoginRateLimiter(
+    max_attempts=settings.ACTIVITY_EXPORT_RATE_LIMIT_MAX_ATTEMPTS,
+    window_seconds=settings.ACTIVITY_EXPORT_RATE_LIMIT_WINDOW_SECONDS,
+    namespace="activity_export",
+)
 
 # Process-local limiter for expensive administrative audit verification requests
 audit_verification_rate_limiter = SlidingWindowRateLimiter(

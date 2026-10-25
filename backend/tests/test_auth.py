@@ -22,7 +22,6 @@ from backend.app.models.audit import AuditEvent, AuditOutcome
 from backend.app.models.user import User, UserRole
 from backend.app.security.passwords import hash_password
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper fixtures
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,25 +289,33 @@ async def test_update_me_full_name(async_client: AsyncClient, db_session: Sessio
 
 
 @pytest.mark.asyncio
-async def test_update_me_password_revokes_sessions(async_client: AsyncClient, db_session: Session):
-    """Changing password invalidates old sessions."""
+async def test_update_me_rejects_password_changes(async_client: AsyncClient, db_session: Session):
+    """The profile endpoint must not allow changing a password without the current one."""
     make_user(db_session, email="changepw@example.com", password=VALID_PASSWORD)
     db_session.commit()
 
-    # Login to get session A
-    login_a = await async_client.post(
+    login_resp = await async_client.post(
         "/api/v1/auth/login",
         json={"email": "changepw@example.com", "password": VALID_PASSWORD},
     )
-    assert login_a.status_code == 200
+    assert login_resp.status_code == 200
 
     new_password = "NewStr0ng!Pass#99"
     resp = await async_client.patch("/api/v1/auth/me", json={"password": new_password})
-    assert resp.status_code == 200
+    assert resp.status_code == 422
 
-    # The old session cookie was revoked — /me should fail
-    me_resp = await async_client.get("/api/v1/auth/me")
-    assert me_resp.status_code == 401
+    # The old password is still valid and the rejected replacement is not.
+    old_login = await async_client.post(
+        "/api/v1/auth/login",
+        json={"email": "changepw@example.com", "password": VALID_PASSWORD},
+    )
+    assert old_login.status_code == 200
+
+    new_login = await async_client.post(
+        "/api/v1/auth/login",
+        json={"email": "changepw@example.com", "password": new_password},
+    )
+    assert new_login.status_code == 401
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,7 +355,7 @@ async def test_admin_list_users_requires_admin_owner(async_client: AsyncClient, 
 @pytest.mark.asyncio
 async def test_admin_list_users_success(async_client: AsyncClient, db_session: Session):
     """Admin user can list all users."""
-    admin = make_user(db_session, email="admin@example.com", password=VALID_PASSWORD, role=UserRole.ADMIN)
+    make_user(db_session, email="admin@example.com", password=VALID_PASSWORD, role=UserRole.ADMIN)
     make_user(db_session, email="user1@example.com", password=VALID_PASSWORD)
     db_session.commit()
 

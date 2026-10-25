@@ -12,14 +12,14 @@ This document details the complete API contract for TrustVault, including authen
 - `204 No Content`: Resource successfully deleted or updated without body response.
 - `400 Bad Request`: Validation failure, invalid payload, or malformed parameter.
 - `401 Unauthorized`: Authentication required or invalid/expired session cookie.
-- `403 Forbidden`: Authenticated identity lacks the required platform role (for example, an admin-only endpoint).
+- `403 Forbidden`: Authenticated identity lacks the required platform role (for example, an admin-only endpoint) or, for activity export, a non-owner reader lacks an approved export request.
 - `404 Not Found`: Deliberate 404 returned for inaccessible or non-existent documents to prevent existence discovery, or a non-existent endpoint/resource.
-- `409 Conflict`: The audit chain could not be anchored because it is invalid or incompletely verified, or the stored checkpoint rejected a rollback or conflicting write; also returned for upload count limits and idempotency-key conflicts or requests that are still processing.
-- `413 Payload Too Large`: Request body or upload exceeds its configured limit, or an upload would exceed per-user or platform storage bytes.
+- `409 Conflict`: The audit chain could not be anchored because it is invalid or incompletely verified, or the stored checkpoint rejected a rollback or conflicting write; also returned for upload count limits and idempotency-key conflicts, requests that are still processing, and attempts to update a permission request that is no longer pending.
+- `413 Payload Too Large`: Request body or upload exceeds its configured limit, an upload would exceed per-user or platform storage bytes, or a document activity export exceeds `DOCUMENT_ACTIVITY_EXPORT_MAX_ROWS`.
 - `422 Unprocessable Entity`: Malformed query parameter, invalid filter value, or invalid date range.
-- `429 Too Many Requests`: Rate limit exceeded (e.g. login brute-force throttle).
+- `429 Too Many Requests`: Rate limit exceeded (login, password-reset request, OTP verification, permission-request creation, or activity export throttle).
 - `431 Request Header Fields Too Large`: A persisted user-agent value exceeds its bound or contains control characters.
-- `503 Service Unavailable`: Database or storage health failure, shared login rate-limit storage failure, or the configured checkpoint store is unavailable.
+- `503 Service Unavailable`: Database or storage health failure, shared rate-limit storage failure, or the configured checkpoint store is unavailable.
 
 ### Security Headers on Every Response
 - `X-Content-Type-Options: nosniff`
@@ -86,6 +86,54 @@ This document details the complete API contract for TrustVault, including authen
 ### `GET /api/v1/auth/me`
 - **Authentication**: Required
 - **Response `200 OK`**: Current user profile and assigned role.
+
+### `POST /api/v1/auth/request-reset`
+- **Authentication**: None (Public)
+- **CSRF**: Standard middleware rules apply. A request that carries the session or CSRF cookie must include `X-CSRF-Token`.
+- **Rate Limit**: 5 requests per 15 minutes per IP and per IP+email, using the shared database-backed limiter. Exceeding the limit returns `429 Too Many Requests` with `Retry-After`.
+- **Request Body**:
+  ```json
+  {
+    "email": "user@trustvault.local"
+  }
+  ```
+- **Action**: If an active account exists, invalidates any earlier unused code, generates a six-digit OTP valid for 15 minutes, stores only its keyed HMAC-SHA256 digest, and sends the code by SMTP (or logs it only in development/testing). The response is deliberately identical for known and unknown addresses.
+- **Response `200 OK`**: `{"message": "If an account with this email exists, an OTP password reset code has been sent."}`
+- **Delivery Failure**: The OTP is marked used and `auth.password_reset_delivery` is recorded as `FAILURE` with `details.reason = email_delivery_failed`; the response remains the generic `200`.
+- **Audit Events**: `auth.password_reset_request` (`SUCCESS`), `auth.password_reset_delivery` (`FAILURE`), `auth.password_reset_rate_limited` (`DENIED`).
+
+### `POST /api/v1/auth/verify-otp`
+- **Authentication**: None (Public)
+- **CSRF**: Standard middleware rules apply.
+- **Rate Limit**: 10 requests per 15 minutes per IP and per IP+email. Exceeding the limit returns `429` with `Retry-After`.
+- **Request Body**:
+  ```json
+  {
+    "email": "user@trustvault.local",
+    "otp_code": "123456"
+  }
+  ```
+- **Response `200 OK`**: `{"valid": true}`
+- **Error**: `400 Bad Request` with `{"detail": "Invalid or expired OTP code"}` for an unknown, expired, consumed, or incorrect code. Each incorrect attempt increments the OTP attempt counter; the fifth failed attempt invalidates the code.
+- **Audit Events**: `auth.otp_verify_rate_limited` (`DENIED`) on rate-limit denial. OTP validation itself is not separately audited.
+
+### `POST /api/v1/auth/confirm-reset`
+- **Authentication**: None (Public)
+- **CSRF**: Standard middleware rules apply.
+- **Rate Limit**: Shares the 10-per-15-minute verify limiter per IP and per IP+email.
+- **Request Body**:
+  ```json
+  {
+    "email": "user@trustvault.local",
+    "otp_code": "123456",
+    "new_password": "NewSecurePassword123!"
+  }
+  ```
+- **Validation**: `new_password` is 12-128 characters and must include uppercase, lowercase, digit, and symbol characters.
+- **Action**: Atomically consumes the OTP, updates the password hash, clears `must_change_password`, and revokes all existing sessions for the account. A concurrent or repeated confirmation with the same code returns `400` instead of resetting the password twice.
+- **Response `200 OK`**: `{"message": "Password successfully reset. You can now log in with your new password."}`
+- **Error**: `400 Bad Request` for an invalid, expired, or already-consumed OTP, or an inactive account.
+- **Audit Event**: `auth.password_reset_confirm` (`SUCCESS`) with `details.sessions_revoked`.
 
 ---
 
@@ -182,6 +230,31 @@ This document details the complete API contract for TrustVault, including authen
 - **Response `204 No Content`**: Empty body; the document is soft-deleted and the physical file is removed. The soft-delete and audit event commit before unlink. If cleanup fails, the response remains `204` and startup reconciliation retries removal after the configured grace period.
 - **Audit Event**: `document.delete` (Outcome: SUCCESS or DENIED)
 
+### `GET /api/v1/documents/{id}/activity`
+- **Authentication**: Required
+- **Authorization Rule**: Administrators may read any existing document's activity. Other callers must be the owner or hold an active `read`/`edit` grant; unauthorized callers receive `404 Not Found`.
+- **Query Parameters**:
+  - `page`: integer, minimum 1 (default: 1).
+  - `page_size`: integer, 1-100 (default: 25).
+- **Action**: Returns document and document-grant audit events for the document, sorted by `sequence_number` descending.
+- **Response `200 OK`**: Paginated envelope `{events, total, page, page_size}` using the safe audit-event shape. `details` is default-deny redacted. For non-administrators, `ip_address`, `user_agent`, and `request_id` are `null`.
+- **Caching**: `Cache-Control: no-store, no-cache, must-revalidate`.
+- **Audit Note**: This document-scoped read does not append an `audit.activity_read` event; the administrative `GET /api/v1/admin/documents/activity` endpoint does.
+
+### `GET /api/v1/documents/{id}/activity/export`
+- **Authentication**: Required
+- **Authorization Rule**: Administrators and the document owner may export directly. A non-owner reader must also have an approved permission request for `download_activity` or `export_activity`; otherwise the request returns `403 Forbidden`. Callers without read access receive `404 Not Found`.
+- **Query Parameters**:
+  - `format`: `csv` (default) or `excel`.
+- **Rate Limit**: 20 requests per hour per IP and per authenticated user, using the shared database-backed limiter. Exceeding the limit returns `429 Too Many Requests` with `Retry-After`; limiter storage failure returns `503`.
+- **Row Limit**: At most `DOCUMENT_ACTIVITY_EXPORT_MAX_ROWS` (default 10,000) matching events are returned. A larger result set returns `413 Payload Too Large` and does not produce a file.
+- **Action**: Exports matching document and document-grant audit events up to the row limit. Columns are `Sequence`, `Timestamp`, `Action`, `Outcome`, `Actor Email`, `Resource Type`, `Resource ID`, and `IP Address`. Excel output is tab-delimited with a UTF-8 BOM for spreadsheet compatibility. Values beginning with spreadsheet formula characters are prefixed with an apostrophe.
+- **Redaction**: Non-administrator exports leave the `IP Address` column empty; administrator exports include it. Audit `details` are not included in the export.
+- **Response `200 OK`**: `text/csv` attachment, or `application/vnd.ms-excel` for `format=excel`. The filename is `trustvault-document-<id-prefix>-activity.csv`/`.xls`.
+- **Caching**: `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache`.
+- **Audit Events**: `audit.activity_export` (`SUCCESS`) with `details.format` and `details.export_type = document_activity`; denied export attempts are recorded with outcome `DENIED` and `details.reason = download_permission_required` or `export_row_limit_exceeded` (including `details.max_rows`). Rate-limit denials use `audit.activity_export_rate_limited` with `details.reason = rate_limit_exceeded` and are aggregated per bucket.
+- **Boundary**: The export does not grant document access, and the approval does not create or modify a `DocumentGrant`.
+
 ---
 
 ## 3. Permission & Sharing Endpoints
@@ -238,7 +311,92 @@ This document details the complete API contract for TrustVault, including authen
 
 ---
 
-## 4. Administration Endpoints
+## 4. Permission Request Endpoints
+
+Permission requests are an administrative workflow used to approve document-activity exports. Approval does **not** create a `DocumentGrant`, grant document read/download access, or change `effective_permission`.
+
+### `POST /api/v1/permission-requests/`
+- **Authentication**: Required
+- **Request Body**:
+  ```json
+  {
+    "document_id": "doc_a1b2c3...",
+    "requested_role": "download_activity"
+  }
+  ```
+- **Validation**: The document must exist and not be soft-deleted (`404` otherwise). `requested_role` defaults to `download_activity`; the activity-export workflow also accepts `export_activity`.
+- **Deduplication**: If the requester already has a pending or approved request for the same document and role, the existing request is returned instead of creating a duplicate.
+- **Response `201 Created`**: Request object with `id`, `requester_id`, `document_id`, `requested_role`, `status` (`pending`), `created_at`, and `updated_at`. `requester_email` and `document_title` are `null` in requester-facing responses.
+- **Side Effects**: Active administrators receive an in-app notification (excluding the requester). Audit event `permission_request.create`.
+- **Rate Limit**: 20 requests per hour per IP and per authenticated requester, using the shared database-backed limiter. Exceeding the limit returns `429 Too Many Requests` with `Retry-After`; limiter storage failure returns `503`. Denials are audited as `permission_request.rate_limited` with `details.reason = rate_limit_exceeded` and are aggregated per bucket.
+
+### `GET /api/v1/permission-requests/status`
+- **Authentication**: Required
+- **Query Parameters**: `document_id` (required).
+- **Response `200 OK`**: The caller's most recent request for that document, or `null` if none exists. `requester_email` and `document_title` are `null`.
+
+### `GET /api/v1/permission-requests/pending`
+- **Authentication**: Required
+- **Authorization Rule**: Administrator only (`403` for other roles).
+- **Query Parameters**: `document_id` (optional exact filter).
+- **Response `200 OK`**: Array of pending requests ordered newest first, including `requester_email` and `document_title` for administrator review.
+
+### `PATCH /api/v1/permission-requests/{request_id}`
+- **Authentication**: Required
+- **Authorization Rule**: Administrator only (`403` for other roles).
+- **Request Body**:
+  ```json
+  {
+    "status": "approved"
+  }
+  ```
+- **Validation**: `status` must be `approved`, `rejected`, or `canceled`. Setting `pending` returns `400 Bad Request`. Only requests currently in `pending` can be changed; otherwise the endpoint returns `409 Conflict`.
+- **Response `200 OK`**: Updated request, including `requester_email` and `document_title`.
+- **Side Effects**: The requester receives an in-app notification. Audit event `permission_request.update_status` with `details.new_status`, `document_id`, and `requester_id`.
+
+---
+
+## 5. Notification Endpoints
+
+All notification endpoints are scoped to the authenticated user. Notifications belonging to another account are never returned or mutated.
+
+### `GET /api/v1/notifications`
+- **Authentication**: Required
+- **Query Parameters**: `limit` (1-50, default 20).
+- **Response `200 OK`**:
+  ```json
+  {
+    "notifications": [
+      {
+        "id": "ntf_...",
+        "title": "Permission request approved",
+        "message": "Your request for 'Q3 Audit' was approved.",
+        "link": "/documents/doc_a1b2c3...",
+        "is_read": false,
+        "created_at": "2026-10-25T10:00:00.000000Z"
+      }
+    ],
+    "unread_count": 1
+  }
+  ```
+- **Ordering**: Newest first. `unread_count` counts all unread notifications, not just the returned page.
+
+### `POST /api/v1/notifications/read-all`
+- **Authentication**: Required
+- **CSRF**: `X-CSRF-Token` required when a session/CSRF cookie is present.
+- **Response `200 OK`**: `{"updated": <number>}`
+- **Audit**: When at least one notification changes state, records `notification.read_all` (`SUCCESS`) with `details.updated`. A no-op request is not audited.
+
+### `POST /api/v1/notifications/{notification_id}/read`
+- **Authentication**: Required
+- **CSRF**: `X-CSRF-Token` required when a session/CSRF cookie is present.
+- **Response `200 OK`**: The updated notification object.
+- **Error**: `404 Not Found` when the notification does not exist or belongs to another user.
+- **Audit**: When an unread notification is marked read, records `notification.read` (`SUCCESS`) with `resource_id` set to the notification ID. Re-reading an already-read notification is not audited.
+
+---
+
+## 6. Administration Endpoints
 
 All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 
@@ -246,6 +404,11 @@ All endpoints in this section require the Administrator role (`UserRole.ADMIN`).
 - **Authentication**: Required
 - **Query Parameters**: `page`, `page_size`
 - **Response `200 OK`**: Paginated user list (`users`, `total`, `page`, `page_size`).
+
+### `GET /api/v1/admin/users/role-counts`
+- **Authentication**: Required
+- **Authorization Rule**: Administrator only.
+- **Response `200 OK`**: `{"admin": 2, "owner": 3, "viewer": 5}`. Counts include all registered accounts in each role, including inactive accounts.
 
 ### `GET /api/v1/admin/users/{user_id}`
 - **Authentication**: Required

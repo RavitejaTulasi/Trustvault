@@ -20,6 +20,7 @@ vi.mock('../api', async () => {
   return {
     ...actual,
     listUsers: vi.fn(),
+    getUserRoleCounts: vi.fn().mockResolvedValue({ admin: 1, owner: 1, viewer: 1 }),
     createUser: vi.fn(),
     resetUserPassword: vi.fn(),
     updateUser: vi.fn(),

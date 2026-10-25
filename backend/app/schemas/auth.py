@@ -114,37 +114,20 @@ class UserResponse(BaseModel):
 
 
 class UserUpdateRequest(BaseModel):
-    """Request body for updating user profile (self-service or admin)."""
+    """Request body for updating the signed-in user's profile.
+
+    Password changes are intentionally excluded: they must go through
+    ``POST /auth/change-password`` (which verifies the current password) or the
+    one-time-code flow available from the login page.
+    """
     full_name: str | None = Field(
         default=None,
         min_length=2,
         max_length=255,
         description="Updated display name",
     )
-    password: str | None = Field(
-        default=None,
-        min_length=12,
-        max_length=128,
-        description="New password (optional)",
-    )
 
-    @field_validator("password")
-    @classmethod
-    def validate_password_strength(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
-        errors = []
-        if not any(c.isupper() for c in v):
-            errors.append("at least one uppercase letter")
-        if not any(c.islower() for c in v):
-            errors.append("at least one lowercase letter")
-        if not any(c.isdigit() for c in v):
-            errors.append("at least one digit")
-        if not any(c in "!@#$%^&*()_+-=[]{}|;':\",./<>?" for c in v):
-            errors.append("at least one special character")
-        if errors:
-            raise ValueError(f"Password must contain {', '.join(errors)}")
-        return v
+    model_config = {"extra": "forbid"}
 
     @field_validator("full_name")
     @classmethod
@@ -237,3 +220,34 @@ class UserListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class PasswordResetRequestSchema(BaseModel):
+    email: str = Field(description="Registered user email address")
+
+
+class OTPVerifyRequestSchema(BaseModel):
+    email: str
+    otp_code: str = Field(min_length=6, max_length=6)
+
+
+class PasswordResetConfirmRequestSchema(BaseModel):
+    email: str
+    otp_code: str = Field(min_length=6, max_length=6)
+    new_password: str = Field(min_length=12, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_password_strength(cls, v: str) -> str:
+        errors = []
+        if not any(c.isupper() for c in v):
+            errors.append("at least one uppercase letter")
+        if not any(c.islower() for c in v):
+            errors.append("at least one lowercase letter")
+        if not any(c.isdigit() for c in v):
+            errors.append("at least one digit")
+        if not any(c in "!@#$%^&*()_+-=[]{}|;':\",./<>?" for c in v):
+            errors.append("at least one special character")
+        if errors:
+            raise ValueError(f"Password must contain {', '.join(errors)}")
+        return v

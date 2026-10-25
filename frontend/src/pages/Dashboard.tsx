@@ -1,9 +1,15 @@
-﻿import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { motion, useReducedMotion } from 'motion/react';
 import { getMe } from '../auth';
-import { ApiError, NetworkError } from '../api';
-import type { UserResponse } from '../types';
+import {
+  ApiError,
+  NetworkError,
+  getUserRoleCounts,
+  listPendingPermissionRequests,
+  updatePermissionRequestStatus,
+} from '../api';
+import type { PermissionRequestResponse, UserResponse } from '../types';
 import AppShell from '../components/AppShell';
 import PageHeader from '../components/PageHeader';
 import OverviewVault from '../components/motion/OverviewVault';
@@ -20,12 +26,17 @@ import {
   UsersIcon,
 } from '../components/Icons';
 import { canManageDocuments } from '../lib/navigation';
-import { formatDate, getInitials, roleLabel } from '../lib/format';
+import { formatDate, formatDateTime, getInitials, roleLabel } from '../lib/format';
 
 export default function Dashboard({ initialUser }: { initialUser?: UserResponse | null } = {}) {
   const [user, setUser] = useState<UserResponse | null>(initialUser ?? null);
   const [loading, setLoading] = useState(initialUser === undefined);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [pendingRequests, setPendingRequests] = useState<PermissionRequestResponse[]>([]);
+  const [pendingLoading, setPendingLoading] = useState(false);
+  const [roleCounts, setRoleCounts] = useState<Record<string, number> | null>(null);
+  const [roleCountsLoading, setRoleCountsLoading] = useState(false);
+  const [actioning, setActioning] = useState<number | null>(null);
   const navigate = useNavigate();
   const reduceMotion = useReducedMotion();
 
@@ -57,12 +68,45 @@ export default function Dashboard({ initialUser }: { initialUser?: UserResponse 
       });
   };
 
+  const loadPendingRequests = useCallback(() => {
+    setPendingLoading(true);
+    listPendingPermissionRequests()
+      .then(setPendingRequests)
+      .catch(() => {})
+      .finally(() => setPendingLoading(false));
+  }, []);
+
+  const loadRoleCounts = useCallback(() => {
+    setRoleCountsLoading(true);
+    getUserRoleCounts()
+      .then(setRoleCounts)
+      .catch(() => {})
+      .finally(() => setRoleCountsLoading(false));
+  }, []);
+
+  const handleAction = (id: number, newStatus: 'approved' | 'rejected') => {
+    setActioning(id);
+    updatePermissionRequestStatus(id, newStatus)
+      .then(() => {
+        setPendingRequests((prev) => prev.filter((r) => r.id !== id));
+      })
+      .catch(() => {})
+      .finally(() => setActioning(null));
+  };
+
   useEffect(() => {
     if (initialUser === undefined) {
       loadSession();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialUser, navigate]);
+
+  useEffect(() => {
+    if (user?.role === 'admin') {
+      loadPendingRequests();
+      loadRoleCounts();
+    }
+  }, [user, loadPendingRequests, loadRoleCounts]);
 
   if (loading) {
     return (
@@ -97,6 +141,7 @@ export default function Dashboard({ initialUser }: { initialUser?: UserResponse 
   }
 
   const canManage = canManageDocuments(user.role);
+  const isAdmin = user.role === 'admin';
 
   return (
     <AppShell user={user}>
@@ -306,6 +351,137 @@ export default function Dashboard({ initialUser }: { initialUser?: UserResponse 
               </div>
             </div>
           </section>
+          {isAdmin && (
+            <section className="panel" aria-labelledby="role-counts-title">
+              <div className="panel-header">
+                <div>
+                  <h2 id="role-counts-title" className="panel-title">
+                    Accounts by role
+                  </h2>
+                  <p className="panel-description">
+                    Registered accounts across the workspace.
+                  </p>
+                </div>
+                <Link to="/admin/users" className="btn btn-secondary btn-sm">
+                  Manage users
+                </Link>
+              </div>
+              <div className="panel-body">
+                <div className="snapshot-list">
+                  <div className="snapshot-row">
+                    <span className="snapshot-label">Administrators</span>
+                    <span className="snapshot-value">
+                      {roleCountsLoading ? '…' : (roleCounts?.admin ?? '—')}
+                    </span>
+                  </div>
+                  <div className="snapshot-row">
+                    <span className="snapshot-label">Document owners</span>
+                    <span className="snapshot-value">
+                      {roleCountsLoading ? '…' : (roleCounts?.owner ?? '—')}
+                    </span>
+                  </div>
+                  <div className="snapshot-row">
+                    <span className="snapshot-label">Viewers</span>
+                    <span className="snapshot-value">
+                      {roleCountsLoading ? '…' : (roleCounts?.viewer ?? '—')}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </section>
+          )}
+          {isAdmin && (
+            <section className="panel panel-wide" aria-labelledby="pending-requests-title">
+              <div className="panel-header">
+                <div>
+                  <h2 id="pending-requests-title" className="panel-title">
+                    Pending download requests
+                  </h2>
+                  <p className="panel-description">
+                    Users awaiting permission to export document activity.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                  {pendingRequests.length > 0 && (
+                    <StatusBadge label={`${pendingRequests.length} pending`} tone="warning" />
+                  )}
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={loadPendingRequests}
+                    disabled={pendingLoading}
+                    aria-label="Refresh pending requests"
+                  >
+                    {pendingLoading ? 'Refreshing…' : 'Refresh'}
+                  </button>
+                </div>
+              </div>
+              <div className="panel-body">
+                {pendingLoading && pendingRequests.length === 0 ? (
+                  <p className="section-copy" style={{ padding: '1rem 0' }}>Loading…</p>
+                ) : pendingRequests.length === 0 ? (
+                  <div className="empty-state" style={{ padding: '1.5rem 0', textAlign: 'center' }}>
+                    <p className="section-copy">No pending requests — all clear.</p>
+                  </div>
+                ) : (
+                  <div className="table-wrap">
+                    <table className="data-table" aria-label="Pending permission requests">
+                      <thead>
+                        <tr>
+                          <th scope="col">Requester</th>
+                          <th scope="col">Document</th>
+                          <th scope="col">Role requested</th>
+                          <th scope="col">Submitted</th>
+                          <th scope="col">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pendingRequests.map((req) => (
+                          <tr key={req.id}>
+                            <td className="mono">{req.requester_email ?? req.requester_id}</td>
+                            <td>
+                              <Link
+                                to={`/documents/${req.document_id}`}
+                                className="cell-title-link"
+                              >
+                                {req.document_title ?? req.document_id}
+                              </Link>
+                            </td>
+                            <td>
+                              <code style={{ fontSize: '0.78rem' }}>{req.requested_role}</code>
+                            </td>
+                            <td>{formatDateTime(req.created_at)}</td>
+                            <td>
+                              <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                <button
+                                  type="button"
+                                  id={`approve-req-${req.id}`}
+                                  className="btn btn-primary btn-sm"
+                                  disabled={actioning === req.id}
+                                  onClick={() => handleAction(req.id, 'approved')}
+                                >
+                                  {actioning === req.id ? '…' : 'Approve'}
+                                </button>
+                                <button
+                                  type="button"
+                                  id={`reject-req-${req.id}`}
+                                  className="btn btn-danger btn-sm"
+                                  disabled={actioning === req.id}
+                                  onClick={() => handleAction(req.id, 'rejected')}
+                                >
+                                  {actioning === req.id ? '…' : 'Reject'}
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
         </div>
       </div>
     </AppShell>

@@ -18,6 +18,9 @@ import type {
   GrantRecipientLookupResponse,
   GrantResponse,
   HealthResponse,
+  NotificationListResponse,
+  NotificationResponse,
+  PermissionRequestResponse,
   UserListResponse,
   UserResponse,
   UserSessionsRevokedResponse,
@@ -129,7 +132,7 @@ export async function apiFetch(path: string, options: RequestInit = {}): Promise
  * {"detail": "..."} but proxies or crashed servers can return plain text,
  * HTML, or nothing.
  */
-async function toApiError(response: Response): Promise<ApiError> {
+export async function toApiError(response: Response): Promise<ApiError> {
   let detail = `Request failed (HTTP ${response.status})`;
   try {
     const body: unknown = await response.json();
@@ -198,6 +201,52 @@ export async function changePassword(
   return parseJsonResponse<UserResponse>(response);
 }
 
+export async function requestPasswordReset(email: string): Promise<string> {
+  const response = await apiFetch('/api/v1/auth/request-reset', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  const data = await parseJsonResponse<{ message: string }>(response);
+  return data.message;
+}
+
+export async function verifyPasswordResetOtp(
+  email: string,
+  otpCode: string,
+): Promise<void> {
+  const response = await apiFetch('/api/v1/auth/verify-otp', {
+    method: 'POST',
+    body: JSON.stringify({ email, otp_code: otpCode }),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  await parseJsonResponse<{ valid: boolean }>(response);
+}
+
+export async function confirmPasswordReset(
+  email: string,
+  otpCode: string,
+  newPassword: string,
+): Promise<string> {
+  const response = await apiFetch('/api/v1/auth/confirm-reset', {
+    method: 'POST',
+    body: JSON.stringify({
+      email,
+      otp_code: otpCode,
+      new_password: newPassword,
+    }),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  const data = await parseJsonResponse<{ message: string }>(response);
+  return data.message;
+}
+
 export async function login(email: string, password: string): Promise<UserResponse> {
   const response = await apiFetch('/api/v1/auth/login', {
     method: 'POST',
@@ -222,6 +271,40 @@ export async function getDemoAccounts(): Promise<DemoAccount[]> {
     throw await toApiError(response);
   }
   return parseJsonResponse<DemoAccount[]>(response);
+}
+
+export async function listNotifications(
+  limit: number = 20,
+): Promise<NotificationListResponse> {
+  const response = await apiFetch(`/api/v1/notifications?limit=${limit}`);
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<NotificationListResponse>(response);
+}
+
+export async function markNotificationRead(
+  notificationId: string,
+): Promise<NotificationResponse> {
+  const response = await apiFetch(
+    `/api/v1/notifications/${encodeURIComponent(notificationId)}/read`,
+    { method: 'POST' },
+  );
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<NotificationResponse>(response);
+}
+
+export async function markAllNotificationsRead(): Promise<number> {
+  const response = await apiFetch('/api/v1/notifications/read-all', {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  const data = await parseJsonResponse<{ updated: number }>(response);
+  return data.updated;
 }
 
 /**
@@ -618,4 +701,101 @@ export async function revokeUserSessions(
     throw await toApiError(response);
   }
   return parseJsonResponse<UserSessionsRevokedResponse>(response);
+}
+
+export async function getPermissionRequestStatus(
+  documentId: string,
+): Promise<PermissionRequestResponse | null> {
+  const response = await apiFetch(
+    `/api/v1/permission-requests/status?document_id=${encodeURIComponent(documentId)}`,
+  );
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<PermissionRequestResponse | null>(response);
+}
+
+export async function createPermissionRequest(
+  documentId: string,
+  requestedRole: string = 'download_activity',
+): Promise<PermissionRequestResponse> {
+  const response = await apiFetch('/api/v1/permission-requests/', {
+    method: 'POST',
+    body: JSON.stringify({ document_id: documentId, requested_role: requestedRole }),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<PermissionRequestResponse>(response);
+}
+
+export async function listPendingPermissionRequests(
+  documentId?: string,
+): Promise<PermissionRequestResponse[]> {
+  const query = documentId ? `?document_id=${encodeURIComponent(documentId)}` : '';
+  const response = await apiFetch(`/api/v1/permission-requests/pending${query}`);
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<PermissionRequestResponse[]>(response);
+}
+
+export async function updatePermissionRequestStatus(
+  requestId: number,
+  status: 'approved' | 'rejected' | 'canceled',
+): Promise<PermissionRequestResponse> {
+  const response = await apiFetch(`/api/v1/permission-requests/${encodeURIComponent(requestId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  });
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<PermissionRequestResponse>(response);
+}
+
+export async function getDocumentActivity(
+  documentId: string,
+  page: number = 1,
+  pageSize: number = 25,
+): Promise<AuditEventListResponse> {
+  const query = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  const response = await apiFetch(
+    `/api/v1/documents/${encodeURIComponent(documentId)}/activity?${query.toString()}`,
+  );
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  return parseJsonResponse<AuditEventListResponse>(response);
+}
+
+export async function exportDocumentActivity(
+  documentId: string,
+  format: 'csv' | 'excel' = 'csv',
+): Promise<void> {
+  const response = await apiFetch(
+    `/api/v1/documents/${encodeURIComponent(documentId)}/activity/export?format=${format}`,
+  );
+  if (!response.ok) {
+    throw await toApiError(response);
+  }
+  const blob = await response.blob();
+  const ext = format === 'csv' ? 'csv' : 'xls';
+  const filename =
+    parseContentDispositionFilename(response.headers.get('Content-Disposition')) ??
+    `document-${documentId.slice(0, 8)}-activity.${ext}`;
+  const url = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }

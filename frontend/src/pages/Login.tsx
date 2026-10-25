@@ -227,6 +227,9 @@ export default function LoginPage() {
                 placeholder="Your password"
               />
             </div>
+            <div className="auth-form-note">
+              <Link to="/forgot-password">Forgot password?</Link>
+            </div>
             <MagneticButton
               ref={submitRef}
               type="submit"

@@ -9,6 +9,7 @@ import { navigationGroupsForRole, pageTitleFor } from '../lib/navigation';
 import CommandPalette from './CommandPalette';
 import IconButton from './IconButton';
 import Menu from './Menu';
+import NotificationBell from './NotificationBell';
 import PageTransition from './motion/PageTransition';
 import {
   CloseIcon,
@@ -377,6 +378,7 @@ export default function AppShell({ user, children }: AppShellProps) {
               <span className="command-trigger-label">Search or jump to</span>
               <kbd className="command-kbd">Ctrl K</kbd>
             </button>
+            <NotificationBell />
             <span className="topbar-divider" aria-hidden="true" />
             <Menu
               label="Account menu"

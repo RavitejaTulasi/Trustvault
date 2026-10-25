@@ -12,7 +12,7 @@ Security principles:
 - Deactivated accounts are rejected even with a valid session
 """
 
-from fastapi import Cookie, Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings

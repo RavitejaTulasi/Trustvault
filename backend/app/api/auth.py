@@ -13,6 +13,8 @@ Security controls implemented:
 """
 
 import logging
+import secrets
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.exc import SQLAlchemyError
@@ -21,10 +23,15 @@ from sqlalchemy.orm import Session
 from backend.app.config import settings
 from backend.app.database import get_db
 from backend.app.models.audit import AuditOutcome
+from backend.app.models.base import utc_now
+from backend.app.models.otp import PasswordResetOTP
 from backend.app.models.user import User, UserRole
 from backend.app.schemas.auth import (
     DemoAccountResponse,
+    OTPVerifyRequestSchema,
     PasswordChangeRequest,
+    PasswordResetConfirmRequestSchema,
+    PasswordResetRequestSchema,
     UserLoginRequest,
     UserRegisterRequest,
     UserResponse,
@@ -32,14 +39,18 @@ from backend.app.schemas.auth import (
 )
 from backend.app.security.auth import get_authenticated_user, get_current_user
 from backend.app.security.csrf import generate_csrf_token
+from backend.app.security.otp import hash_otp_code, verify_otp_code
 from backend.app.security.passwords import (
     hash_password,
     password_needs_rehash,
     verify_password,
 )
 from backend.app.security.rate_limiter import (
+    LoginRateLimiter,
     LoginRateLimitUnavailable,
     login_rate_limiter,
+    otp_request_rate_limiter,
+    otp_verify_rate_limiter,
 )
 from backend.app.security.sessions import (
     create_session,
@@ -47,6 +58,11 @@ from backend.app.security.sessions import (
     revoke_session,
 )
 from backend.app.services.audit_service import AuditService
+from backend.app.services.email_service import (
+    PASSWORD_RESET_OTP_EXPIRY_MINUTES,
+    EmailDeliveryError,
+    send_password_reset_otp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -498,7 +514,10 @@ def change_password(
     "/me",
     response_model=UserResponse,
     summary="Update own profile",
-    description="Allows the authenticated user to update their display name or password.",
+    description=(
+        "Allows the authenticated user to update their display name. Password "
+        "changes require the current password and must use /auth/change-password."
+    ),
 )
 def update_me(
     body: UserUpdateRequest,
@@ -515,12 +534,6 @@ def update_me(
     if body.full_name is not None:
         current_user.full_name = body.full_name
         changed_fields.append("full_name")
-
-    if body.password is not None:
-        current_user.hashed_password = hash_password(body.password)
-        changed_fields.append("password")
-        # Revoke all other sessions on password change (security best practice)
-        revoke_all_user_sessions(db, current_user.id)
 
     if changed_fields:
         AuditService.log_event(
@@ -539,3 +552,274 @@ def update_me(
         db.refresh(current_user)
 
     return UserResponse.model_validate(current_user)
+
+
+OTP_MAX_ATTEMPTS = 5
+
+
+def _enforce_otp_rate_limit(
+    db: Session,
+    limiter: LoginRateLimiter,
+    request: Request,
+    email: str,
+    *,
+    audit_action: str,
+    detail: str,
+) -> None:
+    """Reserve one shared OTP attempt and fail closed on limiter errors."""
+    try:
+        decision = limiter.reserve(db, request.state.client_ip, email)
+    except LoginRateLimitUnavailable:
+        logger.exception("Shared OTP rate limiter unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from None
+
+    if decision.allowed:
+        return
+
+    try:
+        should_audit = limiter.claim_denial_audit(
+            db,
+            request.state.client_ip,
+            email,
+        )
+        if should_audit:
+            AuditService.log_event(
+                db,
+                action=audit_action,
+                outcome=AuditOutcome.DENIED,
+                ip_address=request.state.client_ip,
+                user_agent=request.state.user_agent,
+                request_id=request.state.request_id,
+                details={
+                    "email": email,
+                    "reason": "rate_limit_exceeded",
+                    "aggregated": True,
+                },
+            )
+            db.commit()
+    except (LoginRateLimitUnavailable, SQLAlchemyError):
+        db.rollback()
+        logger.exception("Failed to record OTP rate-limit denial")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication temporarily unavailable",
+            headers={"Retry-After": "5"},
+        ) from None
+
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=detail,
+        headers={"Retry-After": str(decision.retry_after)},
+    )
+
+
+def _require_active_otp(db: Session, email: str, otp_code: str) -> PasswordResetOTP:
+    """Return the latest usable OTP record or raise a uniform reset error.
+
+    Codes expire after 15 minutes and are single-use. Five incorrect attempts
+    invalidate the code so a six-digit value cannot be brute-forced.
+    """
+    now = utc_now()
+    otp_record = (
+        db.query(PasswordResetOTP)
+        .filter(
+            PasswordResetOTP.email == email,
+            PasswordResetOTP.is_used.is_(False),
+            PasswordResetOTP.expires_at > now,
+        )
+        .order_by(PasswordResetOTP.created_at.desc())
+        .first()
+    )
+    if otp_record is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired OTP code",
+        )
+    if otp_record.attempts >= OTP_MAX_ATTEMPTS:
+        otp_record.is_used = True
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired OTP code",
+        )
+    if not verify_otp_code(otp_code, otp_record.otp_code):
+        otp_record.attempts += 1
+        if otp_record.attempts >= OTP_MAX_ATTEMPTS:
+            otp_record.is_used = True
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired OTP code",
+        )
+    return otp_record
+
+
+@router.post(
+    "/request-reset",
+    status_code=status.HTTP_200_OK,
+    summary="Request password reset OTP",
+    description="Generates a 6-digit OTP code and emails it to the account address.",
+)
+def request_password_reset(
+    body: PasswordResetRequestSchema,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    email = body.email.lower()
+    _enforce_otp_rate_limit(
+        db,
+        otp_request_rate_limiter,
+        request,
+        email,
+        audit_action="auth.password_reset_rate_limited",
+        detail="Too many password reset requests. Please try again later.",
+    )
+    user = db.query(User).filter(User.email == email).first()
+    message = "If an account with this email exists, an OTP password reset code has been sent."
+
+    if user is not None and user.is_active:
+        code = f"{secrets.randbelow(900000) + 100000}"
+        expires_at = utc_now() + timedelta(minutes=PASSWORD_RESET_OTP_EXPIRY_MINUTES)
+
+        db.query(PasswordResetOTP).filter(
+            PasswordResetOTP.email == email,
+            PasswordResetOTP.is_used.is_(False),
+        ).update({"is_used": True})
+
+        otp_record = PasswordResetOTP(
+            email=email,
+            otp_code=hash_otp_code(code),
+            expires_at=expires_at,
+        )
+        db.add(otp_record)
+
+        AuditService.log_event(
+            db,
+            action="auth.password_reset_request",
+            outcome=AuditOutcome.SUCCESS,
+            actor_id=user.id,
+            resource_type="user",
+            resource_id=user.id,
+            ip_address=request.state.client_ip,
+            user_agent=request.state.user_agent,
+            request_id=request.state.request_id,
+        )
+        db.commit()
+
+        try:
+            send_password_reset_otp(email, code, PASSWORD_RESET_OTP_EXPIRY_MINUTES)
+        except EmailDeliveryError:
+            logger.exception("Password reset email delivery failed for %s", email)
+            otp_record.is_used = True
+            AuditService.log_event(
+                db,
+                action="auth.password_reset_delivery",
+                outcome=AuditOutcome.FAILURE,
+                actor_id=user.id,
+                resource_type="user",
+                resource_id=user.id,
+                ip_address=request.state.client_ip,
+                user_agent=request.state.user_agent,
+                request_id=request.state.request_id,
+                details={"reason": "email_delivery_failed"},
+            )
+            db.commit()
+
+    return {"message": message}
+
+
+@router.post(
+    "/verify-otp",
+    status_code=status.HTTP_200_OK,
+    summary="Verify password reset OTP",
+    description="Validates the 6-digit OTP code before password reset confirmation.",
+)
+def verify_otp(
+    body: OTPVerifyRequestSchema,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    email = body.email.lower()
+    _enforce_otp_rate_limit(
+        db,
+        otp_verify_rate_limiter,
+        request,
+        email,
+        audit_action="auth.otp_verify_rate_limited",
+        detail="Too many verification attempts. Please try again later.",
+    )
+    _require_active_otp(db, email, body.otp_code)
+    return {"valid": True}
+
+
+@router.post(
+    "/confirm-reset",
+    status_code=status.HTTP_200_OK,
+    summary="Confirm password reset with OTP",
+    description="Verifies the OTP and updates the user password.",
+)
+def confirm_password_reset(
+    body: PasswordResetConfirmRequestSchema,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    email = body.email.lower()
+    _enforce_otp_rate_limit(
+        db,
+        otp_verify_rate_limiter,
+        request,
+        email,
+        audit_action="auth.otp_verify_rate_limited",
+        detail="Too many verification attempts. Please try again later.",
+    )
+    otp_record = _require_active_otp(db, email, body.otp_code)
+
+    user = db.query(User).filter(User.email == email).first()
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid user account",
+        )
+
+    # Consume the code atomically so two concurrent confirmations cannot both
+    # reset the password with the same OTP.
+    consumed = (
+        db.query(PasswordResetOTP)
+        .filter(
+            PasswordResetOTP.id == otp_record.id,
+            PasswordResetOTP.is_used.is_(False),
+            PasswordResetOTP.expires_at > utc_now(),
+        )
+        .update({"is_used": True}, synchronize_session=False)
+    )
+    if consumed != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or expired OTP code",
+        )
+
+    user.hashed_password = hash_password(body.new_password)
+    user.must_change_password = False
+
+    sessions_revoked = revoke_all_user_sessions(db, user.id)
+
+    AuditService.log_event(
+        db,
+        action="auth.password_reset_confirm",
+        outcome=AuditOutcome.SUCCESS,
+        actor_id=user.id,
+        resource_type="user",
+        resource_id=user.id,
+        ip_address=request.state.client_ip,
+        user_agent=request.state.user_agent,
+        request_id=request.state.request_id,
+        details={"sessions_revoked": sessions_revoked},
+    )
+    db.commit()
+
+    return {"message": "Password successfully reset. You can now log in with your new password."}

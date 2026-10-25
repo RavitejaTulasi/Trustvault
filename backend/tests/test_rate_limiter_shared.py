@@ -55,6 +55,26 @@ def test_limiter_state_is_shared_between_instances(db_session: Session):
     assert denied.retry_after > 0
 
 
+def test_namespaced_limiters_do_not_share_buckets(db_session: Session):
+    clock = MutableClock(1_000_000)
+    login = make_limiter(clock, max_attempts=2)
+    otp = LoginRateLimiter(
+        max_attempts=2,
+        window_seconds=60,
+        max_buckets=100,
+        time_func=clock,
+        namespace="otp_request",
+    )
+
+    assert login.reserve(db_session, "203.0.113.10", "user@example.com").allowed
+    assert login.reserve(db_session, "203.0.113.10", "user@example.com").allowed
+    assert otp.reserve(db_session, "203.0.113.10", "user@example.com").allowed
+    assert otp.reserve(db_session, "203.0.113.10", "user@example.com").allowed
+
+    buckets = db_session.scalars(select(LoginRateLimitBucket)).all()
+    assert len(buckets) == 4
+
+
 def test_successful_reservation_creates_ip_and_account_buckets(db_session: Session):
     clock = MutableClock(1_000_000)
     limiter = make_limiter(clock, max_attempts=3)

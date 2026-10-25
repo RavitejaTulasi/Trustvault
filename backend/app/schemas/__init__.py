@@ -27,6 +27,15 @@ from backend.app.schemas.grant import (
     GrantResponse,
 )
 from backend.app.schemas.health import HealthResponse
+from backend.app.schemas.notification import (
+    NotificationListResponse,
+    NotificationResponse,
+)
+from backend.app.schemas.permission_request import (
+    PermissionRequestCreate,
+    PermissionRequestOut,
+    PermissionRequestUpdate,
+)
 
 __all__ = [
     "AdminUserUpdateRequest",
@@ -41,6 +50,11 @@ __all__ = [
     "GrantListResponse",
     "GrantResponse",
     "HealthResponse",
+    "NotificationListResponse",
+    "NotificationResponse",
+    "PermissionRequestCreate",
+    "PermissionRequestOut",
+    "PermissionRequestUpdate",
     "UserListResponse",
     "UserLoginRequest",
     "UserRegisterRequest",
