@@ -2,6 +2,28 @@
 
 TrustVault is a production-minded secure document sharing web application engineered from the ground up for strict authorization enforcement, private storage isolation, and a tamper-evident audit trail.
 
+## Live Demo
+
+**Open the app:** <https://trustvault-oa7y.onrender.com>
+
+| Role | Email | Password |
+| --- | --- | --- |
+| Administrator | `demo.admin@example.com` | `V@Qc=ZscnCabkw2jkcTvYC#_` |
+| Document owner | `demo.owner@example.com` | `j9rcpVd2s3BsMt7j_twa%VXm` |
+| Viewer | `demo.viewer@example.com` | `HzewAiYZ0#w@uIS75rBhb=3F` |
+
+> These accounts are for the public demo workspace only. Do not upload real or sensitive data.
+
+## Screenshots
+
+| Landing page | Sign-in page |
+| --- | --- |
+| ![TrustVault landing page](docs/screenshots/landing.png) | ![TrustVault sign-in page](docs/screenshots/login.png) |
+
+| Workspace overview | Audit trail |
+| --- | --- |
+| ![TrustVault workspace overview](docs/screenshots/dashboard.png) | ![TrustVault audit trail](docs/screenshots/audit.png) |
+
 ---
 
 ## Key Security Features
@@ -119,7 +141,7 @@ Use a new destination path. The SQLite database snapshot is consistent, but the 
 
 The local SQLite configuration in `.env.example` is for development only and is rejected when `ENVIRONMENT=production`.
 
-The Render blueprint deploys the API and built frontend in one Docker web service, with PostgreSQL and document storage in Supabase. The API serves the frontend at `/` and serves API routes on the same origin, preserving the existing `SameSite=Lax` session and CSRF cookie behavior. This avoids split-origin authentication problems with Render's shared `onrender.com` domains. If you rename the web service or attach a custom domain, update `CORS_ORIGINS` to that exact origin. Deploy `main`; the current `render.yaml` and container startup migration are on that branch.
+The current Render deployment serves the API and built frontend at <https://trustvault-oa7y.onrender.com> in one Docker web service, with PostgreSQL and document storage in Supabase. The API serves the frontend at `/` and serves API routes on the same origin, preserving the existing `SameSite=Lax` session and CSRF cookie behavior. This avoids split-origin authentication problems with Render's shared `onrender.com` domains. If you rename the web service or attach a custom domain, update `CORS_ORIGINS` to that exact origin. Deploy `main`; the current `render.yaml` and container startup migration are on that branch.
 
 `TRUSTED_PROXY_IPS` is empty by default. Until you configure exact trusted proxy CIDRs, the app safely ignores `X-Forwarded-For` and uses the immediate peer address; if that peer is a shared proxy, clients may share the same login limit.
 
@@ -154,9 +176,9 @@ No seed script ships in this repository, so demo accounts are not created automa
 2. Set `DEMO_LOGIN_ENABLED=true` and provide `DEMO_ADMIN_*`, `DEMO_OWNER_*`, and `DEMO_VIEWER_*` email/password pairs in the service's secret environment.
 3. Ensure each email belongs to an active user with the matching `admin`, `owner`, or `viewer` role.
 
-When enabled, the login page fetches `GET /api/v1/auth/demo-accounts` and offers role buttons that fill the normal sign-in form. The endpoint returns a credential only after verifying the user, role, active state, and Argon2id password hash. It returns `404` in production or when the flag is off, sets `Cache-Control: no-store`, and keeps credentials out of the frontend bundle and repository. The passwords are never displayed in the UI.
+When enabled, the login page fetches `GET /api/v1/auth/demo-accounts` and offers role buttons that fill the normal sign-in form. The endpoint returns a credential only after verifying the user, role, active state, and Argon2id password hash. It returns `404` in production or when the flag is off, sets `Cache-Control: no-store`, and keeps credentials out of the frontend bundle. The current live demo accounts are listed in [Live Demo](#live-demo); the passwords are never displayed in the UI.
 
-Demo passwords must be distinct, at least 12 characters, and stored only in the staging service's secret configuration. Production configuration rejects `DEMO_LOGIN_ENABLED=true` at startup, and the production Render blueprint sets it to `false`.
+Demo passwords must be distinct and at least 12 characters, and the accounts should exist only in the demo environment. Rotate the demo passwords if the workspace is reset. Production configuration rejects `DEMO_LOGIN_ENABLED=true` at startup, and the production Render blueprint sets it to `false`.
 
 ---
 
