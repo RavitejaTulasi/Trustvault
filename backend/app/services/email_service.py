@@ -7,9 +7,12 @@ remains usable; staging and production raise instead of silently dropping it.
 
 from __future__ import annotations
 
+import json
 import logging
 import smtplib
 import ssl
+import urllib.error
+import urllib.request
 from email.message import EmailMessage
 
 from backend.app.config import settings
@@ -52,15 +55,46 @@ def send_password_reset_otp(
     code: str,
     expires_minutes: int = PASSWORD_RESET_OTP_EXPIRY_MINUTES,
 ) -> None:
-    """Deliver a password reset code by SMTP or log it in development."""
+    """Deliver a password reset code by Nylas API, SMTP, or log it in development."""
+    nylas_key = settings.NYLAS_API_KEY.strip()
+    nylas_grant = settings.NYLAS_GRANT_ID.strip()
+    if nylas_key and nylas_grant:
+        api_uri = settings.NYLAS_API_URI.rstrip("/")
+        url = f"{api_uri}/v3/grants/{nylas_grant}/messages/send"
+        message = _build_password_reset_message(recipient, code, expires_minutes)
+        payload = {
+            "subject": message["Subject"],
+            "body": message.get_content(),
+            "to": [{"email": recipient}],
+        }
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=req_data,
+            headers={
+                "Authorization": f"Bearer {nylas_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=settings.SMTP_TIMEOUT_SECONDS) as response:
+                if response.status not in (200, 201, 202):
+                    raise EmailDeliveryError(f"Nylas API returned status {response.status}")
+        except (urllib.error.URLError, OSError) as exc:
+            raise EmailDeliveryError(
+                "Password reset email could not be delivered via Nylas"
+            ) from exc
+        return
+
     host = settings.SMTP_HOST.strip()
     if not host:
         if settings.is_deployed:
             raise EmailDeliveryError(
-                "SMTP is not configured; password reset email cannot be delivered"
+                "SMTP or Nylas is not configured; password reset email cannot be delivered"
             )
         logger.warning(
-            "Password reset code for %s (development delivery, no SMTP configured): %s",
+            "Password reset code for %s (development delivery, no mail service configured): %s",
             recipient,
             code,
         )

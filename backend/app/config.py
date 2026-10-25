@@ -359,6 +359,11 @@ class Settings(BaseSettings):
     SMTP_USE_SSL: bool = False
     SMTP_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
 
+    # Nylas Email Delivery (v3 API)
+    NYLAS_API_KEY: str = Field(default="", repr=False)
+    NYLAS_GRANT_ID: str = ""
+    NYLAS_API_URI: str = "https://api.us.nylas.com"
+
     # Seed Accounts (reserved; no seed script ships with this repository).
     SEED_ADMIN_EMAIL: str = "admin@trustvault.local"
     SEED_ADMIN_PASSWORD: str = Field(default="", repr=False)
